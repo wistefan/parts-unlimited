@@ -1,0 +1,63 @@
+## Network policy for agent worker pods.
+## Restricts egress to: Gitea, Taiga (read/write), and public internet on 80/443 (read-only by nature).
+## All other cluster-internal traffic is denied.
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-worker-policy
+  namespace: agents
+spec:
+  podSelector:
+    matchLabels:
+      role: agent-worker
+  policyTypes:
+    - Egress
+    - Ingress
+  # No ingress rules — agent workers do not accept incoming connections.
+  ingress: []
+  egress:
+    # Allow DNS resolution (required for all outbound traffic)
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow traffic to Gitea (namespace: gitea)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: gitea
+      ports:
+        - protocol: TCP
+          port: 3000
+        - protocol: TCP
+          port: 2222
+    # Allow traffic to Taiga (namespace: taiga)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: taiga
+      ports:
+        - protocol: TCP
+          port: 9000
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 8000
+    # Allow outbound HTTPS/HTTP to public internet (package registries, docs)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            # Deny access to private networks (cluster-internal, LAN)
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80

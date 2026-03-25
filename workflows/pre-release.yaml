@@ -1,0 +1,47 @@
+# Default pre-release workflow — creates a pre-release tag when a topic branch is merged to main.
+
+name: Pre-Release
+
+on:
+  push:
+    branches: ["main"]
+
+jobs:
+  pre-release:
+    runs-on: ubuntu-latest
+    # Only run when the push is a merge commit (not a direct push)
+    if: contains(github.event.head_commit.message, 'Merge pull request')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          # Get the latest tag, default to v0.0.0 if none exist
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "latest_tag=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
+
+          # Extract major.minor.patch
+          VERSION=${LATEST_TAG#v}
+          IFS='.' read -r MAJOR MINOR PATCH <<< "${VERSION%-*}"
+          PATCH=${PATCH:-0}
+
+          # Increment patch
+          NEW_PATCH=$((PATCH + 1))
+          PRE_RELEASE_TAG="v${MAJOR}.${MINOR}.${NEW_PATCH}-rc.$(date +%Y%m%d%H%M%S)"
+          echo "tag=${PRE_RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Create pre-release tag
+        run: |
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          prerelease: true
+          generate_release_notes: true

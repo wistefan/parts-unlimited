@@ -1,0 +1,43 @@
+# Default release workflow — creates a release when a version tag is pushed.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"  # Only stable version tags (not -rc)
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect language and build
+        id: detect
+        run: |
+          if [ -f "go.mod" ]; then
+            echo "language=go" >> "$GITHUB_OUTPUT"
+          elif [ -f "package.json" ]; then
+            echo "language=node" >> "$GITHUB_OUTPUT"
+          elif [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+            echo "language=python" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Go binary
+        if: steps.detect.outputs.language == 'go'
+        run: |
+          MODULE_NAME=$(head -1 go.mod | awk '{print $2}')
+          BINARY_NAME=$(basename "${MODULE_NAME}")
+          CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${{ github.ref_name }}" -o "dist/${BINARY_NAME}" ./cmd/...
+        continue-on-error: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*

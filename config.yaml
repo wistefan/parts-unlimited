@@ -1,0 +1,59 @@
+# Orchestrator configuration.
+# All values shown are the defaults — only override what you need to change.
+
+gitea:
+  # In-cluster URL (used by the orchestrator pod)
+  url: "http://gitea-http.gitea.svc.cluster.local:3000"
+  adminUsername: "claude"
+  adminPassword: "password"
+
+taiga:
+  # In-cluster URL (used by the orchestrator pod)
+  url: "http://taiga-gateway.taiga.svc.cluster.local:9000"
+  adminUsername: "admin"
+  adminPassword: "password"
+  projectSlug: "dev-environment"
+  # HMAC secret for verifying Taiga webhook payloads
+  webhookSecret: ""
+
+agents:
+  # Maximum number of agents working on tickets concurrently
+  maxConcurrency: 3
+
+  # Seconds before an idle agent container is destroyed
+  idleTimeoutSeconds: 300
+
+  # Seconds before an agent Job is killed (K8s activeDeadlineSeconds)
+  taskTimeoutSeconds: 3600
+
+  # Number of Job retries before escalating to human
+  retryLimit: 2
+
+  # Number of no-op reassignment cycles before escalating to human
+  escalationThreshold: 2
+
+  # Docker image for agent worker containers
+  containerImage: "agent-worker:latest"
+
+  # Per-specialization tool restrictions.
+  # Omitted specializations use the default allowed tools (all).
+  specializations:
+    documentation:
+      allowedTools: ["Read", "Edit", "Write", "Glob", "Grep"]
+
+notifications:
+  # URL to POST notification events to (empty = disabled)
+  webhookUrl: ""
+
+  # Port for the built-in notification dashboard
+  dashboardPort: 8080
+
+  # Send desktop notifications via notify-send (Linux)
+  desktopNotify: false
+
+kubernetes:
+  # Namespace where agent Jobs and orchestrator state live
+  namespace: "agents"
+
+  # ServiceAccount for agent worker pods (zero K8s API permissions)
+  agentServiceAccount: "agent-worker"

@@ -1,0 +1,61 @@
+## Shared volumes for Taiga static and media files.
+## On single-node k3s, hostPath volumes allow multiple pods to access the same data.
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: taiga-static-pv
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteMany
+  hostPath:
+    path: /var/lib/dev-env/taiga/static
+    type: DirectoryOrCreate
+  storageClassName: taiga-shared
+  persistentVolumeReclaimPolicy: Retain
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: taiga-static
+  namespace: taiga
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: taiga-shared
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: taiga-media-pv
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteMany
+  hostPath:
+    path: /var/lib/dev-env/taiga/media
+    type: DirectoryOrCreate
+  storageClassName: taiga-shared
+  persistentVolumeReclaimPolicy: Retain
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: taiga-media
+  namespace: taiga
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: taiga-shared

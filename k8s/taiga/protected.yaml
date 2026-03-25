@@ -1,0 +1,55 @@
+## Taiga protected media proxy — serves attachments with token verification.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taiga-protected
+  namespace: taiga
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: taiga-protected
+  template:
+    metadata:
+      labels:
+        app: taiga-protected
+    spec:
+      containers:
+        - name: taiga-protected
+          image: taigaio/taiga-protected:latest
+          ports:
+            - containerPort: 8003
+          env:
+            - name: MAX_AGE
+              value: "360"
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: taiga-secret
+                  key: secret-key
+          readinessProbe:
+            tcpSocket:
+              port: 8003
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: taiga-protected
+  namespace: taiga
+spec:
+  selector:
+    app: taiga-protected
+  ports:
+    - port: 8003
+      targetPort: 8003

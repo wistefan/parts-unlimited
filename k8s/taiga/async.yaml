@@ -1,0 +1,59 @@
+## Taiga async worker (Celery) — same image as taiga-back with different entrypoint.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taiga-async
+  namespace: taiga
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: taiga-async
+  template:
+    metadata:
+      labels:
+        app: taiga-async
+    spec:
+      containers:
+        - name: taiga-async
+          image: taigaio/taiga-back:latest
+          command: ["/taiga-back/docker/async_entrypoint.sh"]
+          envFrom:
+            - configMapRef:
+                name: taiga-config
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: taiga-secret
+                  key: postgres-password
+            - name: RABBITMQ_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: taiga-secret
+                  key: rabbitmq-password
+            - name: TAIGA_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: taiga-secret
+                  key: secret-key
+          volumeMounts:
+            - name: taiga-static
+              mountPath: /taiga-back/static
+            - name: taiga-media
+              mountPath: /taiga-back/media
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: taiga-static
+          persistentVolumeClaim:
+            claimName: taiga-static
+        - name: taiga-media
+          persistentVolumeClaim:
+            claimName: taiga-media

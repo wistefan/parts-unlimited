@@ -1,0 +1,120 @@
+## Template for agent worker Kubernetes Jobs.
+## The orchestrator creates Jobs based on this template, substituting
+## environment variables for each agent/ticket assignment.
+##
+## Security boundaries:
+## - Non-root user, read-only root filesystem
+## - No privilege escalation, all capabilities dropped
+## - ServiceAccount with zero K8s API permissions (token not mounted)
+## - Workspace is an ephemeral emptyDir (no hostPath access)
+## - Network restricted by NetworkPolicy (Gitea + Taiga + public HTTPS only)
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: "${JOB_NAME}"
+  namespace: agents
+  labels:
+    role: agent-worker
+    agent-id: "${AGENT_ID}"
+    ticket-id: "${TICKET_ID}"
+spec:
+  backoffLimit: ${RETRY_LIMIT}
+  activeDeadlineSeconds: ${TASK_TIMEOUT_SECONDS}
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        role: agent-worker
+        agent-id: "${AGENT_ID}"
+        ticket-id: "${TICKET_ID}"
+    spec:
+      serviceAccountName: agent-worker
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: agent
+          image: "${CONTAINER_IMAGE}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: false
+          env:
+            - name: TICKET_ID
+              value: "${TICKET_ID}"
+            - name: AGENT_ID
+              value: "${AGENT_ID}"
+            - name: AGENT_SPECIALIZATION
+              value: "${AGENT_SPECIALIZATION}"
+            - name: PLAN_STEP
+              value: "${PLAN_STEP}"
+            - name: REPO_OWNER
+              value: "${REPO_OWNER}"
+            - name: REPO_NAME
+              value: "${REPO_NAME}"
+            - name: GITEA_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: agent-service-endpoints
+                  key: GITEA_URL
+            - name: TAIGA_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: agent-service-endpoints
+                  key: TAIGA_URL
+            - name: GITEA_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: agent-credentials-${AGENT_ID}
+                  key: gitea-username
+            - name: GITEA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: agent-credentials-${AGENT_ID}
+                  key: gitea-password
+            - name: TAIGA_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: agent-credentials-${AGENT_ID}
+                  key: taiga-username
+            - name: TAIGA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: agent-credentials-${AGENT_ID}
+                  key: taiga-password
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: anthropic-api-key
+                  key: api-key
+          volumeMounts:
+            - name: workspace
+              mountPath: /home/agent/workspace
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+      volumes:
+        - name: workspace
+          emptyDir:
+            sizeLimit: 10Gi
+
+---
+## Service endpoints ConfigMap — shared by all agent Jobs.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-service-endpoints
+  namespace: agents
+data:
+  GITEA_URL: "http://gitea-http.gitea.svc.cluster.local:3000"
+  TAIGA_URL: "http://taiga-gateway.taiga.svc.cluster.local:9000"

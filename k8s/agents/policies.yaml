@@ -1,0 +1,78 @@
+## Agent permission policies.
+## Controls which Claude Code tools each specialization can use.
+## Only modifiable by humans — agent service accounts have no write access.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-policies
+  namespace: agents
+data:
+  policies.yaml: |
+    # Default tools available to all agents unless overridden.
+    default:
+      allowedTools:
+        - Read
+        - Edit
+        - Write
+        - Glob
+        - Grep
+        - Bash
+
+    # Per-specialization overrides.
+    # Agents only get the tools listed here (not merged with default).
+    specializations:
+      general:
+        # General-purpose agents get all tools.
+        allowedTools:
+          - Read
+          - Edit
+          - Write
+          - Glob
+          - Grep
+          - Bash
+
+      frontend:
+        allowedTools:
+          - Read
+          - Edit
+          - Write
+          - Glob
+          - Grep
+          - Bash
+
+      backend:
+        allowedTools:
+          - Read
+          - Edit
+          - Write
+          - Glob
+          - Grep
+          - Bash
+
+      test:
+        allowedTools:
+          - Read
+          - Edit
+          - Write
+          - Glob
+          - Grep
+          - Bash
+
+      documentation:
+        # Documentation agents do not need Bash.
+        allowedTools:
+          - Read
+          - Edit
+          - Write
+          - Glob
+          - Grep
+
+      operations:
+        allowedTools:
+          - Read
+          - Edit
+          - Write
+          - Glob
+          - Grep
+          - Bash

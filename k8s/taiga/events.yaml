@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taiga-events
+  namespace: taiga
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: taiga-events
+  template:
+    metadata:
+      labels:
+        app: taiga-events
+    spec:
+      containers:
+        - name: taiga-events
+          image: taigaio/taiga-events:latest
+          ports:
+            - containerPort: 8888
+          env:
+            - name: RABBITMQ_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: taiga-config
+                  key: RABBITMQ_USER
+            - name: RABBITMQ_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: taiga-secret
+                  key: rabbitmq-password
+            - name: TAIGA_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: taiga-secret
+                  key: secret-key
+            - name: TAIGA_EVENTS_RABBITMQ_HOST
+              value: "taiga-rabbitmq"
+          readinessProbe:
+            tcpSocket:
+              port: 8888
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: taiga-events
+  namespace: taiga
+spec:
+  selector:
+    app: taiga-events
+  ports:
+    - port: 8888
+      targetPort: 8888

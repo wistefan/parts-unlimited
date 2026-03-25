@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taiga-front
+  namespace: taiga
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: taiga-front
+  template:
+    metadata:
+      labels:
+        app: taiga-front
+    spec:
+      containers:
+        - name: taiga-front
+          image: taigaio/taiga-front:latest
+          ports:
+            - containerPort: 80
+          envFrom:
+            - configMapRef:
+                name: taiga-front-config
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: taiga-front
+  namespace: taiga
+spec:
+  selector:
+    app: taiga-front
+  ports:
+    - port: 80
+      targetPort: 80

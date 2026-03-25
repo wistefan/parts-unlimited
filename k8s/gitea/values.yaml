@@ -1,0 +1,66 @@
+## Gitea Helm chart values for dev-env
+## Chart: gitea-charts/gitea
+
+# Admin user created on first startup
+gitea:
+  admin:
+    username: claude
+    password: password
+    email: claude@dev-env.local
+
+  config:
+    actions:
+      ENABLED: true
+    repository:
+      DEFAULT_DELETE_BRANCH_AFTER_MERGE: true
+    server:
+      ROOT_URL: http://localhost:3000
+      SSH_DOMAIN: localhost
+      SSH_PORT: 2222
+    service:
+      DISABLE_REGISTRATION: false
+    webhook:
+      ALLOWED_HOST_LIST: "*"
+
+# HTTP service exposed on port 3000 via k3s LoadBalancer
+service:
+  http:
+    type: LoadBalancer
+    port: 3000
+  ssh:
+    type: LoadBalancer
+    port: 2222
+
+# Persistence for Gitea data
+persistence:
+  enabled: true
+  size: 10Gi
+
+# Bundled PostgreSQL
+postgresql:
+  enabled: true
+  global:
+    postgresql:
+      auth:
+        password: gitea
+        database: gitea
+        username: gitea
+  primary:
+    persistence:
+      size: 5Gi
+
+# Bundled Redis (used for caching)
+redis-cluster:
+  enabled: false
+
+redis:
+  enabled: false
+
+# Resource requests for local dev
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi

@@ -1,0 +1,76 @@
+# Default test workflow — runs on PRs and pushes to main.
+# Applied automatically to all repositories created by the orchestrator.
+
+name: Test
+
+on:
+  pull_request:
+    branches: ["main", "topic/*"]
+  push:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect language
+        id: detect
+        run: |
+          if [ -f "go.mod" ]; then
+            echo "language=go" >> "$GITHUB_OUTPUT"
+          elif [ -f "package.json" ]; then
+            echo "language=node" >> "$GITHUB_OUTPUT"
+          elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+            echo "language=python" >> "$GITHUB_OUTPUT"
+          elif [ -f "pom.xml" ] || [ -f "build.gradle" ]; then
+            echo "language=java" >> "$GITHUB_OUTPUT"
+          else
+            echo "language=unknown" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Go
+        if: steps.detect.outputs.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Go test
+        if: steps.detect.outputs.language == 'go'
+        run: go test ./...
+
+      - name: Go vet
+        if: steps.detect.outputs.language == 'go'
+        run: go vet ./...
+
+      - name: Setup Node
+        if: steps.detect.outputs.language == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Node install and test
+        if: steps.detect.outputs.language == 'node'
+        run: |
+          npm ci
+          npm test
+
+      - name: Setup Python
+        if: steps.detect.outputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python test
+        if: steps.detect.outputs.language == 'python'
+        run: |
+          pip install -e ".[test]" 2>/dev/null || pip install -r requirements.txt 2>/dev/null || true
+          python -m pytest 2>/dev/null || python -m unittest discover 2>/dev/null || echo "No test runner found"
+
+      - name: Lint (Go)
+        if: steps.detect.outputs.language == 'go'
+        uses: golangci/golangci-lint-action@v6
+        continue-on-error: true

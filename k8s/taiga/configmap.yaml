@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: taiga-config
+  namespace: taiga
+data:
+  # Database
+  POSTGRES_DB: "taiga"
+  POSTGRES_USER: "taiga"
+  POSTGRES_HOST: "taiga-db"
+  POSTGRES_PORT: "5432"
+
+  # Taiga core
+  TAIGA_SITES_SCHEME: "http"
+  TAIGA_SITES_DOMAIN: "localhost:9000"
+  TAIGA_SUBPATH: ""
+
+  # RabbitMQ (single instance for both events and async)
+  RABBITMQ_USER: "taiga"
+  TAIGA_EVENTS_RABBITMQ_HOST: "taiga-rabbitmq"
+  TAIGA_ASYNC_RABBITMQ_HOST: "taiga-rabbitmq"
+
+  # Webhooks
+  WEBHOOKS_ENABLED: "True"
+  WEBHOOKS_ALLOW_PRIVATE_ADDRESS: "True"
+
+  # Email (console backend for local dev)
+  EMAIL_BACKEND: "django.core.mail.backends.console.EmailBackend"
+  DEFAULT_FROM_EMAIL: "taiga@dev-env.local"
+
+  # Misc
+  ENABLE_TELEMETRY: "False"
+  PUBLIC_REGISTER_ENABLED: "True"
+  CELERY_ENABLED: "True"
+  DEBUG: "False"
+  SESSION_COOKIE_SECURE: "False"
+  CSRF_COOKIE_SECURE: "False"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: taiga-front-config
+  namespace: taiga
+data:
+  TAIGA_URL: "http://localhost:9000"
+  TAIGA_WEBSOCKETS_URL: "ws://localhost:9000"
+  TAIGA_SUBPATH: ""
+  PUBLIC_REGISTER_ENABLED: "true"

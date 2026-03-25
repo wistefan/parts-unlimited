@@ -1,0 +1,79 @@
+## Single RabbitMQ instance serving both events and async queues.
+## Consolidates the two separate instances from the official docker-compose.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taiga-rabbitmq
+  namespace: taiga
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: taiga-rabbitmq
+  template:
+    metadata:
+      labels:
+        app: taiga-rabbitmq
+    spec:
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:3.8-management-alpine
+          ports:
+            - containerPort: 5672
+              name: amqp
+            - containerPort: 15672
+              name: management
+          env:
+            - name: RABBITMQ_ERLANG_COOKIE
+              value: "dev-env-erlang-cookie"
+            - name: RABBITMQ_DEFAULT_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: taiga-config
+                  key: RABBITMQ_USER
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: taiga-secret
+                  key: rabbitmq-password
+            - name: RABBITMQ_DEFAULT_VHOST
+              value: "taiga"
+          volumeMounts:
+            - name: rabbitmq-data
+              mountPath: /var/lib/rabbitmq
+          readinessProbe:
+            exec:
+              command:
+                - rabbitmq-diagnostics
+                - -q
+                - ping
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: rabbitmq-data
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: taiga-rabbitmq
+  namespace: taiga
+spec:
+  selector:
+    app: taiga-rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: 5672
+    - name: management
+      port: 15672
+      targetPort: 15672

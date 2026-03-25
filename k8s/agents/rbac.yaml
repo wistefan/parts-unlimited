@@ -1,0 +1,63 @@
+## ServiceAccount and RBAC for agent workers.
+## Agents get zero Kubernetes API permissions — they cannot read secrets,
+## configmaps, or interact with the cluster in any way.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent-worker
+  namespace: agents
+automountServiceAccountToken: false
+
+---
+## The orchestrator needs permissions to manage Jobs in the agents namespace.
+## This is a separate ServiceAccount with scoped permissions.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orchestrator
+  namespace: agents
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orchestrator-role
+  namespace: agents
+rules:
+  # Manage agent worker Jobs
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # Read Job pod status
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Read pod logs for monitoring
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Manage orchestrator state ConfigMap
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "update", "patch"]
+  # Read secrets (agent credentials)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orchestrator-binding
+  namespace: agents
+subjects:
+  - kind: ServiceAccount
+    name: orchestrator
+    namespace: agents
+roleRef:
+  kind: Role
+  name: orchestrator-role
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taiga-back
+  namespace: taiga
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: taiga-back
+  template:
+    metadata:
+      labels:
+        app: taiga-back
+    spec:
+      containers:
+        - name: taiga-back
+          image: taigaio/taiga-back:latest
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: taiga-config
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: taiga-secret
+                  key: postgres-password
+            - name: RABBITMQ_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: taiga-secret
+                  key: rabbitmq-password
+            - name: TAIGA_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: taiga-secret
+                  key: secret-key
+          volumeMounts:
+            - name: taiga-static
+              mountPath: /taiga-back/static
+            - name: taiga-media
+              mountPath: /taiga-back/media
+          readinessProbe:
+            httpGet:
+              path: /api/v1/
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/v1/
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: taiga-static
+          persistentVolumeClaim:
+            claimName: taiga-static
+        - name: taiga-media
+          persistentVolumeClaim:
+            claimName: taiga-media
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: taiga-back
+  namespace: taiga
+spec:
+  selector:
+    app: taiga-back
+  ports:
+    - port: 8000
+      targetPort: 8000
