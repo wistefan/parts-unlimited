@@ -36,7 +36,7 @@ persistence:
   enabled: true
   size: 10Gi
 
-# Bundled PostgreSQL
+# Bundled PostgreSQL (single-node, not HA)
 postgresql:
   enabled: true
   global:
@@ -48,6 +48,9 @@ postgresql:
   primary:
     persistence:
       size: 5Gi
+
+postgresql-ha:
+  enabled: false
 
 # Bundled Redis (used for caching)
 redis-cluster:
