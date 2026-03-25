@@ -43,28 +43,30 @@ echo "Creating human user '${HUMAN_USERNAME}' (admin)..."
 EXISTING_USER=$(curl -sf ${AUTH} "${GITEA_URL}/api/v1/users/${HUMAN_USERNAME}" 2>/dev/null \
     | python3 -c "import sys,json; print(json.load(sys.stdin).get('login',''))" 2>/dev/null || true)
 
-if [ "${EXISTING_USER}" = "${HUMAN_USERNAME}" ]; then
-    echo "  User '${HUMAN_USERNAME}' already exists. Ensuring admin privileges..."
-    curl -sf ${AUTH} -X PATCH "${GITEA_URL}/api/v1/admin/users/${HUMAN_USERNAME}" \
-        -H "Content-Type: application/json" \
-        -d "{
-            \"login_name\": \"${HUMAN_USERNAME}\",
-            \"source_id\": 0,
-            \"is_admin\": true
-        }" >/dev/null
-    echo "  Admin privileges ensured."
-else
+if [ "${EXISTING_USER}" != "${HUMAN_USERNAME}" ]; then
     curl -sf ${AUTH} -X POST "${GITEA_URL}/api/v1/admin/users" \
         -H "Content-Type: application/json" \
         -d "{
             \"username\": \"${HUMAN_USERNAME}\",
             \"password\": \"${HUMAN_PASSWORD}\",
             \"email\": \"${HUMAN_EMAIL}\",
-            \"must_change_password\": false,
-            \"is_admin\": true
+            \"must_change_password\": false
         }" >/dev/null
-    echo "  User '${HUMAN_USERNAME}' created with admin privileges."
+    echo "  User '${HUMAN_USERNAME}' created."
+else
+    echo "  User '${HUMAN_USERNAME}' already exists."
 fi
+
+# Promote to admin (separate PATCH — Gitea uses 'admin' field, not 'is_admin')
+echo "  Ensuring admin privileges..."
+curl -sf ${AUTH} -X PATCH "${GITEA_URL}/api/v1/admin/users/${HUMAN_USERNAME}" \
+    -H "Content-Type: application/json" \
+    -d "{
+        \"login_name\": \"${HUMAN_USERNAME}\",
+        \"source_id\": 0,
+        \"admin\": true
+    }" >/dev/null
+echo "  Admin privileges set."
 
 echo ""
 echo "Gitea initialization complete."
