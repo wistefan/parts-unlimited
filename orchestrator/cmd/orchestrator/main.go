@@ -335,11 +335,16 @@ func (o *orchestrator) registerWebhookHandlers() {
 			return nil
 		}
 
-		// Check for human input on in-progress tickets (new comment or description edit).
-		// When the human provides input, re-spawn the agent to continue work.
+		// Check for human input on in-progress tickets. Only re-spawn the agent
+		// when the ticket is no longer assigned to the human — this means the
+		// human has finished providing input and handed the ticket back.
 		if o.isHumanInput(event) && strings.EqualFold(data.Status.Name, StatusInProgress) {
-			log.Printf("Ticket #%d: human input detected (by %s), re-spawning agent", data.ID, event.By.Username)
-			o.respawnAgent(data.ID)
+			if !o.isAssignedToHuman(data) {
+				log.Printf("Ticket #%d: human input detected (by %s), ticket unassigned from human, re-spawning agent", data.ID, event.By.Username)
+				o.respawnAgent(data.ID)
+			} else {
+				log.Printf("Ticket #%d: human input detected (by %s), still assigned to human — waiting", data.ID, event.By.Username)
+			}
 			return nil
 		}
 
@@ -394,6 +399,22 @@ func (o *orchestrator) isHumanInput(event *webhooks.WebhookEvent) bool {
 		}
 	}
 
+	return false
+}
+
+// isAssignedToHuman checks whether the ticket is currently assigned to the human user.
+func (o *orchestrator) isAssignedToHuman(data *webhooks.UserStoryData) bool {
+	if o.humanTaigaID == 0 {
+		return false
+	}
+	if data.AssignedTo != nil && data.AssignedTo.ID == o.humanTaigaID {
+		return true
+	}
+	for _, uid := range data.AssignedUsers {
+		if uid == o.humanTaigaID {
+			return true
+		}
+	}
 	return false
 }
 
