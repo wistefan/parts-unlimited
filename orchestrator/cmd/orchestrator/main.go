@@ -326,12 +326,14 @@ func (o *orchestrator) registerWebhookHandlers() {
 		if err != nil {
 			return err
 		}
-		if statusChange != nil {
+		if statusChange != nil && statusChange.From != statusChange.To {
 			if strings.EqualFold(statusChange.To, StatusReady) {
 				log.Printf("Ticket #%d moved to ready, enqueuing", data.ID)
 				o.assignEngine.Enqueue(data.ID)
 				o.processQueue()
+				return nil
 			}
+			// Status changed to something other than "ready" — not our concern
 			return nil
 		}
 
