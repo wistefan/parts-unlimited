@@ -40,28 +40,40 @@ Both services also have a configurable **human user** (default: `wistefan` / `pa
 
 This section explains the day-to-day workflow: how to create work for the agents, what to expect while they work, and how to review and merge the results.
 
-### Providing the Anthropic API Key
+### Claude Credentials
 
-Before agents can do any work, they need an Anthropic API key. You can create or manage API keys at https://console.anthropic.com under **API Keys**.
+Before agents can do any work, they need credentials to call the Anthropic API. Two mechanisms are supported; both can be active at the same time, with the API key taking precedence.
 
-The setup script creates the Kubernetes Secret automatically. It checks for a key in this order:
+**Option 1: API key** — a standard API key from the [Anthropic Console](https://console.anthropic.com) (under **API Keys**). Straightforward and does not expire unless revoked.
 
-1. **`ANTHROPIC_API_KEY` environment variable** — a standard API key from the console (recommended for long-running setups):
-   ```bash
-   ANTHROPIC_API_KEY='sk-ant-...' sudo -E ./scripts/setup.sh
-   ```
-2. **`~/.claude/.credentials.json`** — if you have logged in with `claude login`, the setup script reads the OAuth access token from the credentials file. This works but the token expires periodically, so you may need to re-run setup after it rotates.
+```bash
+ANTHROPIC_API_KEY='sk-ant-...' sudo -E ./scripts/setup.sh
+```
 
-If neither source is found, the script prints a warning and agents will not start until the secret is created manually.
+**Option 2: Credentials file** — if you have logged in with `claude login` on the host, the setup script copies `~/.claude/.credentials.json` into the cluster. Each agent container gets its own copy and handles OAuth token refresh independently.
 
-To add or rotate the key after setup:
+```bash
+# Just run setup — it picks up the credentials file automatically
+sudo ./scripts/setup.sh
+```
+
+Both can be provided. If `ANTHROPIC_API_KEY` is set, agents use it directly. Otherwise they fall back to the mounted credentials file. If neither source is found, the script prints a warning.
+
+To update credentials after setup:
 
 ```bash
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
+# Update API key
 kubectl create secret generic anthropic-api-key \
   --namespace=agents \
   --from-literal=api-key='sk-ant-...' \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Or update credentials file (e.g., after re-running 'claude login')
+kubectl create secret generic claude-credentials \
+  --namespace=agents \
+  --from-file=credentials.json=~/.claude/.credentials.json \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
@@ -242,7 +254,7 @@ The script is idempotent — running it again will upgrade existing deployments 
 | `HUMAN_USERNAME` | `wistefan` | Human user created in both Gitea and Taiga |
 | `HUMAN_PASSWORD` | `password` | Password for the human user |
 | `HUMAN_EMAIL` | `<username>@dev-env.local` | Email for the human user |
-| `ANTHROPIC_API_KEY` | *(none)* | Anthropic API key for agents. If set, stored as a K8s Secret during setup. |
+| `ANTHROPIC_API_KEY` | *(none)* | Anthropic API key. If set, used instead of `~/.claude/.credentials.json`. |
 
 The human user is created with **admin privileges** in both Gitea (site admin) and Taiga (superuser), allowing full control over all projects, users, and settings.
 
@@ -491,7 +503,10 @@ docker build -t agent-worker:latest .
 | `TAIGA_URL` | Yes | Taiga base URL |
 | `TAIGA_USERNAME` | Yes | Taiga credentials for this agent |
 | `TAIGA_PASSWORD` | Yes | |
-| `ANTHROPIC_API_KEY` | Yes | Shared Anthropic API key |
+| `ANTHROPIC_API_KEY` | No* | API key from K8s Secret `anthropic-api-key` (takes precedence if present) |
+| *(Claude credentials)* | No* | Mounted at `/home/agent/.claude/.credentials.json` from K8s Secret `claude-credentials` |
+
+\* At least one of `ANTHROPIC_API_KEY` or the credentials file must be available.
 | `PLAN_STEP` | No | Implementation plan step number |
 | `REPO_OWNER` | No | Gitea repo owner (extracted from ticket if not set) |
 | `REPO_NAME` | No | Gitea repo name (extracted from ticket if not set) |

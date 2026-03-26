@@ -246,7 +246,8 @@ Secrets are stored as Kubernetes Secrets in the `agents` namespace:
 
 | Secret | Contents | Used By |
 |---|---|---|
-| `anthropic-api-key` | Anthropic API key for Claude | Agent Jobs, Orchestrator (PR review) |
+| `anthropic-api-key` | (Optional) Anthropic API key — takes precedence over credentials file if present | Agent Jobs, Orchestrator (PR review) |
+| `claude-credentials` | (Optional) Claude Code credentials file (`~/.claude/.credentials.json`) — copied from the host during setup; each agent gets its own copy and handles OAuth refresh independently | Agent Jobs, Orchestrator (PR review) |
 | `orchestrator-admin` | Gitea admin token, Taiga admin credentials | Orchestrator (user management) |
 | `agent-credentials` | Per-agent Gitea tokens and Taiga credentials | Injected into agent Jobs at creation |
 | `webhook-secret` | HMAC key for Taiga webhook signature verification | Orchestrator |

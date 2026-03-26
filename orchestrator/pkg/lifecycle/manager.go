@@ -176,6 +176,11 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 									Name:      "workspace",
 									MountPath: "/home/agent/workspace",
 								},
+								{
+									Name:      "claude-credentials",
+									MountPath: "/home/agent/.claude",
+									ReadOnly:  true,
+								},
 							},
 						},
 					},
@@ -184,6 +189,20 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 							Name: "workspace",
 							VolumeSource: corev1.VolumeSource{
 								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+						{
+							Name: "claude-credentials",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: "claude-credentials",
+									Items: []corev1.KeyToPath{
+										{
+											Key:  "credentials.json",
+											Path: ".credentials.json",
+										},
+									},
+								},
 							},
 						},
 					},
@@ -364,17 +383,21 @@ func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 				},
 			},
 		},
-		// API key from Secret
-		corev1.EnvVar{
-			Name: "ANTHROPIC_API_KEY",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: "anthropic-api-key"},
-					Key:                  "api-key",
-				},
+	)
+
+	// Optional: if the anthropic-api-key Secret exists, it takes
+	// precedence over the mounted credentials file.
+	optional := true
+	envVars = append(envVars, corev1.EnvVar{
+		Name: "ANTHROPIC_API_KEY",
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "anthropic-api-key"},
+				Key:                  "api-key",
+				Optional:             &optional,
 			},
 		},
-	)
+	})
 
 	return envVars
 }

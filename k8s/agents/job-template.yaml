@@ -87,14 +87,20 @@ spec:
                 secretKeyRef:
                   name: agent-credentials-${AGENT_ID}
                   key: taiga-password
+            # Optional: if the anthropic-api-key secret exists, it takes
+            # precedence over the mounted credentials file.
             - name: ANTHROPIC_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: anthropic-api-key
                   key: api-key
+                  optional: true
           volumeMounts:
             - name: workspace
               mountPath: /home/agent/workspace
+            - name: claude-credentials
+              mountPath: /home/agent/.claude
+              readOnly: true
           resources:
             requests:
               cpu: 250m
@@ -106,6 +112,12 @@ spec:
         - name: workspace
           emptyDir:
             sizeLimit: 10Gi
+        - name: claude-credentials
+          secret:
+            secretName: claude-credentials
+            items:
+              - key: credentials.json
+                path: .credentials.json
 
 ---
 ## Service endpoints ConfigMap — shared by all agent Jobs.

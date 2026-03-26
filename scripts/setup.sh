@@ -196,49 +196,44 @@ echo ""
 
 # --- Step 8: Anthropic API key ---
 
-echo "=== Step 8: Anthropic API Key ==="
-RESOLVED_API_KEY="${ANTHROPIC_API_KEY:-}"
+echo "=== Step 8: Claude Credentials ==="
+CLAUDE_CREDENTIALS="${REAL_HOME}/.claude/.credentials.json"
 
-# If no env var, try to read from Claude Code's OAuth credentials
-if [ -z "${RESOLVED_API_KEY}" ]; then
-    CLAUDE_CREDENTIALS="${REAL_HOME}/.claude/.credentials.json"
-    if [ -f "${CLAUDE_CREDENTIALS}" ]; then
-        RESOLVED_API_KEY=$(python3 -c "
-import json, sys
-with open('${CLAUDE_CREDENTIALS}') as f:
-    creds = json.load(f)
-oauth = creds.get('claudeAiOauth', {})
-token = oauth.get('accessToken', '')
-if token:
-    print(token)
-" 2>/dev/null || true)
-        if [ -n "${RESOLVED_API_KEY}" ]; then
-            echo "  Read API key from ${CLAUDE_CREDENTIALS}"
-            echo "  NOTE: This is an OAuth token that expires periodically."
-            echo "  For long-running setups, consider using a standard API key"
-            echo "  from https://console.anthropic.com instead:"
-            echo "    ANTHROPIC_API_KEY='sk-ant-...' sudo -E ./scripts/setup.sh"
-        fi
-    fi
-fi
+# Two credential mechanisms are supported. If ANTHROPIC_API_KEY is set, it is
+# stored as a dedicated Secret and takes precedence at runtime. The credentials
+# file is always set up as a fallback (from ~/.claude/.credentials.json).
 
-if [ -n "${RESOLVED_API_KEY}" ]; then
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     kubectl create secret generic anthropic-api-key \
         --namespace=agents \
-        --from-literal=api-key="${RESOLVED_API_KEY}" \
+        --from-literal=api-key="${ANTHROPIC_API_KEY}" \
         --dry-run=client -o yaml | kubectl apply -f -
-    echo "  API key secret created."
-else
-    # Check if the secret already exists
-    if kubectl get secret anthropic-api-key -n agents &>/dev/null; then
-        echo "  API key secret already exists."
+    echo "  API key secret created from ANTHROPIC_API_KEY."
+fi
+
+if [ -f "${CLAUDE_CREDENTIALS}" ]; then
+    # Copy the host's Claude Code credentials file into the cluster.
+    # Each agent container gets its own copy and handles OAuth refresh
+    # independently.
+    kubectl create secret generic claude-credentials \
+        --namespace=agents \
+        --from-file=credentials.json="${CLAUDE_CREDENTIALS}" \
+        --dry-run=client -o yaml | kubectl apply -f -
+    echo "  Credentials file secret created from ${CLAUDE_CREDENTIALS}."
+fi
+
+# Check that at least one credential source is available
+if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ ! -f "${CLAUDE_CREDENTIALS}" ]; then
+    if kubectl get secret anthropic-api-key -n agents &>/dev/null || \
+       kubectl get secret claude-credentials -n agents &>/dev/null; then
+        echo "  Using existing credential secrets."
     else
-        echo "  WARNING: No API key found. Checked:"
+        echo "  WARNING: No Claude credentials found. Checked:"
         echo "    - ANTHROPIC_API_KEY environment variable"
-        echo "    - ${REAL_HOME}/.claude/.credentials.json"
-        echo "  Agents will not be able to run until the secret is created:"
-        echo "    kubectl create secret generic anthropic-api-key \\"
-        echo "      --namespace=agents --from-literal=api-key='sk-ant-...'"
+        echo "    - ${CLAUDE_CREDENTIALS}"
+        echo "  Agents will not be able to run until credentials are provided."
+        echo "  Either run 'claude login' and re-run setup, or provide an API key:"
+        echo "    ANTHROPIC_API_KEY='sk-ant-...' sudo -E ./scripts/setup.sh"
     fi
 fi
 echo ""

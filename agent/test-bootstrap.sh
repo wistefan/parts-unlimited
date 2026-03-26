@@ -93,12 +93,11 @@ REQUIRED_VARS=(
     TICKET_ID AGENT_ID AGENT_SPECIALIZATION
     GITEA_URL GITEA_USERNAME GITEA_PASSWORD
     TAIGA_URL TAIGA_USERNAME TAIGA_PASSWORD
-    ANTHROPIC_API_KEY
 )
 
-assert_eq "required vars count" "10" "${#REQUIRED_VARS[@]}"
+assert_eq "required vars count" "9" "${#REQUIRED_VARS[@]}"
 assert_contains "TICKET_ID in required" "TICKET_ID" "${REQUIRED_VARS[*]}"
-assert_contains "ANTHROPIC_API_KEY in required" "ANTHROPIC_API_KEY" "${REQUIRED_VARS[*]}"
+assert_contains "TAIGA_PASSWORD in required" "TAIGA_PASSWORD" "${REQUIRED_VARS[*]}"
 
 echo ""
 

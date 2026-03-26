@@ -13,7 +13,9 @@
 #   TAIGA_URL              - Taiga base URL
 #   TAIGA_USERNAME         - Taiga username for this agent
 #   TAIGA_PASSWORD         - Taiga password for this agent
-#   ANTHROPIC_API_KEY      - Anthropic API key for Claude
+#
+# Claude credentials are provided via a mounted file at
+# /home/agent/.claude/.credentials.json (from K8s Secret).
 #
 # Optional environment variables:
 #   PLAN_STEP              - Implementation plan step number to work on
@@ -33,8 +35,9 @@ REQUIRED_VARS=(
     TICKET_ID AGENT_ID AGENT_SPECIALIZATION
     GITEA_URL GITEA_USERNAME GITEA_PASSWORD
     TAIGA_URL TAIGA_USERNAME TAIGA_PASSWORD
-    ANTHROPIC_API_KEY
 )
+
+CLAUDE_CREDENTIALS="/home/agent/.claude/.credentials.json"
 
 for var in "${REQUIRED_VARS[@]}"; do
     if [ -z "${!var:-}" ]; then
@@ -42,6 +45,12 @@ for var in "${REQUIRED_VARS[@]}"; do
         exit 1
     fi
 done
+
+if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ ! -f "${CLAUDE_CREDENTIALS}" ]; then
+    echo "ERROR: No Claude credentials found."
+    echo "  Provide either ANTHROPIC_API_KEY env var or mount credentials at ${CLAUDE_CREDENTIALS}."
+    exit 1
+fi
 
 PLAN_STEP="${PLAN_STEP:-}"
 ALLOWED_TOOLS="${ALLOWED_TOOLS:-Read Edit Write Glob Grep Bash}"

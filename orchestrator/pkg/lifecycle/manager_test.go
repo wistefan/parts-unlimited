@@ -127,9 +127,33 @@ func TestCreateJob(t *testing.T) {
 	if envMap["PLAN_STEP"].Value != "3" {
 		t.Errorf("expected PLAN_STEP=3, got %s", envMap["PLAN_STEP"].Value)
 	}
-	// ANTHROPIC_API_KEY should come from secret
-	if envMap["ANTHROPIC_API_KEY"].ValueFrom == nil || envMap["ANTHROPIC_API_KEY"].ValueFrom.SecretKeyRef == nil {
+	// ANTHROPIC_API_KEY should be optional from secret
+	apiKeyEnv := envMap["ANTHROPIC_API_KEY"]
+	if apiKeyEnv.ValueFrom == nil || apiKeyEnv.ValueFrom.SecretKeyRef == nil {
 		t.Error("expected ANTHROPIC_API_KEY from secret")
+	} else if apiKeyEnv.ValueFrom.SecretKeyRef.Optional == nil || !*apiKeyEnv.ValueFrom.SecretKeyRef.Optional {
+		t.Error("expected ANTHROPIC_API_KEY secret ref to be optional")
+	}
+	// Claude credentials should be mounted as a volume
+	var hasCredentialsMount bool
+	for _, vm := range container.VolumeMounts {
+		if vm.Name == "claude-credentials" && vm.MountPath == "/home/agent/.claude" && vm.ReadOnly {
+			hasCredentialsMount = true
+			break
+		}
+	}
+	if !hasCredentialsMount {
+		t.Error("expected claude-credentials volume mount at /home/agent/.claude")
+	}
+	var hasCredentialsVolume bool
+	for _, v := range podSpec.Volumes {
+		if v.Name == "claude-credentials" && v.Secret != nil && v.Secret.SecretName == "claude-credentials" {
+			hasCredentialsVolume = true
+			break
+		}
+	}
+	if !hasCredentialsVolume {
+		t.Error("expected claude-credentials volume from secret")
 	}
 	// GITEA_URL should come from configmap
 	if envMap["GITEA_URL"].ValueFrom == nil || envMap["GITEA_URL"].ValueFrom.ConfigMapKeyRef == nil {
