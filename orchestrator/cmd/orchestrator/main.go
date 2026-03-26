@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -95,6 +97,17 @@ func main() {
 
 	// Register webhook event handlers
 	orch.registerWebhookHandlers()
+
+	// Generate a webhook secret if none was configured
+	if cfg.Taiga.WebhookSecret == "" {
+		secret, err := generateSecret()
+		if err != nil {
+			log.Fatalf("Failed to generate webhook secret: %v", err)
+		}
+		cfg.Taiga.WebhookSecret = secret
+		orch.webhookHandler = webhooks.NewHandler(secret)
+		log.Printf("  Generated webhook secret (none was configured)")
+	}
 
 	// Register the webhook with Taiga
 	if err := orch.registerTaigaWebhook(ctx); err != nil {
@@ -535,4 +548,13 @@ func (o *orchestrator) saveState(ctx context.Context) {
 	if err := o.stateMgr.Save(ctx, orchState); err != nil {
 		log.Printf("ERROR: Failed to save state: %v", err)
 	}
+}
+
+// generateSecret creates a random hex-encoded secret for webhook HMAC verification.
+func generateSecret() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
