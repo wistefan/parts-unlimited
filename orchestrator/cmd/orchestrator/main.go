@@ -340,7 +340,11 @@ func (o *orchestrator) registerWebhookHandlers() {
 		// Check for human input on in-progress tickets. Only re-spawn the agent
 		// when the ticket is no longer assigned to the human — this means the
 		// human has finished providing input and handed the ticket back.
-		if o.isHumanInput(event) && strings.EqualFold(data.Status.Name, StatusInProgress) {
+		humanInput := o.isHumanInput(event)
+		statusName := data.Status.Name
+		log.Printf("Ticket #%d: change by %s — humanInput=%v, status=%q", data.ID, event.By.Username, humanInput, statusName)
+
+		if humanInput && strings.EqualFold(statusName, StatusInProgress) {
 			if !o.isAssignedToHuman(data) {
 				log.Printf("Ticket #%d: human input detected (by %s), ticket unassigned from human, re-spawning agent", data.ID, event.By.Username)
 				o.respawnAgent(data.ID)
