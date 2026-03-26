@@ -40,6 +40,27 @@ Both services also have a configurable **human user** (default: `wistefan` / `pa
 
 This section explains the day-to-day workflow: how to create work for the agents, what to expect while they work, and how to review and merge the results.
 
+### Providing the Anthropic API Key
+
+Before agents can do any work, you must provide your Anthropic API key as a Kubernetes Secret. The orchestrator and all agent workers read it from this secret. You can create or manage API keys at https://console.anthropic.com under **API Keys**.
+
+```bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+kubectl create secret generic anthropic-api-key \
+  --namespace=agents \
+  --from-literal=api-key='sk-ant-...'
+```
+
+This only needs to be done once. The secret persists across restarts. To rotate the key, delete and recreate the secret:
+
+```bash
+kubectl delete secret anthropic-api-key -n agents
+kubectl create secret generic anthropic-api-key \
+  --namespace=agents \
+  --from-literal=api-key='sk-ant-NEW-KEY'
+```
+
 ### Creating a Ticket
 
 All work starts as a **user story** on the Taiga Kanban board.
