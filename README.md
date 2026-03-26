@@ -42,23 +42,27 @@ This section explains the day-to-day workflow: how to create work for the agents
 
 ### Providing the Anthropic API Key
 
-Before agents can do any work, you must provide your Anthropic API key as a Kubernetes Secret. The orchestrator and all agent workers read it from this secret. You can create or manage API keys at https://console.anthropic.com under **API Keys**.
+Before agents can do any work, they need an Anthropic API key. You can create or manage API keys at https://console.anthropic.com under **API Keys**.
+
+The setup script creates the Kubernetes Secret automatically. It checks for a key in this order:
+
+1. **`ANTHROPIC_API_KEY` environment variable** — a standard API key from the console (recommended for long-running setups):
+   ```bash
+   ANTHROPIC_API_KEY='sk-ant-...' sudo -E ./scripts/setup.sh
+   ```
+2. **`~/.claude/.credentials.json`** — if you have logged in with `claude login`, the setup script reads the OAuth access token from the credentials file. This works but the token expires periodically, so you may need to re-run setup after it rotates.
+
+If neither source is found, the script prints a warning and agents will not start until the secret is created manually.
+
+To add or rotate the key after setup:
 
 ```bash
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
 kubectl create secret generic anthropic-api-key \
   --namespace=agents \
-  --from-literal=api-key='sk-ant-...'
-```
-
-This only needs to be done once. The secret persists across restarts. To rotate the key, delete and recreate the secret:
-
-```bash
-kubectl delete secret anthropic-api-key -n agents
-kubectl create secret generic anthropic-api-key \
-  --namespace=agents \
-  --from-literal=api-key='sk-ant-NEW-KEY'
+  --from-literal=api-key='sk-ant-...' \
+  --dry-run=client -o yaml | kubectl apply -f -
 ```
 
 ### Creating a Ticket
@@ -238,6 +242,7 @@ The script is idempotent — running it again will upgrade existing deployments 
 | `HUMAN_USERNAME` | `wistefan` | Human user created in both Gitea and Taiga |
 | `HUMAN_PASSWORD` | `password` | Password for the human user |
 | `HUMAN_EMAIL` | `<username>@dev-env.local` | Email for the human user |
+| `ANTHROPIC_API_KEY` | *(none)* | Anthropic API key for agents. If set, stored as a K8s Secret during setup. |
 
 The human user is created with **admin privileges** in both Gitea (site admin) and Taiga (superuser), allowing full control over all projects, users, and settings.
 

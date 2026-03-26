@@ -194,9 +194,58 @@ echo "=== Step 7: Agent policies ==="
 kubectl apply -f "${PROJECT_DIR}/k8s/agents/policies.yaml"
 echo ""
 
-# --- Step 8: CI/CD Runner (optional) ---
+# --- Step 8: Anthropic API key ---
 
-echo "=== Step 8: CI/CD Runner ==="
+echo "=== Step 8: Anthropic API Key ==="
+RESOLVED_API_KEY="${ANTHROPIC_API_KEY:-}"
+
+# If no env var, try to read from Claude Code's OAuth credentials
+if [ -z "${RESOLVED_API_KEY}" ]; then
+    CLAUDE_CREDENTIALS="${REAL_HOME}/.claude/.credentials.json"
+    if [ -f "${CLAUDE_CREDENTIALS}" ]; then
+        RESOLVED_API_KEY=$(python3 -c "
+import json, sys
+with open('${CLAUDE_CREDENTIALS}') as f:
+    creds = json.load(f)
+oauth = creds.get('claudeAiOauth', {})
+token = oauth.get('accessToken', '')
+if token:
+    print(token)
+" 2>/dev/null || true)
+        if [ -n "${RESOLVED_API_KEY}" ]; then
+            echo "  Read API key from ${CLAUDE_CREDENTIALS}"
+            echo "  NOTE: This is an OAuth token that expires periodically."
+            echo "  For long-running setups, consider using a standard API key"
+            echo "  from https://console.anthropic.com instead:"
+            echo "    ANTHROPIC_API_KEY='sk-ant-...' sudo -E ./scripts/setup.sh"
+        fi
+    fi
+fi
+
+if [ -n "${RESOLVED_API_KEY}" ]; then
+    kubectl create secret generic anthropic-api-key \
+        --namespace=agents \
+        --from-literal=api-key="${RESOLVED_API_KEY}" \
+        --dry-run=client -o yaml | kubectl apply -f -
+    echo "  API key secret created."
+else
+    # Check if the secret already exists
+    if kubectl get secret anthropic-api-key -n agents &>/dev/null; then
+        echo "  API key secret already exists."
+    else
+        echo "  WARNING: No API key found. Checked:"
+        echo "    - ANTHROPIC_API_KEY environment variable"
+        echo "    - ${REAL_HOME}/.claude/.credentials.json"
+        echo "  Agents will not be able to run until the secret is created:"
+        echo "    kubectl create secret generic anthropic-api-key \\"
+        echo "      --namespace=agents --from-literal=api-key='sk-ant-...'"
+    fi
+fi
+echo ""
+
+# --- Step 9: CI/CD Runner (optional) ---
+
+echo "=== Step 9: CI/CD Runner ==="
 # The act-runner needs a registration token from Gitea.
 # Generate one via the Gitea API and create the secret.
 echo "Generating Gitea Actions runner registration token..."
@@ -218,9 +267,9 @@ else
 fi
 echo ""
 
-# --- Step 9: Verify ---
+# --- Step 10: Verify ---
 
-echo "=== Step 9: Verification ==="
+echo "=== Step 10: Verification ==="
 bash "${SCRIPT_DIR}/verify.sh"
 
 echo ""
