@@ -262,9 +262,56 @@ else
 fi
 echo ""
 
-# --- Step 10: Verify ---
+# --- Step 10: Build container images ---
 
-echo "=== Step 10: Verification ==="
+echo "=== Step 10: Container Images ==="
+
+# Check for Docker or nerdctl (k3s ships with nerdctl-compatible ctr)
+if command -v docker &>/dev/null; then
+    BUILD_CMD="docker build"
+    SAVE_CMD="docker save"
+elif command -v nerdctl &>/dev/null; then
+    BUILD_CMD="nerdctl build"
+    SAVE_CMD="nerdctl save"
+else
+    echo "  WARNING: Neither docker nor nerdctl found."
+    echo "  Container images must be built manually."
+    echo "  See README for build instructions."
+    BUILD_CMD=""
+fi
+
+if [ -n "${BUILD_CMD}" ]; then
+    echo "Building orchestrator image..."
+    ${BUILD_CMD} -t orchestrator:latest "${PROJECT_DIR}/orchestrator"
+    echo "  orchestrator:latest built."
+
+    echo "Building agent-worker image..."
+    ${BUILD_CMD} -t agent-worker:latest "${PROJECT_DIR}/agent"
+    echo "  agent-worker:latest built."
+
+    # Import images into k3s containerd if built with Docker
+    if [ "${BUILD_CMD}" = "docker build" ]; then
+        echo "Importing images into k3s..."
+        ${SAVE_CMD} orchestrator:latest | k3s ctr images import -
+        ${SAVE_CMD} agent-worker:latest | k3s ctr images import -
+        echo "  Images imported into k3s containerd."
+    fi
+fi
+echo ""
+
+# --- Step 11: Deploy orchestrator ---
+
+echo "=== Step 11: Orchestrator ==="
+kubectl apply -f "${PROJECT_DIR}/k8s/agents/orchestrator.yaml"
+echo "Waiting for orchestrator to be ready..."
+kubectl wait --for=condition=Available deployment/orchestrator \
+    -n agents --timeout=120s 2>/dev/null || true
+echo "  Orchestrator deployed."
+echo ""
+
+# --- Step 12: Verify ---
+
+echo "=== Step 12: Verification ==="
 bash "${SCRIPT_DIR}/verify.sh"
 
 echo ""

@@ -1,0 +1,109 @@
+## Orchestrator Deployment — coordinates agent workers via Taiga webhooks.
+## Uses the 'orchestrator' ServiceAccount which has RBAC for managing Jobs,
+## ConfigMaps, and Secrets in the agents namespace.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orchestrator-config
+  namespace: agents
+data:
+  config.yaml: |
+    gitea:
+      url: "http://gitea-http.gitea.svc.cluster.local:3000"
+      adminUsername: "claude"
+      adminPassword: "password"
+    taiga:
+      url: "http://taiga-gateway.taiga.svc.cluster.local:9000"
+      adminUsername: "admin"
+      adminPassword: "password"
+      projectSlug: "dev-environment"
+      webhookSecret: ""
+    agents:
+      maxConcurrency: 3
+      idleTimeoutSeconds: 300
+      taskTimeoutSeconds: 3600
+      retryLimit: 2
+      escalationThreshold: 2
+      containerImage: "agent-worker:latest"
+    notifications:
+      webhookUrl: ""
+      dashboardPort: 8080
+      desktopNotify: false
+    kubernetes:
+      namespace: "agents"
+      agentServiceAccount: "agent-worker"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: agents
+  labels:
+    app: orchestrator
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: orchestrator
+  template:
+    metadata:
+      labels:
+        app: orchestrator
+    spec:
+      serviceAccountName: orchestrator
+      containers:
+        - name: orchestrator
+          image: orchestrator:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--config=/etc/orchestrator/config.yaml"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/orchestrator
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: orchestrator-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: agents
+spec:
+  selector:
+    app: orchestrator
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
