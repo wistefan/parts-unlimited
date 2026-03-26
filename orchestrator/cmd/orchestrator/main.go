@@ -593,18 +593,42 @@ func (o *orchestrator) handleDelegation(ticketID int, specialization string) {
 
 // reconcile checks for tickets in "ready" state that may have been missed.
 func (o *orchestrator) reconcile(ctx context.Context) error {
-	stories, err := o.taigaClient.ListUserStories(o.projectID, &taiga.UserStoryListOptions{
+	// Check for "ready" tickets that need assignment
+	readyStories, err := o.taigaClient.ListUserStories(o.projectID, &taiga.UserStoryListOptions{
 		StatusID: o.readyStatusID,
 	})
 	if err != nil {
 		return fmt.Errorf("listing ready tickets: %w", err)
 	}
-
-	for _, story := range stories {
-		existing := o.assignEngine.GetAssignment(story.ID)
-		if existing == nil {
+	for _, story := range readyStories {
+		if o.assignEngine.GetAssignment(story.ID) == nil {
 			log.Printf("Reconcile: found unassigned ready ticket #%d: %s", story.ID, story.Subject)
 			o.assignEngine.Enqueue(story.ID)
+		}
+	}
+
+	// Check for "in progress" tickets that have no running Job and are
+	// not assigned to the human — these need an agent re-spawned.
+	inProgressStories, err := o.taigaClient.ListUserStories(o.projectID, &taiga.UserStoryListOptions{
+		StatusID: o.inProgressID,
+	})
+	if err != nil {
+		log.Printf("WARNING: Could not list in-progress tickets: %v", err)
+	} else {
+		for _, story := range inProgressStories {
+			// Skip if already assigned in the engine or assigned to the human
+			if o.assignEngine.GetAssignment(story.ID) != nil {
+				continue
+			}
+			assignedToHuman := false
+			if story.AssignedTo != nil && *story.AssignedTo == o.humanTaigaID {
+				assignedToHuman = true
+			}
+			if assignedToHuman {
+				continue
+			}
+			log.Printf("Reconcile: in-progress ticket #%d has no agent, re-spawning", story.ID)
+			o.respawnAgent(story.ID)
 		}
 	}
 
@@ -659,15 +683,19 @@ func (o *orchestrator) registerTaigaWebhook(ctx context.Context) error {
 	callbackURL := fmt.Sprintf("http://orchestrator.%s.svc.cluster.local:%d/webhooks/taiga",
 		o.cfg.Kubernetes.Namespace, WebhookListenPort)
 
-	// Check if already registered
+	// Delete any existing webhook with the same name so we can recreate
+	// it with the current secret (the secret changes on every restart
+	// when not explicitly configured).
 	existing, err := o.taigaClient.ListWebhooks(o.projectID)
 	if err != nil {
 		return fmt.Errorf("listing webhooks: %w", err)
 	}
 	for _, wh := range existing {
 		if wh.Name == WebhookName {
-			log.Printf("Taiga webhook already registered (ID: %d)", wh.ID)
-			return nil
+			log.Printf("Deleting existing Taiga webhook (ID: %d) to update secret", wh.ID)
+			if err := o.taigaClient.DeleteWebhook(wh.ID); err != nil {
+				return fmt.Errorf("deleting old webhook: %w", err)
+			}
 		}
 	}
 

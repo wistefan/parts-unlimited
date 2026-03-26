@@ -387,6 +387,23 @@ func (c *Client) ListWebhooks(projectID int) ([]Webhook, error) {
 	return webhooks, nil
 }
 
+// DeleteWebhook removes a webhook by ID.
+func (c *Client) DeleteWebhook(webhookID int) error {
+	path := fmt.Sprintf("/api/v1/webhooks/%d", webhookID)
+
+	resp, err := c.doRequest(http.MethodDelete, path, nil, true)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("delete webhook %d: status %d", webhookID, resp.StatusCode)
+	}
+
+	return nil
+}
+
 // --- Projects ---
 
 // Project represents a Taiga project.
