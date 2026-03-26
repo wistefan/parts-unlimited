@@ -211,7 +211,9 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 	}
 	log.Printf("  Taiga: statuses resolved (ready=%d, in_progress=%d)", readyStatusID, inProgressID)
 
-	// Resolve role for agent memberships (pick the one with the fewest permissions)
+	// Resolve role for agent memberships. Agents need to comment on tickets,
+	// update status, and manage assignments — pick the role with the most
+	// permissions (typically the admin/product-owner role).
 	roles, err := taigaClient.ListRoles(project.ID)
 	if err != nil {
 		return nil, fmt.Errorf("listing taiga roles: %w", err)
@@ -220,9 +222,11 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 		return nil, fmt.Errorf("no roles found for taiga project")
 	}
 	agentRoleID := roles[0].ID
+	maxPerms := len(roles[0].Permissions)
 	for _, r := range roles {
-		if len(r.Permissions) < len(roles[0].Permissions) {
+		if len(r.Permissions) > maxPerms {
 			agentRoleID = r.ID
+			maxPerms = len(r.Permissions)
 		}
 	}
 

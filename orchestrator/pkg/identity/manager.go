@@ -237,7 +237,7 @@ if created:
     user.save()
 
 project = Project.objects.get(id=%d)
-role = project.roles.order_by('-order').first()
+role = max(project.roles.all(), key=lambda r: len(r.permissions or []))
 membership, m_created = Membership.objects.get_or_create(
     project=project, user=user,
     defaults={'role': role, 'is_admin': False}
