@@ -321,35 +321,27 @@ func (o *orchestrator) registerWebhookHandlers() {
 			return err
 		}
 
-		// Check for status change to "ready"
-		statusChange, err := webhooks.ParseStatusChange(event)
-		if err != nil {
-			return err
-		}
-		if statusChange != nil && statusChange.From != statusChange.To {
-			if strings.EqualFold(statusChange.To, StatusReady) {
-				log.Printf("Ticket #%d moved to ready, enqueuing", data.ID)
+		statusName := data.Status.Name
+		log.Printf("Ticket #%d: change by %s, status=%q", data.ID, event.By.Username, statusName)
+
+		// Ticket moved to "ready" — enqueue for assignment
+		if strings.EqualFold(statusName, StatusReady) {
+			if o.assignEngine.GetAssignment(data.ID) == nil {
+				log.Printf("Ticket #%d: status is ready, enqueuing", data.ID)
 				o.assignEngine.Enqueue(data.ID)
 				o.processQueue()
-				return nil
 			}
-			// Status changed to something other than "ready" — not our concern
 			return nil
 		}
 
-		// Check for human input on in-progress tickets. Only re-spawn the agent
-		// when the ticket is no longer assigned to the human — this means the
-		// human has finished providing input and handed the ticket back.
-		humanInput := o.isHumanInput(event)
-		statusName := data.Status.Name
-		log.Printf("Ticket #%d: change by %s — humanInput=%v, status=%q", data.ID, event.By.Username, humanInput, statusName)
-
-		if humanInput && strings.EqualFold(statusName, StatusInProgress) {
+		// Human input on in-progress tickets — re-spawn agent when the
+		// ticket is no longer assigned to the human.
+		if strings.EqualFold(statusName, StatusInProgress) && o.isHumanInput(event) {
 			if !o.isAssignedToHuman(data) {
-				log.Printf("Ticket #%d: human input detected (by %s), ticket unassigned from human, re-spawning agent", data.ID, event.By.Username)
+				log.Printf("Ticket #%d: human input (by %s), not assigned to human, re-spawning agent", data.ID, event.By.Username)
 				o.respawnAgent(data.ID)
 			} else {
-				log.Printf("Ticket #%d: human input detected (by %s), still assigned to human — waiting", data.ID, event.By.Username)
+				log.Printf("Ticket #%d: human input (by %s), still assigned to human — waiting", data.ID, event.By.Username)
 			}
 			return nil
 		}
