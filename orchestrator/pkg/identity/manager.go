@@ -95,18 +95,23 @@ func (m *Manager) createAgentLocked(specialization string) (*AgentIdentity, erro
 		return nil, fmt.Errorf("creating Gitea user %s: %w", id, err)
 	}
 
-	// Create Taiga user via Django management command is handled during init.
-	// Here we add the agent as a project member via the API.
-	membership, err := m.taigaClient.CreateMembership(m.taigaProject, m.taigaRoleID, id)
+	// Create Taiga user via public registration, then add as project member.
+	taigaUser, err := m.taigaClient.RegisterUser(id, m.defaultPasswd, email, id)
 	if err != nil {
-		// The user might need to be created in Taiga first.
-		// For now, log the error and store what we have.
-		log.Printf("WARNING: Could not add %s to Taiga project: %v", id, err)
+		log.Printf("WARNING: Could not register Taiga user %s: %v", id, err)
 	}
 
 	taigaUserID := 0
-	if membership != nil {
-		taigaUserID = membership.User
+	if taigaUser != nil {
+		taigaUserID = taigaUser.ID
+
+		// Add the user as a project member
+		membership, err := m.taigaClient.CreateMembership(m.taigaProject, m.taigaRoleID, id)
+		if err != nil {
+			log.Printf("WARNING: Could not add %s to Taiga project: %v", id, err)
+		} else if membership != nil {
+			taigaUserID = membership.User
+		}
 	}
 
 	agent := &AgentIdentity{

@@ -284,6 +284,48 @@ func (c *Client) ListProjectMembers(projectID int) ([]User, error) {
 	return users, nil
 }
 
+// RegisterUser creates a new user via Taiga's public registration endpoint.
+// Requires public registration to be enabled on the Taiga instance.
+func (c *Client) RegisterUser(username, password, email, fullName string) (*User, error) {
+	payload := map[string]string{
+		"type":      "public",
+		"username":  username,
+		"password":  password,
+		"email":     email,
+		"full_name": fullName,
+		"accepted_terms": "true",
+	}
+
+	resp, err := c.doRequest(http.MethodPost, "/api/v1/auth/register", payload, false)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("register user %q: status %d, body: %s", username, resp.StatusCode, body)
+	}
+
+	var result struct {
+		ID       int    `json:"id"`
+		Username string `json:"username"`
+		Email    string `json:"email"`
+		FullName string `json:"full_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding registered user: %w", err)
+	}
+
+	return &User{
+		ID:       result.ID,
+		Username: result.Username,
+		Email:    result.Email,
+		FullName: result.FullName,
+		IsActive: true,
+	}, nil
+}
+
 // --- Webhooks ---
 
 // Webhook represents a Taiga webhook configuration.
