@@ -47,17 +47,40 @@ All work starts as a **user story** on the Taiga Kanban board.
 1. Open Taiga at http://localhost:9000 and sign in as your human user.
 2. Open the **Dev Environment** project.
 3. Click **+ Add new** to create a user story.
-4. Fill in the required fields:
+4. Fill in the fields:
 
 | Field | Required | Description |
 |---|---|---|
 | **Subject** | Yes | Short title describing the work (e.g., "Add pagination to user list API") |
 | **Description** | Yes | Detailed requirements. The more context you provide, the better the agent's output. |
-| **Target repository** | Yes | Include `repo: owner/name` in the description (e.g., `repo: claude/my-service`). If the repo does not exist yet, the agent creates it. |
+| **Target repository** | No | One or more `repo:` lines in the description (see below). If omitted, the agent asks via a comment. |
 
 5. Set the status to **ready** — this is the signal that tells the orchestrator the ticket is available for an agent to pick up.
 
-Example ticket description:
+#### Specifying repositories
+
+Use `repo:` lines in the ticket description to tell the agent which repositories are involved. Several formats are supported:
+
+```
+repo: claude/user-service              # existing local Gitea repo
+repo: https://github.com/org/project   # remote repo — agent creates a local copy in Gitea
+repo: claude/new-service               # does not exist yet — agent creates it
+```
+
+When a remote URL is provided, the agent creates the repository in local Gitea and imports the remote as the initial content. This is useful for contributing to existing projects that are not yet mirrored locally.
+
+Multiple repositories can be listed when a ticket spans several codebases. The agent determines which one is the "main" repo (where most work happens) and creates the implementation plan there. Steps in secondary repos are referenced in the plan, and every PR links back to the ticket.
+
+```
+repo: claude/backend-api
+repo: claude/frontend-app
+```
+
+If no `repo:` line is present, the agent posts a comment on the ticket asking for the target repository before starting work.
+
+#### Example tickets
+
+Simple single-repo ticket:
 
 ```markdown
 Add a REST endpoint for listing users with cursor-based pagination.
@@ -68,6 +91,21 @@ Requirements:
 - GET /api/v1/users with query params `limit` (default 20, max 100) and `cursor`
 - Return a JSON response with `items` array and `next_cursor` field
 - Include integration tests
+```
+
+Multi-repo ticket with a remote source:
+
+```markdown
+Add OpenAPI documentation generation to the project and publish it
+on the docs site.
+
+repo: https://github.com/acme/billing-api
+repo: claude/docs-site
+
+Requirements:
+- Generate OpenAPI spec from the existing endpoint annotations in billing-api
+- Add a CI step that publishes the spec to the docs-site repo
+- Include a rendered Swagger UI page
 ```
 
 ### Ticket Lifecycle
@@ -145,12 +183,12 @@ Agents escalate to the human via ticket comments in these situations:
 
 ### Working with Multiple Repositories
 
-A single ticket can span multiple repositories. In the ticket description, specify the main repo as `repo: owner/name`. The agent creates the implementation plan in the main repo and references steps in secondary repos. PRs in all repos link back to the ticket.
+A single ticket can span multiple repositories (see [Specifying repositories](#specifying-repositories)). The agent decides which repo is the "main" one — where most of the work happens — and creates the implementation plan there. Steps that affect secondary repos are outlined in the plan and result in separate PRs in those repos. Every PR (regardless of repo) links back to the ticket and references its plan step. If merge ordering between repos matters, the agent documents this in the PR descriptions or creates the PRs sequentially.
 
 ### Tips for Writing Good Tickets
 
 - **Be specific about acceptance criteria** — agents follow instructions literally.
-- **Include the target repo** — always add `repo: owner/name` in the description.
+- **Include the target repo** — add `repo:` lines so the agent can start immediately instead of asking.
 - **Reference existing code** — if the change relates to existing files or patterns, mention them (e.g., "follow the same pattern as `pkg/auth/handler.go`").
 - **One concern per ticket** — keep tickets focused. The agent creates an implementation plan regardless, but simpler tickets produce better results.
 - **Use comments for follow-up** — if you need to add context after creation, post a comment rather than editing the description (agents are notified of new comments via webhooks).
