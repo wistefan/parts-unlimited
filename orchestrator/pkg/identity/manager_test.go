@@ -51,7 +51,7 @@ func setupTestManager(t *testing.T) (*Manager, *httptest.Server, *httptest.Serve
 	taigaClient := taiga.NewClient(taigaSrv.URL)
 	taigaClient.Authenticate("admin", "password")
 
-	manager := NewManager(giteaClient, taigaClient, 1, 1)
+	manager := NewManager(giteaClient, taigaClient, nil, nil, 1, 1)
 
 	return manager, giteaSrv, taigaSrv
 }

@@ -242,7 +242,7 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 	}
 	lifecycleMgr := lifecycle.NewManager(clientset, lcConfig)
 
-	identityMgr := identity.NewManager(giteaClient, taigaClient, project.ID, agentRoleID)
+	identityMgr := identity.NewManager(giteaClient, taigaClient, clientset, k8sConfig, project.ID, agentRoleID)
 
 	stateMgr := state.NewManager(clientset, cfg.Kubernetes.Namespace)
 

@@ -2,9 +2,18 @@
 package identity
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"log"
 	"sync"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
 
 	"github.com/wistefan/dev-env/orchestrator/pkg/gitea"
 	"github.com/wistefan/dev-env/orchestrator/pkg/taiga"
@@ -34,6 +43,8 @@ type AgentIdentity struct {
 type Manager struct {
 	giteaClient   *gitea.Client
 	taigaClient   *taiga.Client
+	k8sClient     kubernetes.Interface
+	k8sConfig     *rest.Config
 	taigaProject  int
 	taigaRoleID   int // Role used for agent memberships
 	defaultPasswd string
@@ -44,10 +55,12 @@ type Manager struct {
 }
 
 // NewManager creates a new identity manager.
-func NewManager(giteaClient *gitea.Client, taigaClient *taiga.Client, taigaProjectID, taigaRoleID int) *Manager {
+func NewManager(giteaClient *gitea.Client, taigaClient *taiga.Client, k8sClient kubernetes.Interface, k8sConfig *rest.Config, taigaProjectID, taigaRoleID int) *Manager {
 	return &Manager{
 		giteaClient:   giteaClient,
 		taigaClient:   taigaClient,
+		k8sClient:     k8sClient,
+		k8sConfig:     k8sConfig,
 		taigaProject:  taigaProjectID,
 		taigaRoleID:   taigaRoleID,
 		defaultPasswd: "agent-password",
@@ -95,23 +108,13 @@ func (m *Manager) createAgentLocked(specialization string) (*AgentIdentity, erro
 		return nil, fmt.Errorf("creating Gitea user %s: %w", id, err)
 	}
 
-	// Create Taiga user via public registration, then add as project member.
-	taigaUser, err := m.taigaClient.RegisterUser(id, m.defaultPasswd, email, id)
+	// Create Taiga user and project membership via Django ORM.
+	// The Taiga REST API requires users to be "contacts" before they can be
+	// added as project members, which doesn't work on fresh setups. We bypass
+	// this by execing into the taiga-back pod and using the ORM directly.
+	taigaUserID, err := m.createTaigaMembership(id, m.defaultPasswd, email)
 	if err != nil {
-		log.Printf("WARNING: Could not register Taiga user %s: %v", id, err)
-	}
-
-	taigaUserID := 0
-	if taigaUser != nil {
-		taigaUserID = taigaUser.ID
-
-		// Add the user as a project member
-		membership, err := m.taigaClient.CreateMembership(m.taigaProject, m.taigaRoleID, id)
-		if err != nil {
-			log.Printf("WARNING: Could not add %s to Taiga project: %v", id, err)
-		} else if membership != nil {
-			taigaUserID = membership.User
-		}
+		log.Printf("WARNING: Could not create Taiga user/membership for %s: %v", id, err)
 	}
 
 	agent := &AgentIdentity{
@@ -190,4 +193,89 @@ func (m *Manager) RemoveAgent(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.agents, id)
+}
+
+// createTaigaMembership creates a Taiga user and adds them to the project
+// by execing into the taiga-back pod and using the Django ORM directly.
+// Returns the Taiga user ID.
+func (m *Manager) createTaigaMembership(username, password, email string) (int, error) {
+	if m.k8sClient == nil || m.k8sConfig == nil {
+		// Fall back to REST API when K8s access is unavailable (e.g., in tests)
+		membership, err := m.taigaClient.CreateMembership(m.taigaProject, m.taigaRoleID, username)
+		if err != nil {
+			return 0, err
+		}
+		return membership.User, nil
+	}
+
+	ctx := context.Background()
+
+	// Find the taiga-back pod
+	pods, err := m.k8sClient.CoreV1().Pods("taiga").List(ctx, metav1.ListOptions{
+		LabelSelector: "app=taiga-back",
+	})
+	if err != nil {
+		return 0, fmt.Errorf("listing taiga-back pods: %w", err)
+	}
+	if len(pods.Items) == 0 {
+		return 0, fmt.Errorf("no taiga-back pods found")
+	}
+	podName := pods.Items[0].Name
+
+	// Python script to create user and membership via Django ORM
+	script := fmt.Sprintf(`
+from django.contrib.auth import get_user_model
+from taiga.projects.models import Project, Membership
+
+User = get_user_model()
+user, created = User.objects.get_or_create(
+    username='%s',
+    defaults={'email': '%s', 'is_active': True}
+)
+if created:
+    user.set_password('%s')
+    user.save()
+
+project = Project.objects.get(id=%d)
+role = project.roles.order_by('-order').first()
+membership, m_created = Membership.objects.get_or_create(
+    project=project, user=user,
+    defaults={'role': role, 'is_admin': False}
+)
+print(user.id)
+`, username, email, password, m.taigaProject)
+
+	// Exec into the pod
+	req := m.k8sClient.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(podName).
+		Namespace("taiga").
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Command: []string{"python", "manage.py", "shell", "-c", script},
+			Stdout:  true,
+			Stderr:  true,
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(m.k8sConfig, "POST", req.URL())
+	if err != nil {
+		return 0, fmt.Errorf("creating executor: %w", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	}); err != nil {
+		return 0, fmt.Errorf("exec failed: %w, stderr: %s", err, stderr.String())
+	}
+
+	// Parse the user ID from stdout
+	var userID int
+	if _, err := fmt.Sscanf(stdout.String(), "%d", &userID); err != nil {
+		return 0, fmt.Errorf("parsing user ID from output %q: %w", stdout.String(), err)
+	}
+
+	log.Printf("Taiga user %s created/found (ID: %d) with project membership", username, userID)
+	return userID, nil
 }

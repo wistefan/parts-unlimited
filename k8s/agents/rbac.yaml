@@ -61,3 +61,36 @@ roleRef:
   kind: Role
   name: orchestrator-role
   apiGroup: rbac.authorization.k8s.io
+
+---
+## The orchestrator needs to exec into taiga-back pods to create agent
+## memberships via Django ORM (the Taiga REST API requires a "contacts"
+## relationship that doesn't exist on fresh setups).
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orchestrator-taiga-role
+  namespace: taiga
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orchestrator-taiga-binding
+  namespace: taiga
+subjects:
+  - kind: ServiceAccount
+    name: orchestrator
+    namespace: agents
+roleRef:
+  kind: Role
+  name: orchestrator-taiga-role
+  apiGroup: rbac.authorization.k8s.io
