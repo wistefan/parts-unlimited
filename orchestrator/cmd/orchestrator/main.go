@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -313,27 +314,37 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 
 // registerWebhookHandlers sets up event handlers for Taiga webhook events.
 func (o *orchestrator) registerWebhookHandlers() {
-	// User story status changed — check if moved to "ready"
+	// User story changed — status transitions, comments, description edits, tag changes
 	o.webhookHandler.OnFunc("userstory", "change", func(event *webhooks.WebhookEvent) error {
+		data, err := webhooks.ParseUserStoryData(event)
+		if err != nil {
+			return err
+		}
+
+		// Check for status change to "ready"
 		statusChange, err := webhooks.ParseStatusChange(event)
 		if err != nil {
 			return err
 		}
-		if statusChange == nil {
-			// Not a status change — could be a tag change, check for delegation
-			return o.handleTagChange(event)
+		if statusChange != nil {
+			if strings.EqualFold(statusChange.To, StatusReady) {
+				log.Printf("Ticket #%d moved to ready, enqueuing", data.ID)
+				o.assignEngine.Enqueue(data.ID)
+				o.processQueue()
+			}
+			return nil
 		}
 
-		if strings.EqualFold(statusChange.To, StatusReady) {
-			data, err := webhooks.ParseUserStoryData(event)
-			if err != nil {
-				return err
-			}
-			log.Printf("Ticket #%d moved to ready, enqueuing", data.ID)
-			o.assignEngine.Enqueue(data.ID)
-			o.processQueue()
+		// Check for human input on in-progress tickets (new comment or description edit).
+		// When the human provides input, re-spawn the agent to continue work.
+		if o.isHumanInput(event) && o.isInProgressTicket(data) {
+			log.Printf("Ticket #%d: human input detected, re-spawning agent", data.ID)
+			o.respawnAgent(data.ID)
+			return nil
 		}
-		return nil
+
+		// Check for delegation tags
+		return o.handleTagChange(event)
 	})
 
 	// New user story created — check if it starts in "ready" status
@@ -349,6 +360,90 @@ func (o *orchestrator) registerWebhookHandlers() {
 		}
 		return nil
 	})
+}
+
+// isHumanInput checks whether a webhook event represents human input
+// (a new comment or a description edit by a non-agent user).
+func (o *orchestrator) isHumanInput(event *webhooks.WebhookEvent) bool {
+	if event.Change == nil {
+		return false
+	}
+	// Ignore changes made by agent users (their usernames contain "-agent-")
+	if strings.Contains(event.By.Username, "-agent-") {
+		return false
+	}
+	// Ignore changes by the admin/orchestrator accounts
+	if event.By.Username == o.cfg.Taiga.AdminUsername {
+		return false
+	}
+
+	// A non-empty comment field means someone added a comment
+	if event.Change.Comment != "" {
+		return true
+	}
+
+	// Check if the diff contains a description change
+	if event.Change.Diff != nil {
+		var diff map[string]json.RawMessage
+		if json.Unmarshal(event.Change.Diff, &diff) == nil {
+			if _, ok := diff["description"]; ok {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// isInProgressTicket checks whether a ticket is currently in progress (assigned to an agent).
+func (o *orchestrator) isInProgressTicket(data *webhooks.UserStoryData) bool {
+	return strings.EqualFold(data.Status.Name, StatusInProgress) ||
+		o.assignEngine.GetAssignment(data.ID) != nil
+}
+
+// respawnAgent re-spawns the assigned agent for a ticket that received new human input.
+func (o *orchestrator) respawnAgent(ticketID int) {
+	existing := o.assignEngine.GetAssignment(ticketID)
+	if existing == nil {
+		log.Printf("Ticket #%d: no existing assignment, enqueuing as new work", ticketID)
+		o.assignEngine.Enqueue(ticketID)
+		o.processQueue()
+		return
+	}
+
+	agent := o.identityMgr.GetAgent(existing.PrimaryAgent)
+	if agent == nil {
+		log.Printf("Ticket #%d: agent %s not found, creating new", ticketID, existing.PrimaryAgent)
+		var err error
+		agent, err = o.identityMgr.GetOrCreateAgent("general", o.assignEngine.GetBusyAgents())
+		if err != nil {
+			log.Printf("ERROR: Could not get agent for ticket %d: %v", ticketID, err)
+			return
+		}
+	}
+
+	spec := &lifecycle.AgentJobSpec{
+		AgentID:        agent.ID,
+		Specialization: agent.Specialization,
+		TicketID:       ticketID,
+		PlanStep:       fmt.Sprintf("%d", existing.PlanStep),
+		GiteaUsername:   agent.ID,
+		GiteaPassword:   agent.Password,
+		TaigaUsername:   agent.ID,
+		TaigaPassword:   agent.Password,
+		HumanUsername:  o.cfg.Taiga.HumanUsername,
+		HumanTaigaID:  o.humanTaigaID,
+		TaigaProjectID: o.projectID,
+	}
+
+	jobName, err := o.lifecycleMgr.CreateJob(context.Background(), spec)
+	if err != nil {
+		log.Printf("ERROR: Could not re-spawn agent for ticket %d: %v", ticketID, err)
+		return
+	}
+
+	log.Printf("Ticket #%d: agent %s re-spawned (job: %s)", ticketID, agent.ID, jobName)
+	o.saveState(context.Background())
 }
 
 // handleTagChange checks for delegation tags on a user story change event.
