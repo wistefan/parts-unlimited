@@ -1,6 +1,10 @@
 ## Gitea Helm chart values for dev-env
 ## Chart: gitea-charts/gitea
 
+# Use cached images to avoid Docker Hub rate limits on restarts
+image:
+  pullPolicy: IfNotPresent
+
 # Admin user created on first startup
 gitea:
   admin:

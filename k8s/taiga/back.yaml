@@ -16,6 +16,7 @@ spec:
       containers:
         - name: taiga-back
           image: taigaio/taiga-back:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
           envFrom:

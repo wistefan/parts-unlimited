@@ -16,6 +16,7 @@ spec:
       containers:
         - name: taiga-events
           image: taigaio/taiga-events:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8888
           env:

@@ -18,6 +18,7 @@ spec:
       containers:
         - name: taiga-protected
           image: taigaio/taiga-protected:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8003
           env:

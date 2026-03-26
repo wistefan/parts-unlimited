@@ -20,6 +20,7 @@ spec:
       containers:
         - name: runner
           image: gitea/act_runner:latest
+          imagePullPolicy: IfNotPresent
           env:
             - name: DOCKER_HOST
               value: tcp://localhost:2376
@@ -48,6 +49,7 @@ spec:
               memory: 512Mi
         - name: dind
           image: docker:dind
+          imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true
           env:
