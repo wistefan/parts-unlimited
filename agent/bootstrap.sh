@@ -22,6 +22,7 @@
 #   REPO_OWNER             - Gitea repo owner (extracted from ticket if not set)
 #   REPO_NAME              - Gitea repo name (extracted from ticket if not set)
 #   ALLOWED_TOOLS          - Space-separated list of allowed Claude tools
+#   HUMAN_USERNAME         - Taiga username of the human user (for reassignment)
 
 set -euo pipefail
 
@@ -54,6 +55,55 @@ fi
 
 PLAN_STEP="${PLAN_STEP:-}"
 ALLOWED_TOOLS="${ALLOWED_TOOLS:-Read Edit Write Glob Grep Bash}"
+HUMAN_USERNAME="${HUMAN_USERNAME:-}"
+
+# --- Helper: request human input and exit cleanly ---
+
+# Posts a comment on the ticket, reassigns to the human user, and exits 0.
+# Usage: request_human_input <comment_text>
+request_human_input() {
+    local comment="$1"
+    local version
+
+    # Fetch current ticket version
+    version=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
+        "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
+        | jq -r '.version') || true
+
+    if [ -n "${version}" ]; then
+        # Post comment
+        curl -sf -X PATCH "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
+            -H "${TAIGA_AUTH_HEADER}" \
+            -H "Content-Type: application/json" \
+            -d "{\"comment\": $(echo "${comment}" | jq -Rs .), \"version\": ${version}}" \
+            >/dev/null 2>&1 || echo "WARNING: Could not post comment on ticket."
+
+        # Re-fetch version after comment (Taiga increments it)
+        version=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
+            "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
+            | jq -r '.version') || true
+
+        # Reassign to human user if known
+        if [ -n "${HUMAN_USERNAME}" ] && [ -n "${version}" ]; then
+            local human_id
+            human_id=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
+                "${TAIGA_URL}/api/v1/users?project=${TAIGA_PROJECT_ID:-}" \
+                | jq -r ".[] | select(.username == \"${HUMAN_USERNAME}\") | .id" 2>/dev/null) || true
+
+            if [ -n "${human_id}" ]; then
+                curl -sf -X PATCH "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
+                    -H "${TAIGA_AUTH_HEADER}" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"assigned_to\": ${human_id}, \"version\": ${version}}" \
+                    >/dev/null 2>&1 || echo "WARNING: Could not reassign ticket to ${HUMAN_USERNAME}."
+            fi
+        fi
+    fi
+
+    echo ""
+    echo "=== Agent Worker Complete (awaiting human input) ==="
+    exit 0
+}
 
 echo "=== Agent Worker Bootstrap ==="
 echo "  Agent:          ${AGENT_ID}"
@@ -117,15 +167,8 @@ else
         REPO_NAME=$(echo "${REPO_MATCH}" | cut -d/ -f2)
         echo "Extracted repo from description: ${REPO_OWNER}/${REPO_NAME}"
     else
-        echo "ERROR: Cannot determine target repository."
-        echo "  Set REPO_OWNER and REPO_NAME, or include 'repo: owner/name' in the ticket description."
-        # Post a comment asking for the repo
-        curl -sf -X PATCH "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
-            -H "${TAIGA_AUTH_HEADER}" \
-            -H "Content-Type: application/json" \
-            -d "{\"comment\": \"Cannot determine the target repository. Please specify the repository in the description (e.g., \`repo: owner/name\`).\", \"version\": ${TICKET_VERSION}}" \
-            >/dev/null 2>&1 || true
-        exit 1
+        echo "Cannot determine target repository — requesting human input."
+        request_human_input "Cannot determine the target repository. Please specify the repository in the description (e.g., \`repo: owner/name\`) or provide it in a comment."
     fi
 fi
 
@@ -283,6 +326,14 @@ fi
 
 echo "  Completion status: ${COMPLETION_STATUS}"
 echo "  Summary: ${COMPLETION_SUMMARY}"
+
+# --- Handle blocked status ---
+
+if [ "${COMPLETION_STATUS}" = "blocked" ]; then
+    BLOCKED_REASON=$(jq -r '.reason // "No reason provided"' /home/agent/completion-status.json 2>/dev/null || echo "No reason provided")
+    echo "Agent is blocked — requesting human input."
+    request_human_input "**Agent ${AGENT_ID}** is blocked and needs human input.\n\n**Reason:** ${BLOCKED_REASON}"
+fi
 
 # --- Push changes ---
 

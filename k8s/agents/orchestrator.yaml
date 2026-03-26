@@ -19,6 +19,7 @@ data:
       adminPassword: "password"
       projectSlug: "dev-environment"
       webhookSecret: ""
+      humanUsername: "wistefan"
     agents:
       maxConcurrency: 3
       idleTimeoutSeconds: 300

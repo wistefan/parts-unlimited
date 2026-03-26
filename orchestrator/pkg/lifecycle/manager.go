@@ -46,6 +46,8 @@ type AgentJobSpec struct {
 	TaigaUsername       string
 	TaigaPassword       string
 	AllowedTools       string
+	HumanUsername      string
+	TaigaProjectID     int
 }
 
 // Config holds lifecycle manager configuration.
@@ -358,6 +360,8 @@ func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 		{Name: "GITEA_PASSWORD", Value: spec.GiteaPassword},
 		{Name: "TAIGA_USERNAME", Value: spec.TaigaUsername},
 		{Name: "TAIGA_PASSWORD", Value: spec.TaigaPassword},
+		{Name: "HUMAN_USERNAME", Value: spec.HumanUsername},
+		{Name: "TAIGA_PROJECT_ID", Value: fmt.Sprintf("%d", spec.TaigaProjectID)},
 	}
 
 	if spec.AllowedTools != "" {

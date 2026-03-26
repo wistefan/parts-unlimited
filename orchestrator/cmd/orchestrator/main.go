@@ -395,6 +395,8 @@ func (o *orchestrator) assignTicket(ticketID int) error {
 		GiteaPassword:   agent.Password,
 		TaigaUsername:   agent.ID,
 		TaigaPassword:   agent.Password,
+		HumanUsername:  o.cfg.Taiga.HumanUsername,
+		TaigaProjectID: o.projectID,
 	}
 
 	jobName, err := o.lifecycleMgr.CreateJob(context.Background(), spec)
@@ -436,6 +438,8 @@ func (o *orchestrator) handleDelegation(ticketID int, specialization string) {
 		GiteaPassword:   agent.Password,
 		TaigaUsername:   agent.ID,
 		TaigaPassword:   agent.Password,
+		HumanUsername:  o.cfg.Taiga.HumanUsername,
+		TaigaProjectID: o.projectID,
 	}
 
 	jobName, err := o.lifecycleMgr.CreateJob(context.Background(), spec)

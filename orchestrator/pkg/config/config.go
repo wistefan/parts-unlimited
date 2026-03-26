@@ -32,6 +32,7 @@ type TaigaConfig struct {
 	AdminPassword string `yaml:"adminPassword"`
 	ProjectSlug   string `yaml:"projectSlug"`
 	WebhookSecret string `yaml:"webhookSecret"`
+	HumanUsername string `yaml:"humanUsername"`
 }
 
 // AgentsConfig holds agent orchestration settings.
@@ -86,6 +87,7 @@ func DefaultConfig() *Config {
 			AdminUsername: "admin",
 			AdminPassword: "password",
 			ProjectSlug:   "dev-environment",
+			HumanUsername: "wistefan",
 		},
 		Agents: AgentsConfig{
 			MaxConcurrency:      3,

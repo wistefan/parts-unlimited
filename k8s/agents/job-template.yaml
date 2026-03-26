@@ -88,6 +88,10 @@ spec:
                 secretKeyRef:
                   name: agent-credentials-${AGENT_ID}
                   key: taiga-password
+            - name: HUMAN_USERNAME
+              value: "${HUMAN_USERNAME}"
+            - name: TAIGA_PROJECT_ID
+              value: "${TAIGA_PROJECT_ID}"
             # Optional: if the anthropic-api-key secret exists, it takes
             # precedence over the mounted credentials file.
             - name: ANTHROPIC_API_KEY
