@@ -337,8 +337,8 @@ func (o *orchestrator) registerWebhookHandlers() {
 
 		// Check for human input on in-progress tickets (new comment or description edit).
 		// When the human provides input, re-spawn the agent to continue work.
-		if o.isHumanInput(event) && o.isInProgressTicket(data) {
-			log.Printf("Ticket #%d: human input detected, re-spawning agent", data.ID)
+		if o.isHumanInput(event) && strings.EqualFold(data.Status.Name, StatusInProgress) {
+			log.Printf("Ticket #%d: human input detected (by %s), re-spawning agent", data.ID, event.By.Username)
 			o.respawnAgent(data.ID)
 			return nil
 		}
@@ -363,7 +363,7 @@ func (o *orchestrator) registerWebhookHandlers() {
 }
 
 // isHumanInput checks whether a webhook event represents human input
-// (a new comment or a description edit by a non-agent user).
+// (a new comment, description edit, or any meaningful change by a non-agent user).
 func (o *orchestrator) isHumanInput(event *webhooks.WebhookEvent) bool {
 	if event.Change == nil {
 		return false
@@ -382,23 +382,19 @@ func (o *orchestrator) isHumanInput(event *webhooks.WebhookEvent) bool {
 		return true
 	}
 
-	// Check if the diff contains a description change
+	// Check if the diff contains a description or assignment change
 	if event.Change.Diff != nil {
 		var diff map[string]json.RawMessage
 		if json.Unmarshal(event.Change.Diff, &diff) == nil {
-			if _, ok := diff["description"]; ok {
-				return true
+			for _, key := range []string{"description", "assigned_to", "assigned_users"} {
+				if _, ok := diff[key]; ok {
+					return true
+				}
 			}
 		}
 	}
 
 	return false
-}
-
-// isInProgressTicket checks whether a ticket is currently in progress (assigned to an agent).
-func (o *orchestrator) isInProgressTicket(data *webhooks.UserStoryData) bool {
-	return strings.EqualFold(data.Status.Name, StatusInProgress) ||
-		o.assignEngine.GetAssignment(data.ID) != nil
 }
 
 // respawnAgent re-spawns the assigned agent for a ticket that received new human input.
@@ -593,7 +589,7 @@ func (o *orchestrator) reconcile(ctx context.Context) error {
 		}
 	}
 
-	// Also check for completed Jobs and free agents
+	// Check for completed Jobs: free agents and clean up finished Jobs
 	jobStatuses, err := o.lifecycleMgr.ListActiveJobs(ctx)
 	if err != nil {
 		log.Printf("WARNING: Could not list active jobs: %v", err)
@@ -601,12 +597,18 @@ func (o *orchestrator) reconcile(ctx context.Context) error {
 		for _, js := range jobStatuses {
 			if js.Succeeded || js.Failed {
 				ticketID, _ := strconv.Atoi(js.TicketID)
-				if js.Succeeded {
-					log.Printf("Reconcile: job %s completed for ticket #%d", js.Name, ticketID)
-				} else {
-					log.Printf("Reconcile: job %s failed for ticket #%d", js.Name, ticketID)
+				if o.assignEngine.GetAssignment(ticketID) != nil {
+					if js.Succeeded {
+						log.Printf("Reconcile: job %s completed for ticket #%d", js.Name, ticketID)
+					} else {
+						log.Printf("Reconcile: job %s failed for ticket #%d", js.Name, ticketID)
+					}
+					o.assignEngine.CompleteTicket(ticketID)
 				}
-				o.assignEngine.CompleteTicket(ticketID)
+				// Delete finished Jobs to prevent re-processing
+				if err := o.lifecycleMgr.DeleteJob(ctx, js.Name); err != nil {
+					log.Printf("WARNING: Could not delete finished job %s: %v", js.Name, err)
+				}
 			}
 		}
 	}
