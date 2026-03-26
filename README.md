@@ -36,6 +36,125 @@ After setup completes:
 
 Both services also have a configurable **human user** (default: `wistefan` / `password`) with full admin privileges. See [Configuration](#configuration) for how to customize.
 
+## Usage
+
+This section explains the day-to-day workflow: how to create work for the agents, what to expect while they work, and how to review and merge the results.
+
+### Creating a Ticket
+
+All work starts as a **user story** on the Taiga Kanban board.
+
+1. Open Taiga at http://localhost:9000 and sign in as your human user.
+2. Open the **Dev Environment** project.
+3. Click **+ Add new** to create a user story.
+4. Fill in the required fields:
+
+| Field | Required | Description |
+|---|---|---|
+| **Subject** | Yes | Short title describing the work (e.g., "Add pagination to user list API") |
+| **Description** | Yes | Detailed requirements. The more context you provide, the better the agent's output. |
+| **Target repository** | Yes | Include `repo: owner/name` in the description (e.g., `repo: claude/my-service`). If the repo does not exist yet, the agent creates it. |
+
+5. Set the status to **ready** — this is the signal that tells the orchestrator the ticket is available for an agent to pick up.
+
+Example ticket description:
+
+```markdown
+Add a REST endpoint for listing users with cursor-based pagination.
+
+repo: claude/user-service
+
+Requirements:
+- GET /api/v1/users with query params `limit` (default 20, max 100) and `cursor`
+- Return a JSON response with `items` array and `next_cursor` field
+- Include integration tests
+```
+
+### Ticket Lifecycle
+
+Tickets move through three statuses that agents act on:
+
+```
+ready ──→ in progress ──→ ready for test
+  │            │                │
+  │            │                └─ Agent finished. Human reviews and merges final PR.
+  │            └─ Agent is actively working. PRs appear in Gitea.
+  └─ Ticket is queued. Next available agent picks it up (FIFO).
+```
+
+All other statuses (e.g., "done", "closed") are yours to manage — agents ignore them.
+
+### What Happens After You Create a Ticket
+
+1. **Queue** — The orchestrator detects the new "ready" ticket (via webhook) and adds it to a FIFO queue.
+2. **Assignment** — When an agent slot is available (up to `maxConcurrency`, default 3), the orchestrator assigns the ticket, creates an agent identity if needed, and spawns a container.
+3. **Implementation plan** — The agent's first action is always to create an **implementation plan** as a markdown document and open a PR for it. The ticket moves to "in progress".
+4. **Wait for plan approval** — No implementation begins until you approve the plan PR. Review it, leave comments, request changes — the agent will respond.
+5. **Step-by-step implementation** — After plan approval, the agent works through each step, opening one PR per step. Parallelizable steps may be worked on by multiple agents simultaneously.
+6. **Final PR** — When the agent opens the last PR, the ticket moves to **ready for test** and the agent posts release notes as a comment on the ticket.
+
+### Reviewing and Handling PRs
+
+Agent PRs appear in Gitea at http://localhost:3000. Each PR includes:
+- A link to the Taiga ticket
+- A reference to the implementation plan step it addresses
+- Test results from the agent's own test run
+
+The review workflow:
+
+1. **Orchestrator review** — The orchestrator automatically runs a Claude-powered code review on every agent PR and posts comments. It cannot approve or merge.
+2. **Human review** — Open the PR in Gitea, read the diff and review comments. You have three options:
+   - **Approve and merge** — The agent continues to the next step.
+   - **Request changes** — Add review comments explaining what to fix. The orchestrator detects the new comments and spawns an agent to address them on the same branch.
+   - **Reject** — Close the PR without merging. The agent posts a comment on the ticket and pauses. Add new instructions on the ticket to resume.
+
+Only the human user can approve and merge PRs. Agents and the orchestrator cannot.
+
+### Specialized Work and Delegation
+
+A general-purpose agent may delegate subtasks to specialized agents (Frontend, Backend, Test, Documentation, Operations). Delegation is visible on the ticket as **tags**:
+
+| Tag pattern | Meaning |
+|---|---|
+| `delegate:frontend` | General agent requested frontend work — waiting for a specialist |
+| `active:frontend` | A frontend specialist is actively working |
+| (tag removed) | Specialist finished — general agent resumes |
+
+Multiple specializations can run in parallel (e.g., `active:frontend` and `active:test` at the same time). The general-purpose agent resumes once all `active:` tags are gone.
+
+You do not need to manage these tags — the orchestrator handles them automatically. They are visible on the Kanban board as colored badges for transparency.
+
+### Monitoring Progress
+
+- **Taiga ticket comments** — Agents post progress updates, questions, and results as comments on the ticket. This is the primary communication channel.
+- **Gitea PRs** — Each PR shows the code changes and review discussion for one implementation step.
+- **Notification dashboard** — If configured, visit `http://localhost:8080/notifications` for a feed of events (escalations, PRs ready for review, plan approvals needed).
+- **Desktop notifications** — Enable `desktopNotify: true` in `config.yaml` for Linux desktop alerts via `notify-send`.
+
+### Handling Escalations
+
+Agents escalate to the human via ticket comments in these situations:
+
+| Situation | What the agent does | What you should do |
+|---|---|---|
+| **Unclear requirements** | Posts a comment asking for clarification | Reply on the ticket with the missing information |
+| **Merge conflict** | Posts a comment explaining the conflict | Either resolve it yourself or provide guidance in a comment |
+| **Repeated delegation failures** | After 2 no-op reassignment cycles, escalates | Check the ticket comments to understand why delegation failed, then provide instructions |
+| **Job failure after retries** | Agent failed twice, ticket is flagged | Check the agent logs (`kubectl logs -n agents <pod>`) and the ticket comments, then provide guidance |
+| **PR fully rejected** | Agent pauses and comments on the ticket | Add new instructions on the ticket to resume work |
+
+### Working with Multiple Repositories
+
+A single ticket can span multiple repositories. In the ticket description, specify the main repo as `repo: owner/name`. The agent creates the implementation plan in the main repo and references steps in secondary repos. PRs in all repos link back to the ticket.
+
+### Tips for Writing Good Tickets
+
+- **Be specific about acceptance criteria** — agents follow instructions literally.
+- **Include the target repo** — always add `repo: owner/name` in the description.
+- **Reference existing code** — if the change relates to existing files or patterns, mention them (e.g., "follow the same pattern as `pkg/auth/handler.go`").
+- **One concern per ticket** — keep tickets focused. The agent creates an implementation plan regardless, but simpler tickets produce better results.
+- **Use comments for follow-up** — if you need to add context after creation, post a comment rather than editing the description (agents are notified of new comments via webhooks).
+
 ## Scripts
 
 All scripts are in the `scripts/` directory.
