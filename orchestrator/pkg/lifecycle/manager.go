@@ -164,7 +164,7 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 						{
 							Name:            "agent",
 							Image:           m.config.ContainerImage,
-							ImagePullPolicy: corev1.PullNever,
+							ImagePullPolicy: corev1.PullIfNotPresent,
 							SecurityContext: &corev1.SecurityContext{
 								AllowPrivilegeEscalation: &falseVal,
 								Capabilities: &corev1.Capabilities{

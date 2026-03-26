@@ -289,12 +289,20 @@ if [ -n "${BUILD_CMD}" ]; then
     ${BUILD_CMD} -t agent-worker:latest "${PROJECT_DIR}/agent"
     echo "  agent-worker:latest built."
 
-    # Import images into k3s containerd if built with Docker
+    # Import images into k3s containerd if built with Docker.
+    # docker save exports as docker.io/library/<name>:latest, which is
+    # what k3s resolves "name:latest" to, so the import works directly.
     if [ "${BUILD_CMD}" = "docker build" ]; then
         echo "Importing images into k3s..."
         ${SAVE_CMD} orchestrator:latest | k3s ctr images import -
         ${SAVE_CMD} agent-worker:latest | k3s ctr images import -
-        echo "  Images imported into k3s containerd."
+        # Verify the images are available
+        if k3s ctr images check | grep -q "agent-worker"; then
+            echo "  Images imported into k3s containerd."
+        else
+            echo "  WARNING: Image import may have failed. Checking..."
+            k3s ctr images list | grep -E "orchestrator|agent-worker" || true
+        fi
     fi
 fi
 echo ""
@@ -303,9 +311,10 @@ echo ""
 
 echo "=== Step 11: Orchestrator ==="
 kubectl apply -f "${PROJECT_DIR}/k8s/agents/orchestrator.yaml"
+# Force a rollout to pick up new image (idempotent on first deploy)
+kubectl rollout restart deployment/orchestrator -n agents 2>/dev/null || true
 echo "Waiting for orchestrator to be ready..."
-kubectl wait --for=condition=Available deployment/orchestrator \
-    -n agents --timeout=120s 2>/dev/null || true
+kubectl rollout status deployment/orchestrator -n agents --timeout=120s 2>/dev/null || true
 echo "  Orchestrator deployed."
 echo ""
 

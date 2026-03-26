@@ -39,7 +39,7 @@ spec:
       containers:
         - name: agent
           image: "${CONTAINER_IMAGE}"
-          imagePullPolicy: Never
+          imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
