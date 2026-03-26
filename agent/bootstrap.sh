@@ -23,6 +23,7 @@
 #   REPO_NAME              - Gitea repo name (extracted from ticket if not set)
 #   ALLOWED_TOOLS          - Space-separated list of allowed Claude tools
 #   HUMAN_USERNAME         - Taiga username of the human user (for reassignment)
+#   HUMAN_TAIGA_ID         - Taiga user ID of the human user (for reassignment)
 
 set -euo pipefail
 
@@ -56,6 +57,7 @@ fi
 PLAN_STEP="${PLAN_STEP:-}"
 ALLOWED_TOOLS="${ALLOWED_TOOLS:-Read Edit Write Glob Grep Bash}"
 HUMAN_USERNAME="${HUMAN_USERNAME:-}"
+HUMAN_TAIGA_ID="${HUMAN_TAIGA_ID:-}"
 
 # --- Helper: request human input and exit cleanly ---
 
@@ -66,38 +68,38 @@ request_human_input() {
     local version
 
     # Fetch current ticket version
-    version=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
+    version=$(curl -s -H "${TAIGA_AUTH_HEADER}" \
         "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
         | jq -r '.version') || true
 
-    if [ -n "${version}" ]; then
-        # Post comment
-        curl -sf -X PATCH "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
-            -H "${TAIGA_AUTH_HEADER}" \
-            -H "Content-Type: application/json" \
-            -d "{\"comment\": $(echo "${comment}" | jq -Rs .), \"version\": ${version}}" \
-            >/dev/null 2>&1 || echo "WARNING: Could not post comment on ticket."
+    if [ -z "${version}" ] || [ "${version}" = "null" ]; then
+        echo "WARNING: Could not fetch ticket version."
+        echo ""
+        echo "=== Agent Worker Complete (awaiting human input) ==="
+        exit 0
+    fi
 
-        # Re-fetch version after comment (Taiga increments it)
-        version=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
-            "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
-            | jq -r '.version') || true
+    # Build the patch payload: always include comment, optionally reassign
+    local patch_data
+    if [ -n "${HUMAN_TAIGA_ID}" ]; then
+        patch_data="{\"comment\": $(echo "${comment}" | jq -Rs .), \"assigned_to\": ${HUMAN_TAIGA_ID}, \"version\": ${version}}"
+    else
+        patch_data="{\"comment\": $(echo "${comment}" | jq -Rs .), \"version\": ${version}}"
+    fi
 
-        # Reassign to human user if known
-        if [ -n "${HUMAN_USERNAME}" ] && [ -n "${version}" ]; then
-            local human_id
-            human_id=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
-                "${TAIGA_URL}/api/v1/users?project=${TAIGA_PROJECT_ID:-}" \
-                | jq -r ".[] | select(.username == \"${HUMAN_USERNAME}\") | .id" 2>/dev/null) || true
+    local response
+    response=$(curl -s -w "\n%{http_code}" -X PATCH "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
+        -H "${TAIGA_AUTH_HEADER}" \
+        -H "Content-Type: application/json" \
+        -d "${patch_data}") || true
 
-            if [ -n "${human_id}" ]; then
-                curl -sf -X PATCH "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
-                    -H "${TAIGA_AUTH_HEADER}" \
-                    -H "Content-Type: application/json" \
-                    -d "{\"assigned_to\": ${human_id}, \"version\": ${version}}" \
-                    >/dev/null 2>&1 || echo "WARNING: Could not reassign ticket to ${HUMAN_USERNAME}."
-            fi
-        fi
+    local http_code
+    http_code=$(echo "${response}" | tail -1)
+    if [ "${http_code}" = "200" ]; then
+        echo "  Comment posted and ticket reassigned to ${HUMAN_USERNAME:-human}."
+    else
+        echo "WARNING: Ticket update failed (HTTP ${http_code})."
+        echo "  Response: $(echo "${response}" | head -n -1)"
     fi
 
     echo ""

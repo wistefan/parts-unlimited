@@ -47,6 +47,7 @@ type AgentJobSpec struct {
 	TaigaPassword       string
 	AllowedTools       string
 	HumanUsername      string
+	HumanTaigaID       int
 	TaigaProjectID     int
 }
 
@@ -361,6 +362,7 @@ func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 		{Name: "TAIGA_USERNAME", Value: spec.TaigaUsername},
 		{Name: "TAIGA_PASSWORD", Value: spec.TaigaPassword},
 		{Name: "HUMAN_USERNAME", Value: spec.HumanUsername},
+		{Name: "HUMAN_TAIGA_ID", Value: fmt.Sprintf("%d", spec.HumanTaigaID)},
 		{Name: "TAIGA_PROJECT_ID", Value: fmt.Sprintf("%d", spec.TaigaProjectID)},
 	}
 

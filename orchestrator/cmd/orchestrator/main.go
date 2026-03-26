@@ -62,9 +62,10 @@ type orchestrator struct {
 	notifySvc     *notifications.Service
 	webhookHandler *webhooks.Handler
 
-	projectID     int
-	readyStatusID int
-	inProgressID  int
+	projectID      int
+	readyStatusID  int
+	inProgressID   int
+	humanTaigaID   int
 }
 
 func main() {
@@ -225,6 +226,27 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 		}
 	}
 
+	// Resolve human user ID for ticket reassignment
+	var humanTaigaID int
+	if cfg.Taiga.HumanUsername != "" {
+		members, err := taigaClient.ListProjectMembers(project.ID)
+		if err != nil {
+			log.Printf("WARNING: Could not list project members: %v", err)
+		} else {
+			for _, member := range members {
+				if member.Username == cfg.Taiga.HumanUsername {
+					humanTaigaID = member.ID
+					break
+				}
+			}
+		}
+		if humanTaigaID > 0 {
+			log.Printf("  Taiga: human user %q (ID: %d)", cfg.Taiga.HumanUsername, humanTaigaID)
+		} else {
+			log.Printf("WARNING: Human user %q not found in project members", cfg.Taiga.HumanUsername)
+		}
+	}
+
 	// Gitea client
 	giteaClient := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.AdminUsername, cfg.Gitea.AdminPassword)
 	log.Println("  Gitea: client initialized")
@@ -278,6 +300,7 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 		projectID:      project.ID,
 		readyStatusID:  readyStatusID,
 		inProgressID:   inProgressID,
+		humanTaigaID:   humanTaigaID,
 	}
 
 	log.Println("Initialization complete.")
@@ -396,6 +419,7 @@ func (o *orchestrator) assignTicket(ticketID int) error {
 		TaigaUsername:   agent.ID,
 		TaigaPassword:   agent.Password,
 		HumanUsername:  o.cfg.Taiga.HumanUsername,
+		HumanTaigaID:  o.humanTaigaID,
 		TaigaProjectID: o.projectID,
 	}
 
@@ -439,6 +463,7 @@ func (o *orchestrator) handleDelegation(ticketID int, specialization string) {
 		TaigaUsername:   agent.ID,
 		TaigaPassword:   agent.Password,
 		HumanUsername:  o.cfg.Taiga.HumanUsername,
+		HumanTaigaID:  o.humanTaigaID,
 		TaigaProjectID: o.projectID,
 	}
 

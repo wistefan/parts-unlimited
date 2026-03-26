@@ -90,6 +90,8 @@ spec:
                   key: taiga-password
             - name: HUMAN_USERNAME
               value: "${HUMAN_USERNAME}"
+            - name: HUMAN_TAIGA_ID
+              value: "${HUMAN_TAIGA_ID}"
             - name: TAIGA_PROJECT_ID
               value: "${TAIGA_PROJECT_ID}"
             # Optional: if the anthropic-api-key secret exists, it takes
