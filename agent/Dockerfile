@@ -19,8 +19,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
 
-# Create non-root agent user
-RUN useradd -m -s /bin/bash agent
+# Create non-root agent user with UID 1000 (matching the K8s pod securityContext).
+# The node base image ships a 'node' user at UID 1000, so remove it first.
+RUN userdel -r node 2>/dev/null || true \
+    && useradd -m -s /bin/bash -u 1000 agent
 USER agent
 WORKDIR /home/agent
 

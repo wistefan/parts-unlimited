@@ -67,22 +67,68 @@ echo ""
 # --- Test: repo extraction from description ---
 echo "Repo extraction from description:"
 
-extract_repo() {
+# Replicate the extract_repo_ref function from bootstrap.sh
+extract_repo_ref() {
     local desc="$1"
-    echo "${desc}" | grep -oP '(?:repo|gitea)[:\s]+\K\S+/\S+' | head -1 || true
+    local raw
+    raw=$(echo "${desc}" | grep -oP '(?i)(?:repo|gitea)\s*:\s*\K.*' | head -1 || true)
+    [ -z "${raw}" ] && return
+    raw=$(echo "${raw}" | sed -E 's/^\s+//;s/\s+$//')
+    if echo "${raw}" | grep -qP '^\[.*\]\(.*\)'; then
+        raw=$(echo "${raw}" | sed -E 's/^\[([^]]*)\]\(([^)]*)\).*/\2/')
+    fi
+    raw=$(echo "${raw}" | sed -E 's/^\[([^]]*)\]$/\1/')
+    raw=$(echo "${raw}" | sed 's/^<//;s/>$//')
+    raw=$(echo "${raw}" | awk '{print $1}')
+    echo "${raw}"
 }
 
-RESULT=$(extract_repo "Please work on repo: myorg/myrepo and fix the bug")
+RESULT=$(extract_repo_ref "Please work on repo: myorg/myrepo and fix the bug")
 assert_eq "repo: owner/name format" "myorg/myrepo" "${RESULT}"
 
-RESULT=$(extract_repo "Fix the bug in gitea: claude/dev-env immediately")
+RESULT=$(extract_repo_ref "Fix the bug in gitea: claude/dev-env immediately")
 assert_eq "gitea: owner/name format" "claude/dev-env" "${RESULT}"
 
-RESULT=$(extract_repo "Just fix the bug please")
+RESULT=$(extract_repo_ref "Just fix the bug please")
 assert_eq "no repo in description" "" "${RESULT}"
 
-RESULT=$(extract_repo "repo:team/project-name is the target")
+RESULT=$(extract_repo_ref "repo:team/project-name is the target")
 assert_eq "repo:owner/name no space" "team/project-name" "${RESULT}"
+
+RESULT=$(extract_repo_ref "repo: https://github.com/FIWARE/data-space-connector")
+assert_eq "repo: full https URL" "https://github.com/FIWARE/data-space-connector" "${RESULT}"
+
+RESULT=$(extract_repo_ref "repo: [https://github.com/org/repo](https://github.com/org/repo)")
+assert_eq "repo: markdown link URL" "https://github.com/org/repo" "${RESULT}"
+
+RESULT=$(extract_repo_ref "repo: <https://github.com/org/repo>")
+assert_eq "repo: angle bracket URL" "https://github.com/org/repo" "${RESULT}"
+
+RESULT=$(extract_repo_ref "repo: https://github.com/org/repo.git")
+assert_eq "repo: URL with .git suffix" "https://github.com/org/repo.git" "${RESULT}"
+
+RESULT=$(extract_repo_ref "Repo: claude/my-project")
+assert_eq "repo: case insensitive" "claude/my-project" "${RESULT}"
+
+RESULT=$(extract_repo_ref "repo: owner/name # this is a comment")
+assert_eq "repo: value with trailing comment" "owner/name" "${RESULT}"
+
+# Test that URL is detected as remote (not split into owner/name)
+RESULT=$(extract_repo_ref "repo: https://github.com/FIWARE/data-space-connector")
+if echo "${RESULT}" | grep -qP '^https?://'; then
+    echo "  [PASS] URL detected as remote"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] URL detected as remote"
+    echo "         got: ${RESULT}"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test repo name extraction from URL
+CLEAN_URL="${RESULT%.git}"
+CLEAN_URL="${CLEAN_URL%/}"
+REPO_NAME_FROM_URL=$(basename "${CLEAN_URL}")
+assert_eq "repo name from URL" "data-space-connector" "${REPO_NAME_FROM_URL}"
 
 echo ""
 

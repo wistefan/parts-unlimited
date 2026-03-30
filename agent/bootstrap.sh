@@ -117,6 +117,9 @@ echo "  Plan step:      ${PLAN_STEP:-none}"
 
 git config --global user.name "${AGENT_ID}"
 git config --global user.email "${AGENT_ID}@dev-env.local"
+# The workspace emptyDir volume is created by kubelet (root-owned) but the
+# container runs as UID 1000.  Mark it safe so git does not refuse to operate.
+git config --global --add safe.directory "${WORKSPACE}"
 
 # --- Authenticate with Taiga ---
 
@@ -158,19 +161,107 @@ echo "  Comments: ${COMMENT_COUNT}"
 
 # --- Determine repo from ticket or env ---
 
+# Extracts the repo reference from a ticket description line.
+# Handles plain owner/name, full URLs, and markdown-formatted links.
+# Outputs the cleaned value (URL or owner/name) to stdout.
+extract_repo_ref() {
+    local desc="$1"
+    # Grab everything after "repo:" or "gitea:" (case-insensitive)
+    local raw
+    raw=$(echo "${desc}" | grep -oP '(?i)(?:repo|gitea)\s*:\s*\K.*' | head -1 || true)
+    [ -z "${raw}" ] && return
+
+    # Strip leading/trailing whitespace
+    raw=$(echo "${raw}" | sed -E 's/^\s+//;s/\s+$//')
+
+    # Strip markdown link syntax: [text](url) → url
+    if echo "${raw}" | grep -qP '^\[.*\]\(.*\)'; then
+        raw=$(echo "${raw}" | sed -E 's/^\[([^]]*)\]\(([^)]*)\).*/\2/')
+    fi
+    # Strip bare markdown brackets: [url] → url
+    raw=$(echo "${raw}" | sed -E 's/^\[([^]]*)\]$/\1/')
+    # Strip angle brackets: <url> → url
+    raw=$(echo "${raw}" | sed 's/^<//;s/>$//')
+    # Take only the first whitespace-delimited token (drop trailing comments etc.)
+    raw=$(echo "${raw}" | awk '{print $1}')
+
+    echo "${raw}"
+}
+
 if [ -n "${REPO_OWNER:-}" ] && [ -n "${REPO_NAME:-}" ]; then
     echo "Using repo from environment: ${REPO_OWNER}/${REPO_NAME}"
 else
-    # Try to extract repo info from ticket description
-    # Expected format: repo owner/name or a Gitea URL
-    REPO_MATCH=$(echo "${TICKET_DESCRIPTION}" | grep -oP '(?:repo|gitea)[:\s]+\K\S+/\S+' | head -1 || true)
-    if [ -n "${REPO_MATCH}" ]; then
-        REPO_OWNER=$(echo "${REPO_MATCH}" | cut -d/ -f1)
-        REPO_NAME=$(echo "${REPO_MATCH}" | cut -d/ -f2)
-        echo "Extracted repo from description: ${REPO_OWNER}/${REPO_NAME}"
-    else
+    REPO_REF=$(extract_repo_ref "${TICKET_DESCRIPTION}")
+
+    if [ -z "${REPO_REF}" ]; then
         echo "Cannot determine target repository — requesting human input."
         request_human_input "Cannot determine the target repository. Please specify the repository in the description (e.g., \`repo: owner/name\`) or provide it in a comment."
+    elif echo "${REPO_REF}" | grep -qP '^https?://'; then
+        # Remote URL — import into local Gitea
+        REMOTE_URL="${REPO_REF}"
+        CLEAN_URL="${REMOTE_URL%.git}"
+        CLEAN_URL="${CLEAN_URL%/}"
+        REPO_NAME=$(basename "${CLEAN_URL}")
+        REPO_OWNER="${GITEA_USERNAME}"
+
+        echo "Detected remote repository: ${REMOTE_URL}"
+        echo "Importing into Gitea as ${REPO_OWNER}/${REPO_NAME}..."
+
+        if curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+            "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}" > /dev/null 2>&1; then
+            echo "  Repo already exists in Gitea."
+        else
+            MIGRATE_RESPONSE=$(curl -s -w "\n%{http_code}" \
+                -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+                -X POST "${GITEA_URL}/api/v1/repos/migrate" \
+                -H "Content-Type: application/json" \
+                -d "{
+                    \"clone_addr\": \"${REMOTE_URL}\",
+                    \"repo_name\": \"${REPO_NAME}\",
+                    \"repo_owner\": \"${REPO_OWNER}\",
+                    \"service\": \"git\",
+                    \"mirror\": false
+                }")
+            MIGRATE_CODE=$(echo "${MIGRATE_RESPONSE}" | tail -1)
+            if [ "${MIGRATE_CODE}" = "201" ] || [ "${MIGRATE_CODE}" = "200" ]; then
+                echo "  Migration accepted — waiting for import to finish..."
+            else
+                echo "ERROR: Failed to import repo from ${REMOTE_URL} (HTTP ${MIGRATE_CODE})"
+                echo "  Response: $(echo "${MIGRATE_RESPONSE}" | head -n -1)"
+                request_human_input "Failed to import repository from \`${REMOTE_URL}\` into Gitea (HTTP ${MIGRATE_CODE}). Please create it manually or check the URL."
+            fi
+        fi
+
+        # Gitea migrations can be async.  Poll until the repo is cloneable
+        # (i.e. its default branch exists) or until we time out.
+        MIGRATE_WAIT_MAX=60
+        MIGRATE_WAIT=0
+        MIGRATE_POLL_INTERVAL=3
+        while [ "${MIGRATE_WAIT}" -lt "${MIGRATE_WAIT_MAX}" ]; do
+            REPO_STATUS=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+                "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}" 2>/dev/null || true)
+            if [ -n "${REPO_STATUS}" ]; then
+                REPO_EMPTY=$(echo "${REPO_STATUS}" | jq -r '.empty')
+                if [ "${REPO_EMPTY}" = "false" ]; then
+                    echo "  Repo ready."
+                    break
+                fi
+            fi
+            sleep "${MIGRATE_POLL_INTERVAL}"
+            MIGRATE_WAIT=$((MIGRATE_WAIT + MIGRATE_POLL_INTERVAL))
+            echo "  Waiting for migration to complete... (${MIGRATE_WAIT}s/${MIGRATE_WAIT_MAX}s)"
+        done
+        if [ "${MIGRATE_WAIT}" -ge "${MIGRATE_WAIT_MAX}" ]; then
+            echo "ERROR: Migration did not complete within ${MIGRATE_WAIT_MAX}s."
+            request_human_input "Repository migration from \`${REMOTE_URL}\` timed out. The repo may still be importing — check Gitea and retry."
+        fi
+
+        echo "Using imported repo: ${REPO_OWNER}/${REPO_NAME}"
+    else
+        # Local owner/name format
+        REPO_OWNER=$(echo "${REPO_REF}" | cut -d/ -f1)
+        REPO_NAME=$(echo "${REPO_REF}" | cut -d/ -f2)
+        echo "Extracted repo from description: ${REPO_OWNER}/${REPO_NAME}"
     fi
 fi
 
@@ -230,7 +321,7 @@ cat > "${PROMPT_FILE}" <<PROMPT_EOF
 ## Ticket
 - **ID:** ${TICKET_ID}
 - **Subject:** ${TICKET_SUBJECT}
-$([ -n "${PLAN_STEP}" ] && echo "- **Plan Step:** ${PLAN_STEP}")
+$([ -n "${PLAN_STEP}" ] && echo "- **Plan Step:** ${PLAN_STEP}" || true)
 
 ## Ticket Description
 
@@ -365,7 +456,7 @@ PR_BODY="## Ticket
 [#${TICKET_ID}: ${TICKET_SUBJECT}](${TAIGA_URL}/project/dev-environment/us/${TICKET_ID})
 $([ -n "${PLAN_STEP}" ] && echo "
 ## Plan Step
-Step ${PLAN_STEP}")
+Step ${PLAN_STEP}" || true)
 
 ## Summary
 ${COMPLETION_SUMMARY:-Work by agent ${AGENT_ID}}
@@ -381,7 +472,7 @@ else
         -X POST "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}/pulls" \
         -H "Content-Type: application/json" \
         -d "{
-            \"title\": \"[${AGENT_ID}] Ticket #${TICKET_ID}$([ -n "${PLAN_STEP}" ] && echo " - Step ${PLAN_STEP}"): ${TICKET_SUBJECT}\",
+            \"title\": \"[${AGENT_ID}] Ticket #${TICKET_ID}$([ -n "${PLAN_STEP}" ] && echo " - Step ${PLAN_STEP}" || true): ${TICKET_SUBJECT}\",
             \"body\": $(echo "${PR_BODY}" | jq -Rs .),
             \"head\": \"${BRANCH_NAME}\",
             \"base\": \"main\"
