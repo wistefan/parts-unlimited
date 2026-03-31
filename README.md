@@ -10,7 +10,8 @@ A locally-hosted, Kubernetes-based platform that orchestrates Claude AI agents t
 - `curl`
 - `helm` (v3.x)
 - `python3`
-- Ports **3000** (Gitea) and **9000** (Taiga) must be free
+- `docker` (used to cache container images and avoid Docker Hub rate limits)
+- Ports **3001** (Gitea) and **9000** (Taiga) must be free (configurable)
 - Root/sudo access (for k3s installation)
 - At least 4 CPU cores and 8 GB RAM recommended
 
@@ -31,7 +32,7 @@ After setup completes:
 
 | Service | URL | Credentials |
 |---|---|---|
-| Gitea | http://localhost:3000 | `claude` / `password` (system admin) |
+| Gitea | http://localhost:3001 | `claude` / `password` (system admin) |
 | Taiga | http://localhost:9000 | `admin` / `password` (system admin) |
 
 Both services also have a configurable **human user** (default: `wistefan` / `password`) with full admin privileges. See [Configuration](#configuration) for how to customize.
@@ -81,7 +82,7 @@ kubectl create secret generic claude-credentials \
 
 All work starts as a **user story** on the Taiga Kanban board.
 
-1. Open Taiga at http://localhost:9000 and sign in as your human user.
+1. Open Taiga at `http://localhost:9000` and sign in as your human user.
 2. Open the **Dev Environment** project.
 3. Click **+ Add new** to create a user story.
 4. Fill in the fields:
@@ -170,7 +171,7 @@ All other statuses (e.g., "done", "closed") are yours to manage — agents ignor
 
 ### Reviewing and Handling PRs
 
-Agent PRs appear in Gitea at http://localhost:3000. Each PR includes:
+Agent PRs appear in Gitea at `http://localhost:3001`. Each PR includes:
 - A link to the Taiga ticket
 - A reference to the implementation plan step it addresses
 - Test results from the agent's own test run
@@ -248,7 +249,7 @@ The script is idempotent — running it again will upgrade existing deployments 
 
 | Variable | Default | Description |
 |---|---|---|
-| `GITEA_PORT` | `3000` | Port for Gitea web UI and API |
+| `GITEA_PORT` | `3001` | Port for Gitea web UI and API |
 | `TAIGA_PORT` | `9000` | Port for Taiga web UI and API |
 | `TAIGA_SECRET_KEY` | auto-generated | Django secret key for Taiga |
 | `HUMAN_USERNAME` | `wistefan` | Human user created in both Gitea and Taiga |
@@ -261,7 +262,7 @@ The human user is created with **admin privileges** in both Gitea (site admin) a
 Example with custom human user and ports:
 
 ```bash
-HUMAN_USERNAME=johndoe HUMAN_PASSWORD=secret GITEA_PORT=3001 sudo -E ./scripts/setup.sh
+HUMAN_USERNAME=johndoe HUMAN_PASSWORD=secret GITEA_PORT=3002 sudo -E ./scripts/setup.sh
 ```
 
 ### `teardown.sh`
@@ -297,7 +298,7 @@ sudo ./scripts/install-k3s.sh
 Initializes Gitea after deployment: verifies the admin user and creates the `wistefan` user. Called automatically by `setup.sh`.
 
 ```bash
-GITEA_URL=http://localhost:3000 ./scripts/init-gitea.sh
+GITEA_URL=http://localhost:3001 ./scripts/init-gitea.sh
 ```
 
 ### `init-taiga.sh`
@@ -317,6 +318,20 @@ TAIGA_URL=http://localhost:9000 ./scripts/init-taiga.sh
 | `TAIGA_ADMIN_PASSWORD` | `password` | Superuser password |
 | `TAIGA_PROJECT_NAME` | `Dev Environment` | Project name |
 
+### `cache-images.sh`
+
+Pre-pulls external container images to the host Docker daemon and imports them into k3s containerd. On subsequent runs, images already in k3s are skipped; images in Docker but not k3s are imported directly without hitting Docker Hub.
+
+```bash
+# Cache the default set of images used by dev-env manifests
+sudo ./scripts/cache-images.sh
+
+# Cache specific images only
+sudo ./scripts/cache-images.sh postgres:12.3 nginx:1.19-alpine
+```
+
+Called automatically by `setup.sh`. Requires `docker` on the host. If docker is not available, images are pulled directly by k3s (standard behavior, subject to Docker Hub rate limits).
+
 ### `wait-for-ready.sh`
 
 Helper that blocks until all pods in a namespace are running and ready.
@@ -331,8 +346,8 @@ Helper that blocks until all pods in a namespace are running and ready.
 ```
 k3s (single node)
 ├── Namespace: gitea
-│   ├── Gitea (Helm chart) + PostgreSQL
-│   └── (future: act_runner for CI/CD)
+│   ├── Gitea (Helm chart, port 3001) + PostgreSQL
+│   └── act_runner (Gitea Actions CI/CD)
 ├── Namespace: taiga
 │   ├── taiga-back (Django API)
 │   ├── taiga-front (Angular SPA)
@@ -342,7 +357,7 @@ k3s (single node)
 │   ├── taiga-gateway (nginx reverse proxy, port 9000)
 │   ├── PostgreSQL 12.3
 │   └── RabbitMQ 3.8
-├── Namespace: agents (future: orchestrator + worker agents)
+├── Namespace: agents (orchestrator + worker agents)
 └── Storage
     ├── PVCs via local-path-provisioner (PostgreSQL, RabbitMQ)
     └── hostPath volumes at /var/lib/dev-env/taiga/ (shared static/media)
@@ -429,17 +444,17 @@ kubectl get pods -A
 
 ### Port conflicts
 
-If ports 3000 or 9000 are in use, either stop the conflicting service or use custom ports:
+If ports 3001 or 9000 are in use, either stop the conflicting service or use custom ports:
 
 ```bash
 # Check what's using a port
-sudo ss -tlnp | grep ':3000'
+sudo ss -tlnp | grep ':3001'
 
 # Stop a Docker container on that port
 docker stop <container-name>
 
 # Or use different ports
-GITEA_PORT=3001 TAIGA_PORT=9001 sudo -E ./scripts/setup.sh
+GITEA_PORT=3002 TAIGA_PORT=9001 sudo -E ./scripts/setup.sh
 ```
 
 ### Pods not starting
@@ -671,6 +686,7 @@ dev-env/
     ├── setup.sh                 # Master setup script
     ├── teardown.sh              # Cleanup script
     ├── install-k3s.sh           # k3s installation
+    ├── cache-images.sh          # Docker Hub image cache (host → k3s)
     ├── init-gitea.sh            # Gitea initialization
     ├── init-taiga.sh            # Taiga initialization
     ├── verify.sh                # Health checks

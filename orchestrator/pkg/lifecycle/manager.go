@@ -35,20 +35,23 @@ const (
 
 // AgentJobSpec holds the parameters needed to create an agent worker Job.
 type AgentJobSpec struct {
-	AgentID            string
-	Specialization     string
-	TicketID           int
-	PlanStep           string
-	RepoOwner          string
-	RepoName           string
-	GiteaUsername       string
-	GiteaPassword       string
-	TaigaUsername       string
-	TaigaPassword       string
-	AllowedTools       string
-	HumanUsername      string
-	HumanTaigaID       int
-	TaigaProjectID     int
+	AgentID        string
+	Specialization string
+	TicketID       int
+	Mode           string // analysis, plan, step, fix
+	PlanStep       string
+	RepoOwner      string
+	RepoName       string
+	PRNumber       int    // PR to fix (fix mode only)
+	PRRepo         string // "{owner}/{repo}" of the PR (fix mode only)
+	GiteaUsername  string
+	GiteaPassword  string
+	TaigaUsername  string
+	TaigaPassword  string
+	AllowedTools   string
+	HumanUsername  string
+	HumanTaigaID   int
+	TaigaProjectID int
 }
 
 // Config holds lifecycle manager configuration.
@@ -354,6 +357,7 @@ func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 		{Name: "TICKET_ID", Value: fmt.Sprintf("%d", spec.TicketID)},
 		{Name: "AGENT_ID", Value: spec.AgentID},
 		{Name: "AGENT_SPECIALIZATION", Value: spec.Specialization},
+		{Name: "MODE", Value: spec.Mode},
 		{Name: "PLAN_STEP", Value: spec.PlanStep},
 		{Name: "REPO_OWNER", Value: spec.RepoOwner},
 		{Name: "REPO_NAME", Value: spec.RepoName},
@@ -364,6 +368,13 @@ func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 		{Name: "HUMAN_USERNAME", Value: spec.HumanUsername},
 		{Name: "HUMAN_TAIGA_ID", Value: fmt.Sprintf("%d", spec.HumanTaigaID)},
 		{Name: "TAIGA_PROJECT_ID", Value: fmt.Sprintf("%d", spec.TaigaProjectID)},
+	}
+
+	if spec.Mode == "fix" && spec.PRNumber > 0 {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "PR_NUMBER", Value: fmt.Sprintf("%d", spec.PRNumber)},
+			corev1.EnvVar{Name: "PR_REPO", Value: spec.PRRepo},
+		)
 	}
 
 	if spec.AllowedTools != "" {

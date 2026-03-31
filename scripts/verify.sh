@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-GITEA_URL="${GITEA_URL:-http://localhost:3000}"
+GITEA_URL="${GITEA_URL:-http://localhost:3001}"
 TAIGA_URL="${TAIGA_URL:-http://localhost:9000}"
 HUMAN_USERNAME="${HUMAN_USERNAME:-wistefan}"
 

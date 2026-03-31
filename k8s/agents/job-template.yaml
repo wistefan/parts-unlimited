@@ -135,5 +135,5 @@ metadata:
   name: agent-service-endpoints
   namespace: agents
 data:
-  GITEA_URL: "http://gitea-http.gitea.svc.cluster.local:3000"
+  GITEA_URL: "http://gitea-http.gitea.svc.cluster.local:3001"
   TAIGA_URL: "http://taiga-gateway.taiga.svc.cluster.local:9000"

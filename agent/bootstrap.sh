@@ -18,12 +18,15 @@
 # /home/agent/.claude/.credentials.json (from K8s Secret).
 #
 # Optional environment variables:
+#   MODE                   - Agent mode: analysis, plan, step, fix (default: step)
 #   PLAN_STEP              - Implementation plan step number to work on
 #   REPO_OWNER             - Gitea repo owner (extracted from ticket if not set)
 #   REPO_NAME              - Gitea repo name (extracted from ticket if not set)
 #   ALLOWED_TOOLS          - Space-separated list of allowed Claude tools
 #   HUMAN_USERNAME         - Taiga username of the human user (for reassignment)
 #   HUMAN_TAIGA_ID         - Taiga user ID of the human user (for reassignment)
+#   PR_NUMBER              - PR number to fix (fix mode only)
+#   PR_REPO                - "{owner}/{repo}" of the PR (fix mode only)
 
 set -euo pipefail
 
@@ -54,10 +57,13 @@ if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ ! -f "${CLAUDE_CREDENTIALS}" ]; then
     exit 1
 fi
 
+MODE="${MODE:-step}"
 PLAN_STEP="${PLAN_STEP:-}"
 ALLOWED_TOOLS="${ALLOWED_TOOLS:-Read Edit Write Glob Grep Bash}"
 HUMAN_USERNAME="${HUMAN_USERNAME:-}"
 HUMAN_TAIGA_ID="${HUMAN_TAIGA_ID:-}"
+PR_NUMBER="${PR_NUMBER:-}"
+PR_REPO="${PR_REPO:-}"
 
 # --- Helper: request human input and exit cleanly ---
 
@@ -278,22 +284,66 @@ mkdir -p "${WORKSPACE}"
 git clone "${CLONE_URL}" "${WORKSPACE}"
 cd "${WORKSPACE}"
 
+# --- Extract base branch from ticket (optional "base: <branch>" field) ---
+
+extract_base_branch() {
+    local desc="$1"
+    local raw
+    raw=$(echo "${desc}" | grep -oP '(?i)base\s*:\s*\K\S+' | head -1 || true)
+    echo "${raw}"
+}
+
+BASE_BRANCH=$(extract_base_branch "${TICKET_DESCRIPTION}")
+BASE_BRANCH="${BASE_BRANCH:-main}"
+echo "Base branch: ${BASE_BRANCH}"
+
 # --- Determine branch ---
 
-BRANCH_PREFIX="agent/${AGENT_ID}/ticket-${TICKET_ID}"
-if [ -n "${PLAN_STEP}" ]; then
-    BRANCH_NAME="${BRANCH_PREFIX}/step-${PLAN_STEP}"
-else
-    BRANCH_NAME="${BRANCH_PREFIX}/work"
+BRANCH_PREFIX="ticket-${TICKET_ID}"
+case "${MODE}" in
+    analysis)
+        # Analysis mode may not need a branch (works on default branch).
+        BRANCH_NAME=""
+        ;;
+    plan)
+        BRANCH_NAME="${BRANCH_PREFIX}/plan"
+        ;;
+    fix)
+        # Fix mode: check out the existing PR branch (bootstrap determines it later
+        # from the PR data).  Set a placeholder — overridden after PR fetch.
+        BRANCH_NAME=""
+        ;;
+    step|*)
+        if [ -n "${PLAN_STEP}" ]; then
+            BRANCH_NAME="${BRANCH_PREFIX}/step-${PLAN_STEP}"
+        else
+            BRANCH_NAME="${BRANCH_PREFIX}/work"
+        fi
+        ;;
+esac
+
+# Ensure the work branch exists (all modes except analysis branch off it)
+WORK_BRANCH="${BRANCH_PREFIX}/work"
+if [ "${MODE}" != "analysis" ]; then
+    if git ls-remote --heads origin "${WORK_BRANCH}" | grep -q "${WORK_BRANCH}"; then
+        echo "Work branch exists: ${WORK_BRANCH}"
+        git fetch origin "${WORK_BRANCH}"
+    else
+        echo "Creating work branch: ${WORK_BRANCH} from ${BASE_BRANCH}"
+        git checkout -b "${WORK_BRANCH}" "origin/${BASE_BRANCH}"
+        git push -u origin "${WORK_BRANCH}"
+    fi
 fi
 
-# Check if branch already exists (resuming previous work)
-if git ls-remote --heads origin "${BRANCH_NAME}" | grep -q "${BRANCH_NAME}"; then
-    echo "Resuming work on existing branch: ${BRANCH_NAME}"
-    git checkout "${BRANCH_NAME}"
-else
-    echo "Creating new branch: ${BRANCH_NAME}"
-    git checkout -b "${BRANCH_NAME}"
+# Check out or create the target branch
+if [ -n "${BRANCH_NAME}" ]; then
+    if git ls-remote --heads origin "${BRANCH_NAME}" | grep -q "${BRANCH_NAME}"; then
+        echo "Resuming work on existing branch: ${BRANCH_NAME}"
+        git checkout "${BRANCH_NAME}"
+    else
+        echo "Creating new branch: ${BRANCH_NAME} from ${WORK_BRANCH}"
+        git checkout -b "${BRANCH_NAME}" "origin/${WORK_BRANCH}"
+    fi
 fi
 
 # --- Read implementation plan if it exists ---
@@ -373,11 +423,16 @@ PROMPT_EOF
 
 echo "  Prompt written to ${PROMPT_FILE}"
 
-# --- Load system prompt template ---
+# --- Load system prompt template (mode-specific) ---
 
 SYSTEM_PROMPT=""
-if [ -f "/home/agent/system-prompt.md" ]; then
+SYSTEM_PROMPT_FILE="/home/agent/system-prompt-${MODE}.md"
+if [ -f "${SYSTEM_PROMPT_FILE}" ]; then
+    SYSTEM_PROMPT=$(cat "${SYSTEM_PROMPT_FILE}")
+    echo "  Using mode-specific system prompt: ${SYSTEM_PROMPT_FILE}"
+elif [ -f "/home/agent/system-prompt.md" ]; then
     SYSTEM_PROMPT=$(cat /home/agent/system-prompt.md)
+    echo "  Using default system prompt"
 fi
 
 # --- Invoke Claude Code ---
@@ -468,14 +523,30 @@ if [ -n "${EXISTING_PR}" ]; then
     echo "  PR #${EXISTING_PR} already exists, updated with latest push."
 else
     echo "Creating PR..."
+    # Plan/step PRs target the work branch; only the work branch itself targets the base branch.
+    if [ "${BRANCH_NAME}" = "${WORK_BRANCH}" ]; then
+        PR_BASE="${BASE_BRANCH}"
+    else
+        PR_BASE="${WORK_BRANCH}"
+    fi
+
+    PR_TITLE="Ticket #${TICKET_ID}"
+    if [ "${MODE}" = "plan" ]; then
+        PR_TITLE="${PR_TITLE}: Implementation Plan"
+    elif [ -n "${PLAN_STEP}" ]; then
+        PR_TITLE="${PR_TITLE} - Step ${PLAN_STEP}: ${TICKET_SUBJECT}"
+    else
+        PR_TITLE="${PR_TITLE}: ${TICKET_SUBJECT}"
+    fi
+
     PR_RESPONSE=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
         -X POST "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}/pulls" \
         -H "Content-Type: application/json" \
         -d "{
-            \"title\": \"[${AGENT_ID}] Ticket #${TICKET_ID}$([ -n "${PLAN_STEP}" ] && echo " - Step ${PLAN_STEP}" || true): ${TICKET_SUBJECT}\",
+            \"title\": $(echo "${PR_TITLE}" | jq -Rs .),
             \"body\": $(echo "${PR_BODY}" | jq -Rs .),
             \"head\": \"${BRANCH_NAME}\",
-            \"base\": \"main\"
+            \"base\": \"${PR_BASE}\"
         }" 2>/dev/null || true)
 
     PR_NUMBER=$(echo "${PR_RESPONSE}" | jq -r '.number // empty' 2>/dev/null || true)

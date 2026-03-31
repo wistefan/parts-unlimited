@@ -199,3 +199,135 @@ func TestCreateReview(t *testing.T) {
 		t.Errorf("expected body='Looks good', got %q", review.Body)
 	}
 }
+
+func TestEditPullRequest(t *testing.T) {
+	_, client := setupTestServer(t, map[string]http.HandlerFunc{
+		"/api/v1/repos/owner/repo/pulls/5": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPatch {
+				t.Errorf("expected PATCH, got %s", r.Method)
+			}
+			var body EditPRRequest
+			json.NewDecoder(r.Body).Decode(&body)
+			if len(body.Assignees) != 1 || body.Assignees[0] != "wistefan" {
+				t.Errorf("expected assignees=[wistefan], got %v", body.Assignees)
+			}
+			json.NewEncoder(w).Encode(PullRequest{
+				Number:    5,
+				Assignees: []GiteaUser{{Login: "wistefan"}},
+			})
+		},
+	})
+
+	pr, err := client.EditPullRequest("owner", "repo", 5, &EditPRRequest{
+		Assignees: []string{"wistefan"},
+	})
+	if err != nil {
+		t.Fatalf("EditPullRequest: %v", err)
+	}
+	if pr.Number != 5 {
+		t.Errorf("expected PR number=5, got %d", pr.Number)
+	}
+	if len(pr.Assignees) != 1 || pr.Assignees[0].Login != "wistefan" {
+		t.Errorf("expected assignee wistefan, got %v", pr.Assignees)
+	}
+}
+
+func TestGetPRDiff(t *testing.T) {
+	expectedDiff := "diff --git a/file.go b/file.go\n--- a/file.go\n+++ b/file.go\n@@ -1 +1 @@\n-old\n+new\n"
+	_, client := setupTestServer(t, map[string]http.HandlerFunc{
+		"/api/v1/repos/owner/repo/pulls/3.diff": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte(expectedDiff))
+		},
+	})
+
+	diff, err := client.GetPRDiff("owner", "repo", 3)
+	if err != nil {
+		t.Fatalf("GetPRDiff: %v", err)
+	}
+	if diff != expectedDiff {
+		t.Errorf("expected diff content, got %q", diff)
+	}
+}
+
+func TestGetPRReviews(t *testing.T) {
+	_, client := setupTestServer(t, map[string]http.HandlerFunc{
+		"/api/v1/repos/owner/repo/pulls/2/reviews": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				t.Errorf("expected GET, got %s", r.Method)
+			}
+			json.NewEncoder(w).Encode([]PRReview{
+				{ID: 10, Body: "Please fix", State: "REQUEST_CHANGES"},
+				{ID: 11, Body: "Looks good", State: "APPROVED"},
+			})
+		},
+	})
+
+	reviews, err := client.GetPRReviews("owner", "repo", 2)
+	if err != nil {
+		t.Fatalf("GetPRReviews: %v", err)
+	}
+	if len(reviews) != 2 {
+		t.Fatalf("expected 2 reviews, got %d", len(reviews))
+	}
+	if reviews[0].State != "REQUEST_CHANGES" {
+		t.Errorf("expected first review state=REQUEST_CHANGES, got %q", reviews[0].State)
+	}
+}
+
+func TestGetPRReviewComments(t *testing.T) {
+	_, client := setupTestServer(t, map[string]http.HandlerFunc{
+		"/api/v1/repos/owner/repo/pulls/2/reviews/10/comments": func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode([]ReviewComment{
+				{ID: 100, Body: "Fix this line", Path: "main.go", NewLine: 42},
+			})
+		},
+	})
+
+	comments, err := client.GetPRReviewComments("owner", "repo", 2, 10)
+	if err != nil {
+		t.Fatalf("GetPRReviewComments: %v", err)
+	}
+	if len(comments) != 1 {
+		t.Fatalf("expected 1 comment, got %d", len(comments))
+	}
+	if comments[0].Path != "main.go" {
+		t.Errorf("expected path=main.go, got %q", comments[0].Path)
+	}
+	if comments[0].NewLine != 42 {
+		t.Errorf("expected line=42, got %d", comments[0].NewLine)
+	}
+}
+
+func TestCreateRepoWebhook(t *testing.T) {
+	_, client := setupTestServer(t, map[string]http.HandlerFunc{
+		"/api/v1/repos/claude/test-repo/hooks": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				t.Errorf("expected POST, got %s", r.Method)
+			}
+			var body CreateHookRequest
+			json.NewDecoder(r.Body).Decode(&body)
+			if body.Type != "gitea" {
+				t.Errorf("expected type=gitea, got %q", body.Type)
+			}
+			if len(body.Events) != 2 {
+				t.Errorf("expected 2 events, got %d", len(body.Events))
+			}
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte("{}"))
+		},
+	})
+
+	err := client.CreateRepoWebhook("claude", "test-repo", &CreateHookRequest{
+		Type: "gitea",
+		Config: map[string]string{
+			"url":          "http://orchestrator:8080/webhooks/gitea",
+			"content_type": "json",
+		},
+		Events: []string{"pull_request", "pull_request_review"},
+		Active: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateRepoWebhook: %v", err)
+	}
+}
