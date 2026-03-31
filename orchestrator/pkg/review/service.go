@@ -82,18 +82,12 @@ func (s *Service) ReviewPR(ctx context.Context, owner, repo string, prNumber int
 		return nil, fmt.Errorf("invoking claude for review: %w", err)
 	}
 
-	// Post review on Gitea
-	event := "COMMENT"
-	if result.Approved {
-		event = "APPROVED"
-	} else if len(result.Issues) > 0 {
-		event = "REQUEST_CHANGES"
-	}
-
+	// Always post as COMMENT — the auto-review is informational only.
+	// Only the human is allowed to approve or request changes.
 	reviewBody := formatReviewBody(result)
 	_, err = s.giteaClient.CreateReview(owner, repo, prNumber, &gitea.CreateReviewRequest{
 		Body:  reviewBody,
-		Event: event,
+		Event: "COMMENT",
 	})
 	if err != nil {
 		log.Printf("WARNING: could not post review on PR #%d: %v", prNumber, err)
@@ -105,11 +99,7 @@ func (s *Service) ReviewPR(ctx context.Context, owner, repo string, prNumber int
 
 // getPRDiff fetches the unified diff for a PR via the Gitea API.
 func (s *Service) getPRDiff(owner, repo string, prNumber int) (string, error) {
-	// Gitea serves diffs at /repos/:owner/:repo/pulls/:number.diff
-	// We use the gitea client's underlying HTTP to fetch it
-	// For now, return a placeholder — the actual diff fetch will use the Gitea API
-	// which requires a .diff endpoint not yet in our client
-	return fmt.Sprintf("[diff for PR #%d — fetch via Gitea API .diff endpoint]", prNumber), nil
+	return s.giteaClient.GetPRDiff(owner, repo, prNumber)
 }
 
 // invokeClaude runs the claude CLI to review a diff.
