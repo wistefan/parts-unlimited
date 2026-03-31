@@ -825,6 +825,13 @@ func (o *orchestrator) respawnAgent(ticketID int, mode string) {
 		}
 	}
 
+	// Delete any existing Job for this agent+ticket (e.g. completed analysis Job)
+	// before creating the new one — they share the same name.
+	oldJobName := lifecycle.JobName(agent.ID, ticketID)
+	if err := o.lifecycleMgr.DeleteJob(context.Background(), oldJobName); err != nil {
+		log.Printf("Ticket #%d: could not delete old job %s (may not exist): %v", ticketID, oldJobName, err)
+	}
+
 	spec := &lifecycle.AgentJobSpec{
 		AgentID:        agent.ID,
 		Specialization: agent.Specialization,
