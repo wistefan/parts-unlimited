@@ -26,6 +26,7 @@ import (
 	"github.com/wistefan/dev-env/orchestrator/pkg/identity"
 	"github.com/wistefan/dev-env/orchestrator/pkg/lifecycle"
 	"github.com/wistefan/dev-env/orchestrator/pkg/notifications"
+	"github.com/wistefan/dev-env/orchestrator/pkg/review"
 	"github.com/wistefan/dev-env/orchestrator/pkg/state"
 	"github.com/wistefan/dev-env/orchestrator/pkg/taiga"
 	"github.com/wistefan/dev-env/orchestrator/pkg/webhooks"
@@ -53,22 +54,23 @@ const (
 
 // orchestrator holds all initialized subsystems.
 type orchestrator struct {
-	cfg                *config.Config
-	taigaClient        *taiga.Client
-	giteaClient        *gitea.Client
-	assignEngine       *assignment.Engine
-	lifecycleMgr       *lifecycle.Manager
-	identityMgr        *identity.Manager
-	stateMgr           *state.Manager
-	notifySvc          *notifications.Service
-	webhookHandler     *webhooks.Handler
+	cfg                 *config.Config
+	taigaClient         *taiga.Client
+	giteaClient         *gitea.Client
+	assignEngine        *assignment.Engine
+	lifecycleMgr        *lifecycle.Manager
+	identityMgr         *identity.Manager
+	stateMgr            *state.Manager
+	notifySvc           *notifications.Service
+	reviewSvc           *review.Service
+	webhookHandler      *webhooks.Handler
 	giteaWebhookHandler *webhooks.GiteaHandler
 
-	projectID       int
-	readyStatusID   int
-	inProgressID    int
-	readyForTestID  int
-	humanTaigaID    int
+	projectID      int
+	readyStatusID  int
+	inProgressID   int
+	readyForTestID int
+	humanTaigaID   int
 
 	// prMappings maps "{owner}/{repo}#{pr_number}" → ticket ID.
 	// Populated from agent completion comments; used to route PR events.
@@ -287,6 +289,8 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 		DesktopNotify: cfg.Notifications.DesktopNotify,
 	})
 
+	reviewSvc := review.NewService(giteaClient, review.DefaultConfig())
+
 	webhookHandler := webhooks.NewHandler(cfg.Taiga.WebhookSecret)
 	giteaWebhookHandler := webhooks.NewGiteaHandler("") // secret set later if configured
 
@@ -315,6 +319,7 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 		identityMgr:         identityMgr,
 		stateMgr:            stateMgr,
 		notifySvc:           notifySvc,
+		reviewSvc:           reviewSvc,
 		webhookHandler:      webhookHandler,
 		giteaWebhookHandler: giteaWebhookHandler,
 		projectID:           project.ID,
@@ -400,10 +405,13 @@ func (o *orchestrator) registerGiteaWebhookHandlers() {
 			log.Printf("Gitea: PR #%d mapped to ticket #%d", event.PullRequest.Number, ticketID)
 		}
 
-		// TODO(step-21): trigger auto-review via review service
-		// For now, log that auto-review would happen here.
-		log.Printf("Gitea: auto-review pending for PR #%d on %s",
-			event.PullRequest.Number, event.Repository.FullName)
+		// Trigger auto-review: assign PR to reviewing agent, run Claude review,
+		// then reassign to human.  Run in a goroutine so the webhook returns fast.
+		parts := strings.SplitN(event.Repository.FullName, "/", 2)
+		prOwner, prRepo := parts[0], parts[1]
+		prNum := event.PullRequest.Number
+
+		go o.runAutoReview(prOwner, prRepo, prNum)
 
 		return nil
 	})
@@ -417,13 +425,17 @@ func (o *orchestrator) registerGiteaWebhookHandlers() {
 			return nil
 		}
 
-		log.Printf("Gitea: PR #%d merged on %s for ticket #%d — re-spawning agent",
+		log.Printf("Gitea: PR #%d merged on %s for ticket #%d",
 			event.PullRequest.Number, event.Repository.FullName, ticketID)
 
-		// TODO(step-23): parse agent's last Taiga comment for [step:N/M] vs [step:complete]
-		// to decide whether to re-spawn or transition to ready-for-test.
-		// For now, always re-spawn in "step" mode.
-		o.respawnAgent(ticketID, "step")
+		// Check the agent's last Taiga comment for step markers
+		if o.isStepComplete(ticketID) {
+			log.Printf("Gitea: ticket #%d all steps complete — transitioning to ready-for-test", ticketID)
+			o.transitionToReadyForTest(ticketID)
+		} else {
+			log.Printf("Gitea: ticket #%d has more steps — re-spawning agent", ticketID)
+			o.respawnAgent(ticketID, "step")
+		}
 
 		return nil
 	})
@@ -522,6 +534,104 @@ func (o *orchestrator) registerGiteaWebhookHandlers() {
 
 		return nil
 	})
+}
+
+// isStepComplete checks the latest Taiga comments for [step:complete] marker.
+func (o *orchestrator) isStepComplete(ticketID int) bool {
+	comments, err := o.taigaClient.GetComments(ticketID)
+	if err != nil {
+		log.Printf("WARNING: could not fetch comments for ticket %d: %v", ticketID, err)
+		return false
+	}
+
+	// Search from newest to oldest
+	for i := len(comments) - 1; i >= 0; i-- {
+		c := comments[i].Comment
+		if strings.Contains(c, "[step:complete]") {
+			return true
+		}
+		// If we find a [step:N/M] marker first, there are more steps
+		if strings.Contains(c, "[step:") {
+			return false
+		}
+	}
+	return false
+}
+
+// transitionToReadyForTest moves a ticket to "ready for test" status,
+// assigns it to the human user, and posts release notes.
+func (o *orchestrator) transitionToReadyForTest(ticketID int) {
+	story, err := o.taigaClient.GetUserStory(ticketID)
+	if err != nil {
+		log.Printf("WARNING: could not fetch ticket %d: %v", ticketID, err)
+		return
+	}
+
+	update := &taiga.UserStoryUpdate{
+		Version: story.Version,
+	}
+
+	if o.readyForTestID > 0 {
+		update.Status = &o.readyForTestID
+	}
+	if o.humanTaigaID > 0 {
+		update.AssignedTo = &o.humanTaigaID
+	}
+
+	_, err = o.taigaClient.UpdateUserStory(ticketID, update)
+	if err != nil {
+		log.Printf("WARNING: could not transition ticket %d to ready-for-test: %v", ticketID, err)
+	}
+
+	// Clear the internal assignment
+	o.assignEngine.CompleteTicket(ticketID)
+	o.saveState(context.Background())
+
+	o.notifySvc.Notify(
+		notifications.EventReadyForTest,
+		ticketID, "",
+		fmt.Sprintf("Ticket #%d ready for test", ticketID),
+		"All implementation steps completed. Please review and test.",
+		"",
+	)
+
+	log.Printf("Ticket #%d transitioned to ready-for-test", ticketID)
+}
+
+// runAutoReview performs an automated Claude review on a PR.
+// It assigns the PR to the reviewing agent during the review, then reassigns
+// to the human user after the review is posted.
+func (o *orchestrator) runAutoReview(owner, repo string, prNumber int) {
+	log.Printf("Auto-review: starting for PR #%d on %s/%s", prNumber, owner, repo)
+
+	// Assign PR to the orchestrator/claude account during review
+	_, err := o.giteaClient.EditPullRequest(owner, repo, prNumber, &gitea.EditPRRequest{
+		Assignees: []string{o.cfg.Gitea.AdminUsername},
+	})
+	if err != nil {
+		log.Printf("Auto-review: WARNING: could not assign PR #%d to reviewer: %v", prNumber, err)
+	}
+
+	// Run the Claude review
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	_, err = o.reviewSvc.ReviewPR(ctx, owner, repo, prNumber)
+	if err != nil {
+		log.Printf("Auto-review: ERROR on PR #%d: %v", prNumber, err)
+	}
+
+	// Reassign PR to the human user
+	if o.cfg.Taiga.HumanUsername != "" {
+		_, err = o.giteaClient.EditPullRequest(owner, repo, prNumber, &gitea.EditPRRequest{
+			Assignees: []string{o.cfg.Taiga.HumanUsername},
+		})
+		if err != nil {
+			log.Printf("Auto-review: WARNING: could not reassign PR #%d to human: %v", prNumber, err)
+		}
+	}
+
+	log.Printf("Auto-review: completed for PR #%d on %s/%s", prNumber, owner, repo)
 }
 
 // resolveTicketFromPR looks up the Taiga ticket ID for a Gitea PR event.

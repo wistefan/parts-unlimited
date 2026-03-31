@@ -30,8 +30,12 @@ WORKDIR /home/agent
 RUN git config --global init.defaultBranch main \
     && git config --global advice.detachedHead false
 
-# Copy bootstrap script and system prompt template
+# Copy bootstrap script and system prompt templates (one per mode)
 COPY --chown=agent:agent bootstrap.sh /home/agent/bootstrap.sh
 COPY --chown=agent:agent system-prompt.md /home/agent/system-prompt.md
+COPY --chown=agent:agent system-prompt-analysis.md /home/agent/system-prompt-analysis.md
+COPY --chown=agent:agent system-prompt-plan.md /home/agent/system-prompt-plan.md
+COPY --chown=agent:agent system-prompt-step.md /home/agent/system-prompt-step.md
+COPY --chown=agent:agent system-prompt-fix.md /home/agent/system-prompt-fix.md
 
 ENTRYPOINT ["/bin/bash", "/home/agent/bootstrap.sh"]
