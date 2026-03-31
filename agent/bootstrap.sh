@@ -495,12 +495,18 @@ fi
 
 # --- Invoke Claude Code ---
 
+# Ensure Claude Code's session directory is writable.
+# The credentials file is mounted at .claude/.credentials.json via subPath,
+# so the .claude directory itself needs to be created if it doesn't exist.
+mkdir -p /home/agent/.claude/session-env
+
 echo "Invoking Claude Code..."
 
 CLAUDE_ARGS=(
     -p
     --dangerously-skip-permissions
     --output-format stream-json
+    --verbose
 )
 
 if [ -n "${SYSTEM_PROMPT}" ]; then

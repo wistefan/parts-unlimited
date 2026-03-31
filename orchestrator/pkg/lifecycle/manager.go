@@ -188,7 +188,8 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 								},
 								{
 									Name:      "claude-credentials",
-									MountPath: "/home/agent/.claude",
+									MountPath: "/home/agent/.claude/.credentials.json",
+									SubPath:   ".credentials.json",
 									ReadOnly:  true,
 								},
 							},

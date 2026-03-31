@@ -108,7 +108,8 @@ spec:
             - name: workspace
               mountPath: /home/agent/workspace
             - name: claude-credentials
-              mountPath: /home/agent/.claude
+              mountPath: /home/agent/.claude/.credentials.json
+              subPath: .credentials.json
               readOnly: true
           resources:
             requests:

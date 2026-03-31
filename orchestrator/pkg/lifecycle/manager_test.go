@@ -141,7 +141,7 @@ func TestCreateJob(t *testing.T) {
 	// Claude credentials should be mounted as a volume
 	var hasCredentialsMount bool
 	for _, vm := range container.VolumeMounts {
-		if vm.Name == "claude-credentials" && vm.MountPath == "/home/agent/.claude" && vm.ReadOnly {
+		if vm.Name == "claude-credentials" && vm.MountPath == "/home/agent/.claude/.credentials.json" && vm.ReadOnly {
 			hasCredentialsMount = true
 			break
 		}
