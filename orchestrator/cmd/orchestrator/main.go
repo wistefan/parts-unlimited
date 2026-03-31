@@ -1036,12 +1036,16 @@ func (o *orchestrator) reconcile(ctx context.Context) error {
 					if js.Succeeded {
 						log.Printf("Reconcile: job %s completed for ticket #%d (mode=%s)", js.Name, ticketID, assignment.Mode)
 						o.handleJobCompletion(ctx, ticketID, assignment)
-					} else {
-						log.Printf("Reconcile: job %s failed for ticket #%d", js.Name, ticketID)
-						o.assignEngine.CompleteTicket(ticketID)
+						// handleJobCompletion may have deleted the old Job and
+						// created a replacement with the same name (e.g.
+						// analysis→plan).  Do NOT delete here or we kill the
+						// new Job.  respawnAgent already handles cleanup.
+						continue
 					}
+					log.Printf("Reconcile: job %s failed for ticket #%d", js.Name, ticketID)
+					o.assignEngine.CompleteTicket(ticketID)
 				}
-				// Delete finished Jobs to prevent re-processing
+				// Delete finished/failed Jobs that were not re-spawned
 				if err := o.lifecycleMgr.DeleteJob(ctx, js.Name); err != nil {
 					log.Printf("WARNING: Could not delete finished job %s: %v", js.Name, err)
 				}
