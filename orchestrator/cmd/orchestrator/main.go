@@ -311,7 +311,18 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 		if savedState.PRMappings != nil {
 			prMappings = savedState.PRMappings
 		}
-		log.Printf("  State: restored %d agents, %d PR mappings", len(savedState.Agents), len(prMappings))
+		// Restore ticket assignments so the orchestrator knows which
+		// tickets are already being worked on and in which mode.
+		if savedState.Assignments != nil {
+			for ticketID, a := range savedState.Assignments {
+				assignEngine.AssignAgent(ticketID, a.PrimaryAgent)
+				if a.Mode != "" {
+					assignEngine.SetMode(ticketID, a.Mode)
+				}
+			}
+		}
+		log.Printf("  State: restored %d agents, %d assignments, %d PR mappings",
+			len(savedState.Agents), len(savedState.Assignments), len(prMappings))
 	}
 
 	orch := &orchestrator{
@@ -825,13 +836,6 @@ func (o *orchestrator) respawnAgent(ticketID int, mode string) {
 		}
 	}
 
-	// Delete any existing Job for this agent+ticket (e.g. completed analysis Job)
-	// before creating the new one — they share the same name.
-	oldJobName := lifecycle.JobName(agent.ID, ticketID)
-	if err := o.lifecycleMgr.DeleteJob(context.Background(), oldJobName); err != nil {
-		log.Printf("Ticket #%d: could not delete old job %s (may not exist): %v", ticketID, oldJobName, err)
-	}
-
 	spec := &lifecycle.AgentJobSpec{
 		AgentID:        agent.ID,
 		Specialization: agent.Specialization,
@@ -1036,16 +1040,12 @@ func (o *orchestrator) reconcile(ctx context.Context) error {
 					if js.Succeeded {
 						log.Printf("Reconcile: job %s completed for ticket #%d (mode=%s)", js.Name, ticketID, assignment.Mode)
 						o.handleJobCompletion(ctx, ticketID, assignment)
-						// handleJobCompletion may have deleted the old Job and
-						// created a replacement with the same name (e.g.
-						// analysis→plan).  Do NOT delete here or we kill the
-						// new Job.  respawnAgent already handles cleanup.
-						continue
+					} else {
+						log.Printf("Reconcile: job %s failed for ticket #%d", js.Name, ticketID)
+						o.assignEngine.CompleteTicket(ticketID)
 					}
-					log.Printf("Reconcile: job %s failed for ticket #%d", js.Name, ticketID)
-					o.assignEngine.CompleteTicket(ticketID)
 				}
-				// Delete finished/failed Jobs that were not re-spawned
+				// Delete finished Jobs (safe — each mode has a unique Job name)
 				if err := o.lifecycleMgr.DeleteJob(ctx, js.Name); err != nil {
 					log.Printf("WARNING: Could not delete finished job %s: %v", js.Name, err)
 				}

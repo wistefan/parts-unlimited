@@ -110,14 +110,17 @@ func NewManager(clientset kubernetes.Interface, config *Config) *Manager {
 	}
 }
 
-// JobName generates a deterministic job name for an agent/ticket combination.
-func JobName(agentID string, ticketID int) string {
-	return fmt.Sprintf("agent-%s-ticket-%d", agentID, ticketID)
+// JobName generates a deterministic job name for an agent/ticket/mode combination.
+func JobName(agentID string, ticketID int, mode string) string {
+	if mode == "" {
+		mode = "step"
+	}
+	return fmt.Sprintf("agent-%s-ticket-%d-%s", agentID, ticketID, mode)
 }
 
 // CreateJob creates a Kubernetes Job for an agent worker.
 func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, error) {
-	jobName := JobName(spec.AgentID, spec.TicketID)
+	jobName := JobName(spec.AgentID, spec.TicketID, spec.Mode)
 
 	// Check if job already exists
 	_, err := m.clientset.BatchV1().Jobs(m.config.Namespace).Get(ctx, jobName, metav1.GetOptions{})
