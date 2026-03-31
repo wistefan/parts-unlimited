@@ -1002,6 +1002,31 @@ func (o *orchestrator) reconcile(ctx context.Context) error {
 		}
 	}
 
+	// Check for restored assignments that have no running Job — the
+	// orchestrator may have restarted after a Job completed but before
+	// the next mode was spawned.  Re-trigger the lifecycle for these.
+	for ticketID, a := range o.assignEngine.GetAllAssignments() {
+		if a.Status != "assigned" {
+			continue
+		}
+		jobName := lifecycle.JobName(a.PrimaryAgent, ticketID, a.Mode)
+		js, _ := o.lifecycleMgr.GetJobStatus(ctx, jobName)
+		if js != nil {
+			continue // Job exists (running, succeeded, or failed — handled below)
+		}
+		// No Job for this assignment — re-trigger based on mode
+		log.Printf("Reconcile: ticket #%d has assignment (mode=%s) but no Job, re-triggering", ticketID, a.Mode)
+		switch a.Mode {
+		case "analysis":
+			// Analysis Job finished but result wasn't processed.
+			// Re-run handleAnalysisCompletion to check for [analysis:proceed].
+			o.handleAnalysisCompletion(ctx, ticketID, a)
+		default:
+			// For other modes, just re-spawn in the same mode.
+			o.respawnAgent(ticketID, a.Mode)
+		}
+	}
+
 	// Check for "in progress" tickets that have no running Job and are
 	// not assigned to the human — these need an agent re-spawned.
 	inProgressStories, err := o.taigaClient.ListUserStories(o.projectID, &taiga.UserStoryListOptions{
