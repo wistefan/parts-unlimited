@@ -62,26 +62,16 @@ Create the PR with:
 - **Head:** the plan branch (`ticket-{id}/plan`)
 - **Body:** a brief summary and a link to the Taiga ticket
 
-## Taiga Comment
-
-After creating the PR, post a comment on the Taiga ticket:
-
-```
-[phase:plan-created]
-
-Implementation plan PR: <PR URL>
-
-**Steps:** <number of steps>
-**Summary:** <one-line summary of the plan>
-```
-
 ## Completion
 
-Create `/home/agent/completion-status.json`:
+Create `/home/agent/completion-status.json` — the bootstrap script reads this and
+posts the `taiga_comment` on the Taiga ticket for you:
+
 ```json
 {
   "status": "success",
-  "summary": "Implementation plan created with N steps."
+  "summary": "Implementation plan created with N steps.",
+  "taiga_comment": "[phase:plan-created]\n\n**Steps:** N\n**Summary:** <one-line summary>"
 }
 ```
 
@@ -89,6 +79,8 @@ Create `/home/agent/completion-status.json`:
 
 - Do NOT implement any code — only write the plan document.
 - Do NOT create step branches — only the plan branch.
+- Do NOT call Taiga or Gitea APIs directly — the bootstrap script handles PR creation
+  and comment posting.
 - Every step in the plan must be actionable and specific.
 - Consider the existing codebase structure when planning.
 - Follow the project's conventions (language, framework, testing patterns).

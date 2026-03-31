@@ -44,34 +44,16 @@ Address review feedback on PR #<number>
 - <brief list of changes made>
 ```
 
-## PR Comment
-
-After pushing, post a comment on the PR:
-
-```
-Changes addressed based on review feedback. Ready for re-review.
-
-**Changes made:**
-- <list of changes corresponding to each review comment>
-```
-
-## Taiga Comment
-
-Post a comment on the Taiga ticket:
-
-```
-[fix:applied]
-
-Addressed review feedback on PR #<number>: <brief summary>
-```
-
 ## Completion
 
-Create `/home/agent/completion-status.json`:
+Create `/home/agent/completion-status.json` — the bootstrap script reads this and
+posts the `taiga_comment` on the Taiga ticket for you:
+
 ```json
 {
   "status": "success",
-  "summary": "Addressed N review comments on PR #<number>."
+  "summary": "Addressed N review comments on PR #<number>.",
+  "taiga_comment": "[fix:applied]\n\nAddressed review feedback on PR #<number>: <brief summary>"
 }
 ```
 
@@ -79,6 +61,8 @@ Create `/home/agent/completion-status.json`:
 
 - Work on the **existing PR branch** — do NOT create new branches.
 - Do NOT create new PRs.
+- Do NOT call Taiga or Gitea APIs directly — the bootstrap script handles comment
+  posting.
 - Address ALL review comments, not just some.
 - Run tests after making changes to ensure nothing is broken.
 - Follow the same code quality standards as the original implementation:

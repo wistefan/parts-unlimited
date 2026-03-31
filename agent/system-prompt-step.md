@@ -44,51 +44,38 @@ unnecessary, a new step is needed, or the approach should change):
 
 1. Update `IMPLEMENTATION_PLAN.md` on the current step branch.
 2. Note the plan change in the PR description.
-3. Post a Taiga comment with `[plan-update]` explaining what changed.
 
 The human reviewer will see the plan changes in the PR diff.
 
-## Taiga Comment — Step Progress
-
-After creating the step PR, post a Taiga comment with:
-
-**If more steps remain:**
-```
-[step:N/M]
-
-Completed step N of M: <step title>
-PR: <PR URL>
-
-**Summary:** <brief description of what was implemented>
-```
-
-**If this was the last step:**
-```
-[step:complete]
-
-All M steps completed.
-
-**Release Notes:**
-<Human-readable summary of ALL changes made across the entire ticket.
-Describe what was implemented, what was changed, and the overall outcome.
-This summary will be posted as the final release notes.>
-```
-
 ## Completion
 
-Create `/home/agent/completion-status.json`:
+Create `/home/agent/completion-status.json` — the bootstrap script reads this and
+posts the `taiga_comment` on the Taiga ticket for you.
+
+**If more steps remain:**
 ```json
 {
   "status": "success",
-  "summary": "Implemented step N of M: <step title>"
+  "summary": "Implemented step N of M: <step title>",
+  "taiga_comment": "[step:N/M]\n\nCompleted step N of M: <step title>\n\n**Summary:** <brief description>"
 }
 ```
 
-Or if all steps are complete:
+**If this was the last step:**
 ```json
 {
   "status": "success",
-  "summary": "All steps complete. Release notes posted."
+  "summary": "All steps complete.",
+  "taiga_comment": "[step:complete]\n\nAll M steps completed.\n\n**Release Notes:**\n<Human-readable summary of ALL changes made across the entire ticket.>"
+}
+```
+
+**If the plan was updated:**
+```json
+{
+  "status": "success",
+  "summary": "Updated implementation plan.",
+  "taiga_comment": "[plan-update]\n\nUpdated the implementation plan: <what changed>"
 }
 ```
 
@@ -98,11 +85,13 @@ Or if all steps are complete:
 - Create exactly ONE PR per step.
 - Each step must be self-contained and independently mergeable.
 - Do NOT implement future steps — only the next pending one.
+- Do NOT call Taiga or Gitea APIs directly — the bootstrap script handles PR creation
+  and comment posting.
 - Run tests before finishing to catch regressions.
 - Follow the code quality standards:
   - Every public method documented per language conventions.
   - No magic constants — define named constants.
   - Parameterized tests where possible.
-- The `[step:N/M]` or `[step:complete]` marker in the Taiga comment is critical — the
-  orchestrator reads it to determine whether to re-spawn you for the next step or
+- The `[step:N/M]` or `[step:complete]` marker in the `taiga_comment` field is critical —
+  the orchestrator reads it to determine whether to re-spawn you for the next step or
   transition the ticket to "ready for test".

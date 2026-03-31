@@ -475,39 +475,74 @@ fi
 echo "  Completion status: ${COMPLETION_STATUS}"
 echo "  Summary: ${COMPLETION_SUMMARY}"
 
-# --- Handle blocked status ---
+# --- Mode-specific post-processing ---
 
-if [ "${COMPLETION_STATUS}" = "blocked" ]; then
-    BLOCKED_REASON=$(jq -r '.reason // "No reason provided"' /home/agent/completion-status.json 2>/dev/null || echo "No reason provided")
-    echo "Agent is blocked — requesting human input."
-    request_human_input "**Agent ${AGENT_ID}** is blocked and needs human input.\n\n**Reason:** ${BLOCKED_REASON}"
-fi
+if [ "${MODE}" = "analysis" ]; then
+    # --- Analysis mode: post result comment, handle need-info ---
 
-# --- Push changes ---
+    ANALYSIS_RESULT=$(jq -r '.analysis_result // ""' /home/agent/completion-status.json 2>/dev/null || true)
+    ANALYSIS_COMMENT=$(jq -r '.analysis_comment // ""' /home/agent/completion-status.json 2>/dev/null || true)
 
-if [ -n "$(git status --porcelain)" ] || [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/$(git rev-parse --abbrev-ref HEAD) 2>/dev/null || echo '')" ]; then
-    echo "Pushing changes..."
-    # Stage and commit any uncommitted work
-    if [ -n "$(git status --porcelain)" ]; then
+    echo "  Analysis result: ${ANALYSIS_RESULT}"
+
+    if [ -n "${ANALYSIS_COMMENT}" ]; then
+        echo "Posting analysis comment on ticket..."
+        CURRENT_VERSION=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
+            "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
+            | jq -r '.version')
+
+        curl -sf -X PATCH "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
+            -H "${TAIGA_AUTH_HEADER}" \
+            -H "Content-Type: application/json" \
+            -d "{\"comment\": $(echo "${ANALYSIS_COMMENT}" | jq -Rs .), \"version\": ${CURRENT_VERSION}}" \
+            >/dev/null 2>&1 || echo "WARNING: Could not post analysis comment on ticket."
+    fi
+
+    if [ "${ANALYSIS_RESULT}" = "need-info" ]; then
+        echo "Analysis requires human input — assigning ticket to human."
+        request_human_input "Analysis requires additional information. See the analysis comment above for details."
+    fi
+
+else
+    # --- Plan/Step/Fix modes: push, create PR, post comment ---
+
+    # Handle blocked status
+    if [ "${COMPLETION_STATUS}" = "blocked" ]; then
+        BLOCKED_REASON=$(jq -r '.reason // "No reason provided"' /home/agent/completion-status.json 2>/dev/null || echo "No reason provided")
+        echo "Agent is blocked — requesting human input."
+        request_human_input "**Agent ${AGENT_ID}** is blocked and needs human input.\n\n**Reason:** ${BLOCKED_REASON}"
+    fi
+
+    # Push changes
+    if [ -n "${BRANCH_NAME}" ] && [ -n "$(git status --porcelain)" ]; then
+        echo "Pushing changes..."
         git add -A
         git commit -m "Agent ${AGENT_ID}: work on ticket #${TICKET_ID}
 
 ${COMPLETION_SUMMARY:-Work in progress}"
+        git push -u origin "${BRANCH_NAME}"
+        echo "  Pushed to ${BRANCH_NAME}"
+    elif [ -n "${BRANCH_NAME}" ]; then
+        # Check if there are unpushed commits
+        LOCAL_HEAD=$(git rev-parse HEAD)
+        REMOTE_HEAD=$(git rev-parse "origin/${BRANCH_NAME}" 2>/dev/null || echo "")
+        if [ "${LOCAL_HEAD}" != "${REMOTE_HEAD}" ]; then
+            echo "Pushing commits..."
+            git push -u origin "${BRANCH_NAME}"
+            echo "  Pushed to ${BRANCH_NAME}"
+        else
+            echo "  No changes to push."
+        fi
     fi
-    git push -u origin "${BRANCH_NAME}"
-    echo "  Pushed to ${BRANCH_NAME}"
-else
-    echo "  No changes to push."
-fi
 
-# --- Create or update PR ---
+    # Create or update PR (skip for fix mode — PR already exists)
+    if [ -n "${BRANCH_NAME}" ] && [ "${MODE}" != "fix" ]; then
+        echo "Checking for existing PR..."
+        EXISTING_PR=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+            "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}/pulls?state=open&head=${BRANCH_NAME}" \
+            | jq '.[0].number // empty' 2>/dev/null || true)
 
-echo "Checking for existing PR..."
-EXISTING_PR=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
-    "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}/pulls?state=open&head=${BRANCH_NAME}" \
-    | jq '.[0].number // empty' 2>/dev/null || true)
-
-PR_BODY="## Ticket
+        PR_BODY="## Ticket
 [#${TICKET_ID}: ${TICKET_SUBJECT}](${TAIGA_URL}/project/dev-environment/us/${TICKET_ID})
 $([ -n "${PLAN_STEP}" ] && echo "
 ## Plan Step
@@ -519,59 +554,62 @@ ${COMPLETION_SUMMARY:-Work by agent ${AGENT_ID}}
 ## Status
 ${COMPLETION_STATUS}"
 
-if [ -n "${EXISTING_PR}" ]; then
-    echo "  PR #${EXISTING_PR} already exists, updated with latest push."
-else
-    echo "Creating PR..."
-    # Plan/step PRs target the work branch; only the work branch itself targets the base branch.
-    if [ "${BRANCH_NAME}" = "${WORK_BRANCH}" ]; then
-        PR_BASE="${BASE_BRANCH}"
-    else
-        PR_BASE="${WORK_BRANCH}"
+        if [ -n "${EXISTING_PR}" ]; then
+            echo "  PR #${EXISTING_PR} already exists, updated with latest push."
+        else
+            echo "Creating PR..."
+            # Plan/step PRs target the work branch; only the work branch itself targets the base branch.
+            if [ "${BRANCH_NAME}" = "${WORK_BRANCH}" ]; then
+                PR_BASE="${BASE_BRANCH}"
+            else
+                PR_BASE="${WORK_BRANCH}"
+            fi
+
+            PR_TITLE="Ticket #${TICKET_ID}"
+            if [ "${MODE}" = "plan" ]; then
+                PR_TITLE="${PR_TITLE}: Implementation Plan"
+            elif [ -n "${PLAN_STEP}" ]; then
+                PR_TITLE="${PR_TITLE} - Step ${PLAN_STEP}: ${TICKET_SUBJECT}"
+            else
+                PR_TITLE="${PR_TITLE}: ${TICKET_SUBJECT}"
+            fi
+
+            PR_RESPONSE=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+                -X POST "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}/pulls" \
+                -H "Content-Type: application/json" \
+                -d "{
+                    \"title\": $(echo "${PR_TITLE}" | jq -Rs .),
+                    \"body\": $(echo "${PR_BODY}" | jq -Rs .),
+                    \"head\": \"${BRANCH_NAME}\",
+                    \"base\": \"${PR_BASE}\"
+                }" 2>/dev/null || true)
+
+            PR_NUMBER=$(echo "${PR_RESPONSE}" | jq -r '.number // empty' 2>/dev/null || true)
+            if [ -n "${PR_NUMBER}" ]; then
+                echo "  Created PR #${PR_NUMBER}"
+            else
+                echo "  WARNING: Could not create PR"
+            fi
+        fi
     fi
 
-    PR_TITLE="Ticket #${TICKET_ID}"
-    if [ "${MODE}" = "plan" ]; then
-        PR_TITLE="${PR_TITLE}: Implementation Plan"
-    elif [ -n "${PLAN_STEP}" ]; then
-        PR_TITLE="${PR_TITLE} - Step ${PLAN_STEP}: ${TICKET_SUBJECT}"
-    else
-        PR_TITLE="${PR_TITLE}: ${TICKET_SUBJECT}"
+    # Post progress comment on ticket (use taiga_comment from completion-status if available)
+    TAIGA_COMMENT=$(jq -r '.taiga_comment // ""' /home/agent/completion-status.json 2>/dev/null || true)
+    if [ -z "${TAIGA_COMMENT}" ]; then
+        TAIGA_COMMENT="**Agent ${AGENT_ID}** completed work.\n\n**Status:** ${COMPLETION_STATUS}\n**Summary:** ${COMPLETION_SUMMARY:-N/A}\n**Branch:** \`${BRANCH_NAME:-N/A}\`"
     fi
 
-    PR_RESPONSE=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
-        -X POST "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}/pulls" \
+    echo "Posting progress comment on ticket..."
+    CURRENT_VERSION=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
+        "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
+        | jq -r '.version')
+
+    curl -sf -X PATCH "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
+        -H "${TAIGA_AUTH_HEADER}" \
         -H "Content-Type: application/json" \
-        -d "{
-            \"title\": $(echo "${PR_TITLE}" | jq -Rs .),
-            \"body\": $(echo "${PR_BODY}" | jq -Rs .),
-            \"head\": \"${BRANCH_NAME}\",
-            \"base\": \"${PR_BASE}\"
-        }" 2>/dev/null || true)
-
-    PR_NUMBER=$(echo "${PR_RESPONSE}" | jq -r '.number // empty' 2>/dev/null || true)
-    if [ -n "${PR_NUMBER}" ]; then
-        echo "  Created PR #${PR_NUMBER}"
-    else
-        echo "  WARNING: Could not create PR"
-    fi
+        -d "{\"comment\": $(echo "${TAIGA_COMMENT}" | jq -Rs .), \"version\": ${CURRENT_VERSION}}" \
+        >/dev/null 2>&1 || echo "WARNING: Could not post comment on ticket."
 fi
-
-# --- Update ticket with progress comment ---
-
-echo "Posting progress comment on ticket..."
-COMMENT_TEXT="**Agent ${AGENT_ID}** completed work.\n\n**Status:** ${COMPLETION_STATUS}\n**Summary:** ${COMPLETION_SUMMARY:-N/A}\n**Branch:** \`${BRANCH_NAME}\`"
-
-# Re-fetch ticket version to avoid conflict
-CURRENT_VERSION=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
-    "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
-    | jq -r '.version')
-
-curl -sf -X PATCH "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
-    -H "${TAIGA_AUTH_HEADER}" \
-    -H "Content-Type: application/json" \
-    -d "{\"comment\": \"$(echo -e "${COMMENT_TEXT}")\", \"version\": ${CURRENT_VERSION}}" \
-    >/dev/null 2>&1 || echo "WARNING: Could not post comment on ticket."
 
 echo ""
 echo "=== Agent Worker Complete ==="
