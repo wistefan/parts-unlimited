@@ -316,9 +316,6 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 		if savedState.Assignments != nil {
 			for ticketID, a := range savedState.Assignments {
 				assignEngine.AssignAgent(ticketID, a.PrimaryAgent)
-				if a.Mode != "" {
-					assignEngine.SetMode(ticketID, a.Mode)
-				}
 			}
 		}
 		log.Printf("  State: restored %d agents, %d assignments, %d PR mappings",
@@ -721,17 +718,64 @@ func (o *orchestrator) isTicketUnassigned(event *webhooks.WebhookEvent) bool {
 	return toIsNull && !fromIsNull
 }
 
-// handleJobCompletion processes the result of a completed agent Job based on its mode.
-func (o *orchestrator) handleJobCompletion(ctx context.Context, ticketID int, assignment *assignment.TicketAssignment) {
-	switch assignment.Mode {
+// extractModeFromJobName extracts the mode suffix from a Job name.
+// Job names follow the pattern: agent-{id}-ticket-{id}-{mode}
+func extractModeFromJobName(jobName string) string {
+	lastDash := strings.LastIndex(jobName, "-")
+	if lastDash < 0 {
+		return "step"
+	}
+	return jobName[lastDash+1:]
+}
+
+// determineMode derives the agent mode from the ticket's Taiga comment history.
+// This is the single source of truth for lifecycle state — no mode is stored in the
+// orchestrator's own state.
+func (o *orchestrator) determineMode(ticketID int) string {
+	comments, err := o.taigaClient.GetComments(ticketID)
+	if err != nil {
+		log.Printf("WARNING: could not fetch comments for ticket %d to determine mode: %v", ticketID, err)
+		return "analysis"
+	}
+
+	// Search from newest to oldest for the most recent lifecycle marker
+	for i := len(comments) - 1; i >= 0; i-- {
+		c := comments[i].Comment
+		if strings.Contains(c, "[step:complete]") {
+			return "" // all done
+		}
+		if strings.Contains(c, "[fix:applied]") {
+			return "step" // fix done, continue with steps
+		}
+		if strings.Contains(c, "[step:") {
+			return "step" // step in progress, continue
+		}
+		if strings.Contains(c, "[phase:plan-created]") {
+			return "step" // plan created, start steps
+		}
+		if strings.Contains(c, "[analysis:proceed]") {
+			return "plan" // analysis done, need plan
+		}
+		if strings.Contains(c, "[analysis:need-info]") {
+			return "" // waiting for human
+		}
+	}
+
+	return "analysis" // no markers — start from the beginning
+}
+
+// handleJobCompletion processes the result of a completed agent Job.
+// The mode is extracted from the Job name (not stored in the assignment).
+func (o *orchestrator) handleJobCompletion(ctx context.Context, ticketID int, mode string, assgn *assignment.TicketAssignment) {
+	switch mode {
 	case "analysis":
-		o.handleAnalysisCompletion(ctx, ticketID, assignment)
+		o.handleAnalysisCompletion(ctx, ticketID, assgn)
 	default:
 		// For plan/step/fix modes, the Job posted comments and created PRs.
 		// The Gitea webhook handlers (PR opened/merged/review) drive the
 		// next steps.  Here we just mark the Job as done without clearing
 		// the assignment — the agent is still "owning" this ticket.
-		log.Printf("Ticket #%d: %s Job completed, awaiting PR events", ticketID, assignment.Mode)
+		log.Printf("Ticket #%d: %s Job completed, awaiting PR events", ticketID, mode)
 	}
 }
 
@@ -779,7 +823,6 @@ func (o *orchestrator) handleAnalysisCompletion(ctx context.Context, ticketID in
 		}
 
 		// Spawn the plan agent
-		o.assignEngine.SetMode(ticketID, "plan")
 		o.respawnAgent(ticketID, "plan")
 
 	case "need-info":
@@ -908,7 +951,6 @@ func (o *orchestrator) assignTicket(ticketID int) error {
 
 	// Record the assignment internally — ticket status stays "ready" in Taiga
 	o.assignEngine.AssignAgent(ticketID, agent.ID)
-	o.assignEngine.SetMode(ticketID, "analysis")
 
 	// Assign the ticket to the agent user in Taiga (makes the assignment visible)
 	// but do NOT change the status — it stays "ready" until analysis confirms.
@@ -925,12 +967,19 @@ func (o *orchestrator) assignTicket(ticketID int) error {
 		}
 	}
 
-	// Spawn the analysis agent Job
+	// Derive the mode from ticket state (comments) — always start fresh
+	mode := o.determineMode(ticketID)
+	if mode == "" {
+		log.Printf("Ticket #%d: no work needed (complete or waiting for human)", ticketID)
+		o.assignEngine.CompleteTicket(ticketID)
+		return nil
+	}
+
 	spec := &lifecycle.AgentJobSpec{
 		AgentID:        agent.ID,
 		Specialization: agent.Specialization,
 		TicketID:       ticketID,
-		Mode:           "analysis",
+		Mode:           mode,
 		GiteaUsername:  agent.ID,
 		GiteaPassword:  agent.Password,
 		TaigaUsername:  agent.ID,
@@ -945,7 +994,7 @@ func (o *orchestrator) assignTicket(ticketID int) error {
 		return fmt.Errorf("creating job: %w", err)
 	}
 
-	log.Printf("Ticket #%d: analysis assigned to %s (job: %s)", ticketID, agent.ID, jobName)
+	log.Printf("Ticket #%d: %s assigned to %s (job: %s)", ticketID, mode, agent.ID, jobName)
 
 	// Save state
 	o.saveState(context.Background())
@@ -1005,26 +1054,25 @@ func (o *orchestrator) reconcile(ctx context.Context) error {
 	// Check for restored assignments that have no running Job — the
 	// orchestrator may have restarted after a Job completed but before
 	// the next mode was spawned.  Re-trigger the lifecycle for these.
+	// For each assigned ticket, check if a Job is running.  If not,
+	// derive the mode from the ticket's Taiga comments and re-spawn.
 	for ticketID, a := range o.assignEngine.GetAllAssignments() {
 		if a.Status != "assigned" {
 			continue
 		}
-		jobName := lifecycle.JobName(a.PrimaryAgent, ticketID, a.Mode)
+		mode := o.determineMode(ticketID)
+		if mode == "" {
+			log.Printf("Reconcile: ticket #%d is complete or waiting for human, clearing assignment", ticketID)
+			o.assignEngine.CompleteTicket(ticketID)
+			continue
+		}
+		jobName := lifecycle.JobName(a.PrimaryAgent, ticketID, mode)
 		js, _ := o.lifecycleMgr.GetJobStatus(ctx, jobName)
 		if js != nil {
 			continue // Job exists (running, succeeded, or failed — handled below)
 		}
-		// No Job for this assignment — re-trigger based on mode
-		log.Printf("Reconcile: ticket #%d has assignment (mode=%s) but no Job, re-triggering", ticketID, a.Mode)
-		switch a.Mode {
-		case "analysis":
-			// Analysis Job finished but result wasn't processed.
-			// Re-run handleAnalysisCompletion to check for [analysis:proceed].
-			o.handleAnalysisCompletion(ctx, ticketID, a)
-		default:
-			// For other modes, just re-spawn in the same mode.
-			o.respawnAgent(ticketID, a.Mode)
-		}
+		log.Printf("Reconcile: ticket #%d has no Job, derived mode=%s, spawning", ticketID, mode)
+		o.respawnAgent(ticketID, mode)
 	}
 
 	// Check for "in progress" tickets that have no running Job and are
@@ -1062,9 +1110,11 @@ func (o *orchestrator) reconcile(ctx context.Context) error {
 				ticketID, _ := strconv.Atoi(js.TicketID)
 				assignment := o.assignEngine.GetAssignment(ticketID)
 				if assignment != nil {
+					// Extract mode from job name (format: agent-{id}-ticket-{id}-{mode})
+					jobMode := extractModeFromJobName(js.Name)
 					if js.Succeeded {
-						log.Printf("Reconcile: job %s completed for ticket #%d (mode=%s)", js.Name, ticketID, assignment.Mode)
-						o.handleJobCompletion(ctx, ticketID, assignment)
+						log.Printf("Reconcile: job %s completed for ticket #%d (mode=%s)", js.Name, ticketID, jobMode)
+						o.handleJobCompletion(ctx, ticketID, jobMode, assignment)
 					} else {
 						log.Printf("Reconcile: job %s failed for ticket #%d", js.Name, ticketID)
 						o.assignEngine.CompleteTicket(ticketID)
