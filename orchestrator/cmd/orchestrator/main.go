@@ -445,8 +445,8 @@ func (o *orchestrator) registerGiteaWebhookHandlers() {
 			log.Printf("Gitea: ticket #%d all steps complete — transitioning to ready-for-test", ticketID)
 			o.transitionToReadyForTest(ticketID)
 		} else {
-			log.Printf("Gitea: ticket #%d has more steps — re-spawning agent", ticketID)
-			o.respawnAgent(ticketID, "step")
+			log.Printf("Gitea: ticket #%d PR merged — spawning step agent", ticketID)
+			o.spawnAgentForTicket(ticketID, "step")
 		}
 
 		return nil
@@ -637,40 +637,24 @@ func (o *orchestrator) ensureGiteaWebhook(owner, repo string) {
 	o.registeredRepos[key] = true
 }
 
-// runAutoReview performs an automated Claude review on a PR.
-// It assigns the PR to the reviewing agent during the review, then reassigns
-// to the human user after the review is posted.
+// runAutoReview assigns a PR to the human user for review.
+// TODO: invoke Claude Code to post an automated review comment before assigning.
+// Currently the orchestrator's distroless image doesn't include the Claude CLI,
+// so the automated review is skipped — only the PR assignment is performed.
 func (o *orchestrator) runAutoReview(owner, repo string, prNumber int) {
-	log.Printf("Auto-review: starting for PR #%d on %s/%s", prNumber, owner, repo)
+	log.Printf("Auto-review: assigning PR #%d on %s/%s to human for review", prNumber, owner, repo)
 
-	// Assign PR to the orchestrator/claude account during review
-	_, err := o.giteaClient.EditPullRequest(owner, repo, prNumber, &gitea.EditPRRequest{
-		Assignees: []string{o.cfg.Gitea.AdminUsername},
-	})
-	if err != nil {
-		log.Printf("Auto-review: WARNING: could not assign PR #%d to reviewer: %v", prNumber, err)
-	}
-
-	// Run the Claude review
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-
-	_, err = o.reviewSvc.ReviewPR(ctx, owner, repo, prNumber)
-	if err != nil {
-		log.Printf("Auto-review: ERROR on PR #%d: %v", prNumber, err)
-	}
-
-	// Reassign PR to the human user
+	// Assign PR to the human user
 	if o.cfg.Taiga.HumanUsername != "" {
-		_, err = o.giteaClient.EditPullRequest(owner, repo, prNumber, &gitea.EditPRRequest{
+		_, err := o.giteaClient.EditPullRequest(owner, repo, prNumber, &gitea.EditPRRequest{
 			Assignees: []string{o.cfg.Taiga.HumanUsername},
 		})
 		if err != nil {
-			log.Printf("Auto-review: WARNING: could not reassign PR #%d to human: %v", prNumber, err)
+			log.Printf("Auto-review: WARNING: could not assign PR #%d to human: %v", prNumber, err)
 		}
 	}
 
-	log.Printf("Auto-review: completed for PR #%d on %s/%s", prNumber, owner, repo)
+	log.Printf("Auto-review: PR #%d assigned to %s", prNumber, o.cfg.Taiga.HumanUsername)
 }
 
 // resolveTicketFromPR looks up the Taiga ticket ID for a Gitea PR event.
@@ -773,10 +757,12 @@ func (o *orchestrator) handleJobCompletion(ctx context.Context, ticketID int, mo
 		o.handleAnalysisCompletion(ctx, ticketID, assgn)
 	default:
 		// For plan/step/fix modes, the Job posted comments and created PRs.
-		// The Gitea webhook handlers (PR opened/merged/review) drive the
-		// next steps.  Here we just mark the Job as done without clearing
-		// the assignment — the agent is still "owning" this ticket.
-		log.Printf("Ticket #%d: %s Job completed, awaiting PR events", ticketID, mode)
+		// Clear the assignment so the reconciliation loop doesn't re-spawn.
+		// The Gitea webhook handlers (PR merge, review) will create new
+		// assignments when the next action is needed.
+		log.Printf("Ticket #%d: %s Job completed, clearing assignment (PR events drive next steps)", ticketID, mode)
+		o.assignEngine.CompleteTicket(ticketID)
+		o.saveState(ctx)
 	}
 }
 
@@ -855,6 +841,42 @@ func (o *orchestrator) isAssignedToHuman(data *webhooks.UserStoryData) bool {
 		}
 	}
 	return false
+}
+
+// spawnAgentForTicket creates (or reuses) an agent and spawns a Job for the given
+// ticket and mode.  Unlike respawnAgent, this does not require an existing assignment.
+// Used by Gitea webhook handlers where the assignment was already cleared.
+func (o *orchestrator) spawnAgentForTicket(ticketID int, mode string) {
+	agent, err := o.identityMgr.GetOrCreateAgent("general", o.assignEngine.GetBusyAgents())
+	if err != nil {
+		log.Printf("ERROR: could not get agent for ticket %d: %v", ticketID, err)
+		return
+	}
+
+	o.assignEngine.AssignAgent(ticketID, agent.ID)
+
+	spec := &lifecycle.AgentJobSpec{
+		AgentID:        agent.ID,
+		Specialization: agent.Specialization,
+		TicketID:       ticketID,
+		Mode:           mode,
+		GiteaUsername:  agent.ID,
+		GiteaPassword:  agent.Password,
+		TaigaUsername:  agent.ID,
+		TaigaPassword:  agent.Password,
+		HumanUsername:  o.cfg.Taiga.HumanUsername,
+		HumanTaigaID:  o.humanTaigaID,
+		TaigaProjectID: o.projectID,
+	}
+
+	jobName, err := o.lifecycleMgr.CreateJob(context.Background(), spec)
+	if err != nil {
+		log.Printf("ERROR: could not spawn %s agent for ticket %d: %v", mode, ticketID, err)
+		return
+	}
+
+	log.Printf("Ticket #%d: %s agent %s spawned (job: %s)", ticketID, mode, agent.ID, jobName)
+	o.saveState(context.Background())
 }
 
 // respawnAgent re-spawns the assigned agent for a ticket with the given mode.
