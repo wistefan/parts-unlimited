@@ -3,7 +3,7 @@
 
 gitea:
   # In-cluster URL (used by the orchestrator pod)
-  url: "http://gitea-http.gitea.svc.cluster.local:3000"
+  url: "http://gitea-http.gitea.svc.cluster.local:3001"
   adminUsername: "claude"
   adminPassword: "password"
 

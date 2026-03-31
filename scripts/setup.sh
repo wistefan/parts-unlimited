@@ -6,7 +6,7 @@
 #
 # Prerequisites:
 #   - curl, helm, python3 must be installed
-#   - Ports 3000 (Gitea) and 9000 (Taiga) must be free
+#   - Ports 3001 (Gitea) and 9000 (Taiga) must be free (configurable via env vars)
 
 set -euo pipefail
 
@@ -14,12 +14,42 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Configurable via environment
-GITEA_PORT="${GITEA_PORT:-3000}"
+GITEA_PORT="${GITEA_PORT:-3001}"
 TAIGA_PORT="${TAIGA_PORT:-9000}"
 TAIGA_SECRET_KEY="${TAIGA_SECRET_KEY:-$(python3 -c "import secrets; print(secrets.token_hex(32))")}"
 HUMAN_USERNAME="${HUMAN_USERNAME:-wistefan}"
 HUMAN_PASSWORD="${HUMAN_PASSWORD:-password}"
 HUMAN_EMAIL="${HUMAN_EMAIL:-${HUMAN_USERNAME}@dev-env.local}"
+
+# Default port value used in static k8s manifests.  When GITEA_PORT differs,
+# apply_manifest() rewrites the port on-the-fly so the files on disk stay as
+# documentation/reference while the deployed resources use the configured value.
+GITEA_DEFAULT_PORT=3001
+
+# --- Helpers ---
+
+# Apply a k8s manifest with port substitution.
+# Replaces the default Gitea and Taiga in-cluster service ports with the
+# values configured via GITEA_PORT / TAIGA_PORT.
+apply_manifest() {
+    local file="$1"
+    sed \
+        -e "s|gitea-http\.gitea\.svc\.cluster\.local:${GITEA_DEFAULT_PORT}|gitea-http.gitea.svc.cluster.local:${GITEA_PORT}|g" \
+        -e "s|localhost:${GITEA_DEFAULT_PORT}|localhost:${GITEA_PORT}|g" \
+        "${file}" | kubectl apply -f -
+}
+
+# Apply a network policy manifest, replacing the default Gitea service port.
+apply_network_policy() {
+    local file="$1"
+    # The Gitea port appears as a bare number under the gitea namespace rule.
+    # Use awk to replace only the port line immediately after the gitea selector.
+    awk -v old="${GITEA_DEFAULT_PORT}" -v new="${GITEA_PORT}" '
+        /name: gitea/ { in_gitea=1 }
+        in_gitea && /port:/ && $NF == old { sub(old, new); in_gitea=0 }
+        { print }
+    ' "${file}" | kubectl apply -f -
+}
 
 # --- Pre-flight checks ---
 
@@ -49,7 +79,7 @@ for port in "${GITEA_PORT}" "${TAIGA_PORT}"; do
     if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
         echo "ERROR: Port ${port} is already in use."
         echo "  Stop the conflicting service or set a different port:"
-        echo "  GITEA_PORT=3001 TAIGA_PORT=9001 sudo ./scripts/setup.sh"
+        echo "  GITEA_PORT=3002 TAIGA_PORT=9001 sudo -E ./scripts/setup.sh"
         exit 1
     fi
 done
@@ -87,23 +117,30 @@ echo ""
 echo "=== Step 2: Namespaces and RBAC ==="
 kubectl apply -f "${PROJECT_DIR}/k8s/namespaces.yaml"
 kubectl apply -f "${PROJECT_DIR}/k8s/agents/rbac.yaml"
-kubectl apply -f "${PROJECT_DIR}/k8s/agents/network-policy.yaml"
+apply_network_policy "${PROJECT_DIR}/k8s/agents/network-policy.yaml"
 # Apply service endpoints ConfigMap (extracted from job-template.yaml)
-kubectl apply -f - <<'ENDPOINTS'
+kubectl apply -f - <<ENDPOINTS
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: agent-service-endpoints
   namespace: agents
 data:
-  GITEA_URL: "http://gitea-http.gitea.svc.cluster.local:3000"
-  TAIGA_URL: "http://taiga-gateway.taiga.svc.cluster.local:9000"
+  GITEA_URL: "http://gitea-http.gitea.svc.cluster.local:${GITEA_PORT}"
+  TAIGA_URL: "http://taiga-gateway.taiga.svc.cluster.local:${TAIGA_PORT}"
 ENDPOINTS
 echo ""
 
-# --- Step 3: Shared volume directories ---
+# --- Step 3: Cache external container images ---
 
-echo "=== Step 3: Shared volumes ==="
+echo "=== Step 3: Image Cache ==="
+echo "Pre-pulling external images to avoid Docker Hub rate limits..."
+bash "${SCRIPT_DIR}/cache-images.sh"
+echo ""
+
+# --- Step 4: Shared volume directories ---
+
+echo "=== Step 4: Shared volumes ==="
 mkdir -p /var/lib/dev-env/taiga/static
 mkdir -p /var/lib/dev-env/taiga/media
 # Taiga containers run as UID 999 (taiga user)
@@ -111,9 +148,9 @@ chown -R 999:999 /var/lib/dev-env/taiga
 echo "Created host directories for Taiga shared volumes."
 echo ""
 
-# --- Step 4: Deploy Gitea ---
+# --- Step 5: Deploy Gitea ---
 
-echo "=== Step 4: Gitea ==="
+echo "=== Step 5: Gitea ==="
 
 # Add Helm repo
 helm repo add gitea-charts https://dl.gitea.io/charts/ 2>/dev/null || true
@@ -125,12 +162,16 @@ if helm status gitea -n gitea &>/dev/null; then
     helm upgrade gitea gitea-charts/gitea \
         -n gitea \
         -f "${PROJECT_DIR}/k8s/gitea/values.yaml" \
+        --set "service.http.port=${GITEA_PORT}" \
+        --set "gitea.config.server.ROOT_URL=http://localhost:${GITEA_PORT}" \
         --wait --timeout 5m
 else
     echo "Installing Gitea..."
     helm install gitea gitea-charts/gitea \
         -n gitea \
         -f "${PROJECT_DIR}/k8s/gitea/values.yaml" \
+        --set "service.http.port=${GITEA_PORT}" \
+        --set "gitea.config.server.ROOT_URL=http://localhost:${GITEA_PORT}" \
         --wait --timeout 5m
 fi
 
@@ -138,9 +179,9 @@ echo "Waiting for Gitea pods..."
 bash "${SCRIPT_DIR}/wait-for-ready.sh" gitea 300
 echo ""
 
-# --- Step 5: Deploy Taiga ---
+# --- Step 6: Deploy Taiga ---
 
-echo "=== Step 5: Taiga ==="
+echo "=== Step 6: Taiga ==="
 
 # Generate and inject the secret key
 TAIGA_SECRET_YAML="${PROJECT_DIR}/k8s/taiga/secret.yaml"
@@ -168,9 +209,9 @@ echo "Waiting for all Taiga pods..."
 bash "${SCRIPT_DIR}/wait-for-ready.sh" taiga 600
 echo ""
 
-# --- Step 6: Initialize services ---
+# --- Step 7: Initialize services ---
 
-echo "=== Step 6: Initialization ==="
+echo "=== Step 7: Initialization ==="
 
 echo "--- Initializing Gitea ---"
 GITEA_URL="http://localhost:${GITEA_PORT}" \
@@ -188,15 +229,15 @@ TAIGA_URL="http://localhost:${TAIGA_PORT}" \
     bash "${SCRIPT_DIR}/init-taiga.sh"
 echo ""
 
-# --- Step 7: Agent policies ---
+# --- Step 8: Agent policies ---
 
-echo "=== Step 7: Agent policies ==="
+echo "=== Step 8: Agent policies ==="
 kubectl apply -f "${PROJECT_DIR}/k8s/agents/policies.yaml"
 echo ""
 
-# --- Step 8: Anthropic API key ---
+# --- Step 9: Anthropic API key ---
 
-echo "=== Step 8: Claude Credentials ==="
+echo "=== Step 9: Claude Credentials ==="
 CLAUDE_CREDENTIALS="${REAL_HOME}/.claude/.credentials.json"
 
 # Two credential mechanisms are supported. If ANTHROPIC_API_KEY is set, it is
@@ -238,9 +279,9 @@ if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ ! -f "${CLAUDE_CREDENTIALS}" ]; then
 fi
 echo ""
 
-# --- Step 9: CI/CD Runner (optional) ---
+# --- Step 10: CI/CD Runner (optional) ---
 
-echo "=== Step 9: CI/CD Runner ==="
+echo "=== Step 10: CI/CD Runner ==="
 # The act-runner needs a registration token from Gitea.
 # Generate one via the Gitea API and create the secret.
 echo "Generating Gitea Actions runner registration token..."
@@ -254,7 +295,7 @@ if [ -n "${RUNNER_TOKEN}" ]; then
         --namespace gitea \
         --from-literal=token="${RUNNER_TOKEN}" \
         --dry-run=client -o yaml | kubectl apply -f -
-    kubectl apply -f "${PROJECT_DIR}/k8s/gitea/act-runner.yaml"
+    apply_manifest "${PROJECT_DIR}/k8s/gitea/act-runner.yaml"
     echo "  Act runner deployed."
 else
     echo "  WARNING: Could not generate runner token. Gitea Actions runner not deployed."
@@ -262,9 +303,9 @@ else
 fi
 echo ""
 
-# --- Step 10: Build container images ---
+# --- Step 11: Build container images ---
 
-echo "=== Step 10: Container Images ==="
+echo "=== Step 11: Container Images ==="
 
 # Check for Docker or nerdctl (k3s ships with nerdctl-compatible ctr)
 if command -v docker &>/dev/null; then
@@ -307,10 +348,10 @@ if [ -n "${BUILD_CMD}" ]; then
 fi
 echo ""
 
-# --- Step 11: Deploy orchestrator ---
+# --- Step 12: Deploy orchestrator ---
 
-echo "=== Step 11: Orchestrator ==="
-kubectl apply -f "${PROJECT_DIR}/k8s/agents/orchestrator.yaml"
+echo "=== Step 12: Orchestrator ==="
+apply_manifest "${PROJECT_DIR}/k8s/agents/orchestrator.yaml"
 # Force a rollout to pick up new image (idempotent on first deploy)
 kubectl rollout restart deployment/orchestrator -n agents 2>/dev/null || true
 echo "Waiting for orchestrator to be ready..."
@@ -318,10 +359,13 @@ kubectl rollout status deployment/orchestrator -n agents --timeout=120s 2>/dev/n
 echo "  Orchestrator deployed."
 echo ""
 
-# --- Step 12: Verify ---
+# --- Step 13: Verify ---
 
-echo "=== Step 12: Verification ==="
-bash "${SCRIPT_DIR}/verify.sh"
+echo "=== Step 13: Verification ==="
+GITEA_URL="http://localhost:${GITEA_PORT}" \
+    TAIGA_URL="http://localhost:${TAIGA_PORT}" \
+    HUMAN_USERNAME="${HUMAN_USERNAME}" \
+    bash "${SCRIPT_DIR}/verify.sh"
 
 echo ""
 echo "=========================================="

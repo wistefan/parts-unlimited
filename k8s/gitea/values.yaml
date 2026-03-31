@@ -18,7 +18,7 @@ gitea:
     repository:
       DEFAULT_DELETE_BRANCH_AFTER_MERGE: true
     server:
-      ROOT_URL: http://localhost:3000
+      ROOT_URL: http://localhost:3001
       SSH_DOMAIN: localhost
       SSH_PORT: 2222
     service:
@@ -26,11 +26,11 @@ gitea:
     webhook:
       ALLOWED_HOST_LIST: "*"
 
-# HTTP service exposed on port 3000 via k3s LoadBalancer
+# HTTP service exposed via k3s LoadBalancer (port configurable via setup.sh)
 service:
   http:
     type: LoadBalancer
-    port: 3000
+    port: 3001
   ssh:
     type: LoadBalancer
     port: 2222

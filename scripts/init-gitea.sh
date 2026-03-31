@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-GITEA_URL="${GITEA_URL:-http://localhost:3000}"
+GITEA_URL="${GITEA_URL:-http://localhost:3001}"
 ADMIN_USERNAME="${GITEA_ADMIN_USERNAME:-claude}"
 ADMIN_PASSWORD="${GITEA_ADMIN_PASSWORD:-password}"
 HUMAN_USERNAME="${HUMAN_USERNAME:-wistefan}"
