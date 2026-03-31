@@ -193,6 +193,9 @@ func classifyGiteaEvent(giteaEvent string, event *GiteaPREvent) string {
 				return GiteaEventReviewComment
 			}
 		}
+	case "pull_request_rejected":
+		// Gitea sends this event type when a reviewer requests changes.
+		return GiteaEventReviewRequestChanges
 	}
 	return ""
 }

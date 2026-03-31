@@ -95,7 +95,7 @@ else
                 \"url\": \"${ORCHESTRATOR_WEBHOOK_URL}\",
                 \"content_type\": \"json\"
             },
-            \"events\": [\"pull_request\", \"pull_request_review\"],
+            \"events\": [\"pull_request\", \"pull_request_review\", \"pull_request_rejected\"],
             \"active\": true
         }" >/dev/null 2>&1 && echo "  System webhook registered." || echo "  WARNING: Could not register system webhook."
 fi

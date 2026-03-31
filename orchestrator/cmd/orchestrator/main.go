@@ -625,7 +625,7 @@ func (o *orchestrator) ensureGiteaWebhook(owner, repo string) {
 			"url":          webhookURL,
 			"content_type": "json",
 		},
-		Events: []string{"pull_request", "pull_request_review"},
+		Events: []string{"pull_request", "pull_request_review", "pull_request_rejected"},
 		Active: true,
 	})
 	if err != nil {
