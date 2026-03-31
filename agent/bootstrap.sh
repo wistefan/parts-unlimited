@@ -361,12 +361,98 @@ done
 
 echo "Building task prompt..."
 
+# Build the mode-specific instructions section
+MODE_INSTRUCTIONS=""
+case "${MODE}" in
+    analysis)
+        MODE_INSTRUCTIONS="You are an analysis agent. Evaluate this ticket and determine if it is clear enough to create an implementation plan.
+
+Your ONLY task is to write /home/agent/completion-status.json with your analysis.
+Do NOT write code, create branches, or make commits.
+
+If the ticket is clear enough to proceed:
+\`\`\`json
+{
+  \"status\": \"success\",
+  \"summary\": \"Analysis complete: ticket is ready for implementation planning.\",
+  \"analysis_result\": \"proceed\",
+  \"analysis_comment\": \"[analysis:proceed]\\n\\n**Analysis Summary:**\\n<your understanding>\\n\\n**Repositories:** <repos>\\n**Base branch:** <branch>\\n**Estimated steps:** <number>\"
+}
+\`\`\`
+
+If more information is needed:
+\`\`\`json
+{
+  \"status\": \"blocked\",
+  \"reason\": \"Additional information required: <summary>\",
+  \"analysis_result\": \"need-info\",
+  \"analysis_comment\": \"[analysis:need-info]\\n\\n**Missing Information:**\\n<specific questions>\"
+}
+\`\`\`"
+        ;;
+    plan)
+        MODE_INSTRUCTIONS="You are a planning agent. Create an implementation plan for this ticket.
+
+Write IMPLEMENTATION_PLAN.md in the repo root with steps using \`### Step N: Title\` format.
+Commit the plan. Do not implement any code.
+
+When done, write /home/agent/completion-status.json:
+\`\`\`json
+{
+  \"status\": \"success\",
+  \"summary\": \"Implementation plan created with N steps.\",
+  \"taiga_comment\": \"[phase:plan-created]\\n\\n**Steps:** N\\n**Summary:** <one-line summary>\"
+}
+\`\`\`"
+        ;;
+    fix)
+        MODE_INSTRUCTIONS="You are a fix agent. Address the review comments on the existing PR.
+
+Review the PR diff and comments below. Fix every issue raised.
+Commit your changes. Do not create new branches or PRs.
+
+When done, write /home/agent/completion-status.json:
+\`\`\`json
+{
+  \"status\": \"success\",
+  \"summary\": \"Addressed N review comments on PR #${PR_NUMBER}.\",
+  \"taiga_comment\": \"[fix:applied]\\n\\nAddressed review feedback on PR #${PR_NUMBER}: <summary>\"
+}
+\`\`\`"
+        ;;
+    step|*)
+        MODE_INSTRUCTIONS="You are a step implementation agent. Implement the next step from the implementation plan.
+
+Read IMPLEMENTATION_PLAN.md, determine which step to work on next, implement it.
+Create a step branch, commit, and follow the plan.
+
+When done, write /home/agent/completion-status.json:
+If more steps remain:
+\`\`\`json
+{
+  \"status\": \"success\",
+  \"summary\": \"Implemented step N of M: <title>\",
+  \"taiga_comment\": \"[step:N/M]\\n\\nCompleted step N of M: <title>\\n\\n**Summary:** <description>\"
+}
+\`\`\`
+If this was the last step:
+\`\`\`json
+{
+  \"status\": \"success\",
+  \"summary\": \"All steps complete.\",
+  \"taiga_comment\": \"[step:complete]\\n\\nAll steps completed.\\n\\n**Release Notes:**\\n<summary of all changes>\"
+}
+\`\`\`"
+        ;;
+esac
+
 cat > "${PROMPT_FILE}" <<PROMPT_EOF
 # Task Assignment
 
 ## Agent Identity
 - **Agent:** ${AGENT_ID}
 - **Specialization:** ${AGENT_SPECIALIZATION}
+- **Mode:** ${MODE}
 
 ## Ticket
 - **ID:** ${TICKET_ID}
@@ -390,35 +476,7 @@ PLAN_SECTION
 
 ## Instructions
 
-You are an autonomous coding agent. Your task is to implement the work described in the ticket above.
-
-Guidelines:
-- Follow the implementation plan if one exists. Work on step ${PLAN_STEP:-"as described in the ticket"}.
-- Write clean, well-documented code following the language's best practices.
-- Every public method and class must be documented.
-- Never use magic constants — define named constants.
-- Use parameterized tests where possible.
-- Include sufficient tests to verify your work.
-- Run tests and linters before finishing.
-- Commit your work with clear, descriptive commit messages.
-- Do not push to remote — the bootstrap script handles that.
-
-When you are done, create a file at /home/agent/completion-status.json with:
-\`\`\`json
-{
-  "status": "success",
-  "summary": "Brief description of what was done",
-  "files_changed": ["list", "of", "files"]
-}
-\`\`\`
-
-If you encounter a blocking issue, create the file with:
-\`\`\`json
-{
-  "status": "blocked",
-  "reason": "Description of the blocking issue"
-}
-\`\`\`
+${MODE_INSTRUCTIONS}
 PROMPT_EOF
 
 echo "  Prompt written to ${PROMPT_FILE}"
