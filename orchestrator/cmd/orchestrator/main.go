@@ -334,14 +334,16 @@ func (o *orchestrator) registerWebhookHandlers() {
 			return nil
 		}
 
-		// Human input on in-progress tickets — re-spawn agent when the
-		// ticket is no longer assigned to the human.
-		if strings.EqualFold(statusName, StatusInProgress) && o.isHumanInput(event) {
-			if !o.isAssignedToHuman(data) {
-				log.Printf("Ticket #%d: human input (by %s), not assigned to human, re-spawning agent", data.ID, event.By.Username)
-				o.respawnAgent(data.ID)
+		// Ticket became unassigned — the human finished providing input.
+		// Re-run analysis regardless of ticket status (ready or in-progress).
+		if o.isTicketUnassigned(event) {
+			if o.assignEngine.GetAssignment(data.ID) == nil {
+				log.Printf("Ticket #%d: unassigned, enqueuing for analysis", data.ID)
+				o.assignEngine.Enqueue(data.ID)
+				o.processQueue()
 			} else {
-				log.Printf("Ticket #%d: human input (by %s), still assigned to human — waiting", data.ID, event.By.Username)
+				log.Printf("Ticket #%d: unassigned but already tracked, re-spawning analysis", data.ID)
+				o.respawnAgent(data.ID, "analysis")
 			}
 			return nil
 		}
@@ -365,39 +367,39 @@ func (o *orchestrator) registerWebhookHandlers() {
 	})
 }
 
-// isHumanInput checks whether a webhook event represents human input
-// (a new comment, description edit, or any meaningful change by a non-agent user).
-func (o *orchestrator) isHumanInput(event *webhooks.WebhookEvent) bool {
-	if event.Change == nil {
-		return false
-	}
-	// Ignore changes made by agent users (their usernames contain "-agent-")
-	if strings.Contains(event.By.Username, "-agent-") {
-		return false
-	}
-	// Ignore changes by the admin/orchestrator accounts
-	if event.By.Username == o.cfg.Taiga.AdminUsername {
+// isTicketUnassigned checks whether a webhook event represents a ticket becoming
+// unassigned (assigned_to changed from a non-null value to null).  This is the
+// signal that the human finished providing input and the ticket is ready for
+// (re-)analysis.
+func (o *orchestrator) isTicketUnassigned(event *webhooks.WebhookEvent) bool {
+	if event.Change == nil || event.Change.Diff == nil {
 		return false
 	}
 
-	// A non-empty comment field means someone added a comment
-	if event.Change.Comment != "" {
-		return true
+	var diff map[string]json.RawMessage
+	if err := json.Unmarshal(event.Change.Diff, &diff); err != nil {
+		return false
 	}
 
-	// Check if the diff contains a description or assignment change
-	if event.Change.Diff != nil {
-		var diff map[string]json.RawMessage
-		if json.Unmarshal(event.Change.Diff, &diff) == nil {
-			for _, key := range []string{"description", "assigned_to", "assigned_users"} {
-				if _, ok := diff[key]; ok {
-					return true
-				}
-			}
-		}
+	raw, ok := diff["assigned_to"]
+	if !ok {
+		return false
 	}
 
-	return false
+	// Parse the "from"/"to" structure: {"from": <value>, "to": null}
+	var change struct {
+		From json.RawMessage `json:"from"`
+		To   json.RawMessage `json:"to"`
+	}
+	if err := json.Unmarshal(raw, &change); err != nil {
+		return false
+	}
+
+	// "to" is null (unassigned) and "from" was non-null (was previously assigned)
+	fromIsNull := change.From == nil || string(change.From) == "null"
+	toIsNull := change.To == nil || string(change.To) == "null"
+
+	return toIsNull && !fromIsNull
 }
 
 // isAssignedToHuman checks whether the ticket is currently assigned to the human user.
@@ -416,8 +418,10 @@ func (o *orchestrator) isAssignedToHuman(data *webhooks.UserStoryData) bool {
 	return false
 }
 
-// respawnAgent re-spawns the assigned agent for a ticket that received new human input.
-func (o *orchestrator) respawnAgent(ticketID int) {
+// respawnAgent re-spawns the assigned agent for a ticket with the given mode.
+// Used when the orchestrator needs to advance the lifecycle (e.g. after analysis
+// confirms proceed, or after a PR merge triggers the next step).
+func (o *orchestrator) respawnAgent(ticketID int, mode string) {
 	existing := o.assignEngine.GetAssignment(ticketID)
 	if existing == nil {
 		log.Printf("Ticket #%d: no existing assignment, enqueuing as new work", ticketID)
@@ -441,11 +445,11 @@ func (o *orchestrator) respawnAgent(ticketID int) {
 		AgentID:        agent.ID,
 		Specialization: agent.Specialization,
 		TicketID:       ticketID,
-		PlanStep:       fmt.Sprintf("%d", existing.PlanStep),
-		GiteaUsername:   agent.ID,
-		GiteaPassword:   agent.Password,
-		TaigaUsername:   agent.ID,
-		TaigaPassword:   agent.Password,
+		Mode:           mode,
+		GiteaUsername:  agent.ID,
+		GiteaPassword:  agent.Password,
+		TaigaUsername:  agent.ID,
+		TaigaPassword:  agent.Password,
 		HumanUsername:  o.cfg.Taiga.HumanUsername,
 		HumanTaigaID:  o.humanTaigaID,
 		TaigaProjectID: o.projectID,
@@ -457,7 +461,7 @@ func (o *orchestrator) respawnAgent(ticketID int) {
 		return
 	}
 
-	log.Printf("Ticket #%d: agent %s re-spawned (job: %s)", ticketID, agent.ID, jobName)
+	log.Printf("Ticket #%d: agent %s re-spawned in %s mode (job: %s)", ticketID, agent.ID, mode, jobName)
 	o.saveState(context.Background())
 }
 
@@ -497,7 +501,9 @@ func (o *orchestrator) processQueue() {
 	}
 }
 
-// assignTicket creates an agent and spawns a Job for the given ticket.
+// assignTicket creates an agent and spawns an analysis Job for the given ticket.
+// The ticket stays in "ready" status — it only moves to "in-progress" after the
+// analysis agent confirms it can proceed (via a Taiga comment).
 func (o *orchestrator) assignTicket(ticketID int) error {
 	// Get or create an agent
 	agent, err := o.identityMgr.GetOrCreateAgent("general", o.assignEngine.GetBusyAgents())
@@ -505,33 +511,34 @@ func (o *orchestrator) assignTicket(ticketID int) error {
 		return fmt.Errorf("getting agent: %w", err)
 	}
 
-	// Record the assignment
+	// Record the assignment internally — ticket status stays "ready" in Taiga
 	o.assignEngine.AssignAgent(ticketID, agent.ID)
 
-	// Move ticket to "in progress"
+	// Assign the ticket to the agent user in Taiga (makes the assignment visible)
+	// but do NOT change the status — it stays "ready" until analysis confirms.
 	story, err := o.taigaClient.GetUserStory(ticketID)
 	if err != nil {
-		log.Printf("WARNING: Could not fetch ticket %d for status update: %v", ticketID, err)
+		log.Printf("WARNING: Could not fetch ticket %d for assignment: %v", ticketID, err)
 	} else {
 		_, err = o.taigaClient.UpdateUserStory(ticketID, &taiga.UserStoryUpdate{
-			Status:     &o.inProgressID,
 			AssignedTo: &agent.TaigaUserID,
 			Version:    story.Version,
 		})
 		if err != nil {
-			log.Printf("WARNING: Could not update ticket %d status: %v", ticketID, err)
+			log.Printf("WARNING: Could not assign ticket %d to agent: %v", ticketID, err)
 		}
 	}
 
-	// Spawn the agent Job
+	// Spawn the analysis agent Job
 	spec := &lifecycle.AgentJobSpec{
 		AgentID:        agent.ID,
 		Specialization: agent.Specialization,
 		TicketID:       ticketID,
-		GiteaUsername:   agent.ID,
-		GiteaPassword:   agent.Password,
-		TaigaUsername:   agent.ID,
-		TaigaPassword:   agent.Password,
+		Mode:           "analysis",
+		GiteaUsername:  agent.ID,
+		GiteaPassword:  agent.Password,
+		TaigaUsername:  agent.ID,
+		TaigaPassword:  agent.Password,
 		HumanUsername:  o.cfg.Taiga.HumanUsername,
 		HumanTaigaID:  o.humanTaigaID,
 		TaigaProjectID: o.projectID,
@@ -542,15 +549,7 @@ func (o *orchestrator) assignTicket(ticketID int) error {
 		return fmt.Errorf("creating job: %w", err)
 	}
 
-	log.Printf("Ticket #%d assigned to %s (job: %s)", ticketID, agent.ID, jobName)
-
-	o.notifySvc.Notify(
-		notifications.EventPRReadyForReview,
-		ticketID, agent.ID,
-		fmt.Sprintf("Ticket #%d assigned", ticketID),
-		fmt.Sprintf("Agent %s is working on ticket #%d", agent.ID, ticketID),
-		"",
-	)
+	log.Printf("Ticket #%d: analysis assigned to %s (job: %s)", ticketID, agent.ID, jobName)
 
 	// Save state
 	o.saveState(context.Background())
@@ -628,7 +627,7 @@ func (o *orchestrator) reconcile(ctx context.Context) error {
 				continue
 			}
 			log.Printf("Reconcile: in-progress ticket #%d has no agent, re-spawning", story.ID)
-			o.respawnAgent(story.ID)
+			o.respawnAgent(story.ID, "step")
 		}
 	}
 

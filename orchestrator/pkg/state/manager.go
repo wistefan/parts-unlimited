@@ -16,7 +16,6 @@ import (
 
 	"github.com/wistefan/dev-env/orchestrator/pkg/assignment"
 	"github.com/wistefan/dev-env/orchestrator/pkg/identity"
-	"github.com/wistefan/dev-env/orchestrator/pkg/plan"
 )
 
 const (
@@ -33,7 +32,7 @@ type OrchestratorState struct {
 	Queue       []assignment.QueueEntry           `json:"queue"`
 	Assignments map[int]*assignment.TicketAssignment `json:"assignments"`
 	Escalations map[int]*assignment.EscalationEntry  `json:"escalations"`
-	Plans       map[int]*plan.Plan                `json:"plans"` // keyed by ticket ID
+	PRMappings  map[string]int                    `json:"prMappings,omitempty"` // "{owner}/{repo}#{pr}" → ticket ID
 	LastSaved   time.Time                         `json:"lastSaved"`
 }
 

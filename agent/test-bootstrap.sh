@@ -46,13 +46,12 @@ echo ""
 # --- Test: branch name generation ---
 echo "Branch naming:"
 
-AGENT_ID="general-agent-1"
 TICKET_ID="42"
+BRANCH_PREFIX="ticket-${TICKET_ID}"
 
 PLAN_STEP="3"
-BRANCH_PREFIX="agent/${AGENT_ID}/ticket-${TICKET_ID}"
 BRANCH_NAME="${BRANCH_PREFIX}/step-${PLAN_STEP}"
-assert_eq "branch with plan step" "agent/general-agent-1/ticket-42/step-3" "${BRANCH_NAME}"
+assert_eq "branch with plan step" "ticket-42/step-3" "${BRANCH_NAME}"
 
 PLAN_STEP=""
 if [ -n "${PLAN_STEP}" ]; then
@@ -60,7 +59,11 @@ if [ -n "${PLAN_STEP}" ]; then
 else
     BRANCH_NAME="${BRANCH_PREFIX}/work"
 fi
-assert_eq "branch without plan step" "agent/general-agent-1/ticket-42/work" "${BRANCH_NAME}"
+assert_eq "branch without plan step" "ticket-42/work" "${BRANCH_NAME}"
+
+MODE="plan"
+BRANCH_NAME="${BRANCH_PREFIX}/plan"
+assert_eq "branch for plan mode" "ticket-42/plan" "${BRANCH_NAME}"
 
 echo ""
 
@@ -129,6 +132,27 @@ CLEAN_URL="${RESULT%.git}"
 CLEAN_URL="${CLEAN_URL%/}"
 REPO_NAME_FROM_URL=$(basename "${CLEAN_URL}")
 assert_eq "repo name from URL" "data-space-connector" "${REPO_NAME_FROM_URL}"
+
+echo ""
+
+# --- Test: base branch extraction from description ---
+echo "Base branch extraction:"
+
+extract_base_branch() {
+    local desc="$1"
+    local raw
+    raw=$(echo "${desc}" | grep -oP '(?i)base\s*:\s*\K\S+' | head -1 || true)
+    echo "${raw}"
+}
+
+RESULT=$(extract_base_branch "repo: claude/test\nbase: develop")
+assert_eq "base: develop" "develop" "${RESULT}"
+
+RESULT=$(extract_base_branch "repo: claude/test")
+assert_eq "base: not specified" "" "${RESULT}"
+
+RESULT=$(extract_base_branch "Base: release/v2")
+assert_eq "base: case insensitive" "release/v2" "${RESULT}"
 
 echo ""
 
