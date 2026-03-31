@@ -42,7 +42,7 @@ REQUIRED_VARS=(
     TAIGA_URL TAIGA_USERNAME TAIGA_PASSWORD
 )
 
-CLAUDE_CREDENTIALS="/home/agent/.claude/.credentials.json"
+CLAUDE_CREDENTIALS="/home/agent/.claude-secret/.credentials.json"
 
 for var in "${REQUIRED_VARS[@]}"; do
     if [ -z "${!var:-}" ]; then
@@ -495,9 +495,14 @@ fi
 
 # --- Invoke Claude Code ---
 
-# Ensure Claude Code's session directory is writable.
-# The credentials file is mounted at .claude/.credentials.json via subPath,
-# so the .claude directory itself needs to be created if it doesn't exist.
+# Copy credentials into the writable .claude directory (mounted as emptyDir).
+# The secret is mounted separately; we copy the file so Claude Code has a
+# fully writable ~/.claude for session-env and other runtime files.
+CRED_SECRET="/home/agent/.claude-secret/.credentials.json"
+if [ -f "${CRED_SECRET}" ]; then
+    cp "${CRED_SECRET}" /home/agent/.claude/.credentials.json
+    echo "  Credentials copied to ~/.claude/"
+fi
 mkdir -p /home/agent/.claude/session-env
 
 echo "Invoking Claude Code..."

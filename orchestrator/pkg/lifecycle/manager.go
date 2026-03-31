@@ -187,9 +187,12 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 									MountPath: "/home/agent/workspace",
 								},
 								{
+									Name:      "claude-home",
+									MountPath: "/home/agent/.claude",
+								},
+								{
 									Name:      "claude-credentials",
-									MountPath: "/home/agent/.claude/.credentials.json",
-									SubPath:   ".credentials.json",
+									MountPath: "/home/agent/.claude-secret",
 									ReadOnly:  true,
 								},
 							},
@@ -198,6 +201,12 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 					Volumes: []corev1.Volume{
 						{
 							Name: "workspace",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+						{
+							Name: "claude-home",
 							VolumeSource: corev1.VolumeSource{
 								EmptyDir: &corev1.EmptyDirVolumeSource{},
 							},

@@ -107,9 +107,10 @@ spec:
           volumeMounts:
             - name: workspace
               mountPath: /home/agent/workspace
+            - name: claude-home
+              mountPath: /home/agent/.claude
             - name: claude-credentials
-              mountPath: /home/agent/.claude/.credentials.json
-              subPath: .credentials.json
+              mountPath: /home/agent/.claude-secret
               readOnly: true
           resources:
             requests:
@@ -122,6 +123,8 @@ spec:
         - name: workspace
           emptyDir:
             sizeLimit: 10Gi
+        - name: claude-home
+          emptyDir: {}
         - name: claude-credentials
           secret:
             secretName: claude-credentials
