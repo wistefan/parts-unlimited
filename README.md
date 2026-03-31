@@ -92,6 +92,7 @@ All work starts as a **user story** on the Taiga Kanban board.
 | **Subject** | Yes | Short title describing the work (e.g., "Add pagination to user list API") |
 | **Description** | Yes | Detailed requirements. The more context you provide, the better the agent's output. |
 | **Target repository** | No | One or more `repo:` lines in the description (see below). If omitted, the agent asks via a comment. |
+| **Base branch** | No | A `base:` line in the description (e.g., `base: develop`). The work branch is created from this branch. Defaults to `main`. |
 
 5. Set the status to **ready** — this is the signal that tells the orchestrator the ticket is available for an agent to pick up.
 
@@ -115,6 +116,16 @@ repo: claude/frontend-app
 ```
 
 If no `repo:` line is present, the agent posts a comment on the ticket asking for the target repository before starting work.
+
+#### Specifying a base branch
+
+Use a `base:` line to specify which branch the work branch should be created from. If omitted, `main` is used.
+
+```
+base: develop
+```
+
+The analysis agent validates that the specified base branch exists in the repository.
 
 #### Example tickets
 
@@ -152,22 +163,26 @@ Tickets move through three statuses that agents act on:
 
 ```
 ready ──→ in progress ──→ ready for test
-  │            │                │
-  │            │                └─ Agent finished. Human reviews and merges final PR.
-  │            └─ Agent is actively working. PRs appear in Gitea.
-  └─ Ticket is queued. Next available agent picks it up (FIFO).
+  │  ↑          │                │
+  │  │          │                └─ All steps done. Human reviews work branch.
+  │  │          └─ Agent is implementing. PRs appear in Gitea.
+  │  │
+  │  └─ Human provides info and unassigns → re-analysis
+  └─ Ticket queued. Analysis agent evaluates first.
 ```
 
 All other statuses (e.g., "done", "closed") are yours to manage — agents ignore them.
 
 ### What Happens After You Create a Ticket
 
-1. **Queue** — The orchestrator detects the new "ready" ticket (via webhook) and adds it to a FIFO queue.
-2. **Assignment** — When an agent slot is available (up to `maxConcurrency`, default 3), the orchestrator assigns the ticket, creates an agent identity if needed, and spawns a container.
-3. **Implementation plan** — The agent's first action is always to create an **implementation plan** as a markdown document and open a PR for it. The ticket moves to "in progress".
-4. **Wait for plan approval** — No implementation begins until you approve the plan PR. Review it, leave comments, request changes — the agent will respond.
-5. **Step-by-step implementation** — After plan approval, the agent works through each step, opening one PR per step. Parallelizable steps may be worked on by multiple agents simultaneously.
-6. **Final PR** — When the agent opens the last PR, the ticket moves to **ready for test** and the agent posts release notes as a comment on the ticket.
+1. **Analysis** — The orchestrator detects the "ready" ticket and spawns an **analysis agent**. The agent reads the ticket, examines the repository (if referenced), and evaluates whether the ticket is clear enough to proceed. The ticket stays in "ready" during analysis.
+   - If **clear**: the agent posts `[analysis:proceed]` and the ticket moves to "in progress".
+   - If **unclear**: the agent posts a comment asking for clarification, assigns the ticket to you, and waits. Add the missing info and **unassign yourself** to signal the orchestrator to re-analyze.
+2. **Plan** — A **plan agent** creates an `IMPLEMENTATION_PLAN.md` with numbered steps and opens a PR to the work branch. An automated Claude review is posted as comments. The PR is then assigned to you.
+3. **Plan review** — Review the plan PR. Approve and merge to proceed, or request changes — an agent will address your feedback.
+4. **Step-by-step implementation** — After the plan PR merges, a **step agent** picks up the first step, implements it on a step branch, and opens a PR. Each step gets its own PR targeting the work branch.
+5. **Step review** — Each step PR gets an auto-review, then is assigned to you. Approve and merge to advance, or request changes. The cycle repeats for each step.
+6. **Completion** — When the agent finishes the last step, it posts `[step:complete]` with release notes. The ticket moves to **ready for test** and is assigned to you.
 
 ### Reviewing and Handling PRs
 
@@ -178,13 +193,25 @@ Agent PRs appear in Gitea at `http://localhost:3001`. Each PR includes:
 
 The review workflow:
 
-1. **Orchestrator review** — The orchestrator automatically runs a Claude-powered code review on every agent PR and posts comments. It cannot approve or merge.
-2. **Human review** — Open the PR in Gitea, read the diff and review comments. You have three options:
-   - **Approve and merge** — The agent continues to the next step.
-   - **Request changes** — Add review comments explaining what to fix. The orchestrator detects the new comments and spawns an agent to address them on the same branch.
-   - **Reject** — Close the PR without merging. The agent posts a comment on the ticket and pauses. Add new instructions on the ticket to resume.
+1. **Auto-review** — When any PR is opened, the orchestrator automatically runs a Claude-powered code review and posts it as comments (informational only — it never approves or requests changes). The PR is assigned to the `claude` account during review, then reassigned to you.
+2. **Human review** — Open the PR in Gitea, read the diff and auto-review comments. You have three options:
+   - **Approve and merge** — The orchestrator detects the merge and spawns the agent for the next step (or transitions to "ready for test" if all steps are done).
+   - **Request changes** — Post a review with "Request Changes". The orchestrator spawns the same agent to address your feedback on the existing branch. After fixing, the agent re-assigns the PR to you.
+   - **Reject** — Close the PR without merging. The orchestrator posts an escalation comment on the Taiga ticket, assigns it to you, and pauses. You can re-queue by moving the ticket back to "ready".
 
 Only the human user can approve and merge PRs. Agents and the orchestrator cannot.
+
+### Branch Naming
+
+All branches follow the convention `ticket-{id}/...`:
+
+| Branch | Purpose |
+|---|---|
+| `ticket-{id}/work` | Integration branch — all step PRs merge here |
+| `ticket-{id}/plan` | Plan PR branch (targets the work branch) |
+| `ticket-{id}/step-{n}` | Step implementation branch (targets the work branch) |
+
+The work branch is created from `main` (or the branch specified by `base:` in the ticket).
 
 ### Specialized Work and Delegation
 
@@ -495,8 +522,24 @@ sudo ./scripts/setup.sh
 The agent worker is a Docker container that runs Claude Code CLI to perform autonomous coding tasks. It lives in `agent/` and contains:
 
 - **Dockerfile** — Based on `node:22-slim` with Claude Code CLI, git, and common build tools
-- **Bootstrap script** (`bootstrap.sh`) — Orchestrates the full agent lifecycle: authenticates with Taiga/Gitea, fetches the ticket, clones the repo, builds a task prompt with full context, invokes Claude Code, pushes changes, and creates a PR
-- **System prompt** (`system-prompt.md`) — Coding guidelines, quality standards, and completion protocol for the agent
+- **Bootstrap script** (`bootstrap.sh`) — Orchestrates the full agent lifecycle: authenticates with Taiga/Gitea, fetches the ticket, clones the repo, selects mode-specific behavior, invokes Claude Code, pushes changes, and creates a PR
+- **System prompts** — one per agent mode:
+  - `system-prompt-analysis.md` — evaluate ticket clarity, post analysis result
+  - `system-prompt-plan.md` — create implementation plan, open plan PR
+  - `system-prompt-step.md` — implement next step, signal progress
+  - `system-prompt-fix.md` — address PR review comments
+  - `system-prompt.md` — generic fallback
+
+### Agent Modes
+
+The orchestrator spawns agents in different modes via the `MODE` environment variable:
+
+| Mode | When | What the agent does |
+|---|---|---|
+| `analysis` | Ticket is "ready" and unassigned | Evaluates ticket + repo, posts `[analysis:proceed]` or `[analysis:need-info]` |
+| `plan` | Analysis confirmed "proceed" | Creates `IMPLEMENTATION_PLAN.md`, opens plan PR to work branch |
+| `step` | Plan PR merged, or previous step PR merged | Reads plan, implements next step, opens step PR, signals `[step:N/M]` or `[step:complete]` |
+| `fix` | Human requests changes on a PR | Addresses review comments on existing PR branch, pushes, re-assigns to human |
 
 ### Building
 
@@ -512,6 +555,7 @@ docker build -t agent-worker:latest .
 | `TICKET_ID` | Yes | Taiga user story ID to work on |
 | `AGENT_ID` | Yes | Agent identity (e.g., `general-agent-1`) |
 | `AGENT_SPECIALIZATION` | Yes | Agent role (e.g., `general`, `frontend`) |
+| `MODE` | No | Agent mode: `analysis`, `plan`, `step`, `fix` (default: `step`) |
 | `GITEA_URL` | Yes | Gitea base URL |
 | `GITEA_USERNAME` | Yes | Gitea credentials for this agent |
 | `GITEA_PASSWORD` | Yes | |
@@ -522,10 +566,15 @@ docker build -t agent-worker:latest .
 | *(Claude credentials)* | No* | Mounted at `/home/agent/.claude/.credentials.json` from K8s Secret `claude-credentials` |
 
 \* At least one of `ANTHROPIC_API_KEY` or the credentials file must be available.
+
+| Variable | Required | Description |
+|---|---|---|
 | `PLAN_STEP` | No | Implementation plan step number |
 | `REPO_OWNER` | No | Gitea repo owner (extracted from ticket if not set) |
 | `REPO_NAME` | No | Gitea repo name (extracted from ticket if not set) |
 | `ALLOWED_TOOLS` | No | Space-separated Claude tools (default: all) |
+| `PR_NUMBER` | No | PR number to fix (fix mode only) |
+| `PR_REPO` | No | `{owner}/{repo}` of the PR (fix mode only) |
 
 ### Agent Workflow
 
@@ -533,12 +582,13 @@ docker build -t agent-worker:latest .
 2. Authenticates with Taiga (JWT) and Gitea (basic auth)
 3. Fetches the ticket (subject, description, comments)
 4. Determines the target repo (from env vars or ticket description, format: `repo: owner/name`)
-5. Clones the repo and creates/resumes a branch (`agent/<id>/ticket-<id>/step-<n>`)
-6. Reads the implementation plan if present
-7. Builds a task prompt with full ticket context
-8. Invokes `claude -p --dangerously-skip-permissions` with the task prompt
-9. Pushes changes and creates a PR with a link to the ticket
-10. Posts a progress comment on the ticket
+5. Extracts optional `base:` branch from ticket description (default: `main`)
+6. Clones the repo and creates/resumes branches (`ticket-{id}/work`, `ticket-{id}/plan`, or `ticket-{id}/step-{n}`)
+7. Loads mode-specific system prompt (`system-prompt-{mode}.md`)
+8. Builds a task prompt with full ticket context
+9. Invokes `claude -p --dangerously-skip-permissions` with the task prompt
+10. Pushes changes and creates a PR (plan/step modes) or pushes to existing branch (fix mode)
+11. Posts a progress comment on the ticket with machine-readable markers
 
 ### Testing
 

@@ -52,6 +52,8 @@ spec:
               value: "${AGENT_ID}"
             - name: AGENT_SPECIALIZATION
               value: "${AGENT_SPECIALIZATION}"
+            - name: MODE
+              value: "${MODE}"
             - name: PLAN_STEP
               value: "${PLAN_STEP}"
             - name: REPO_OWNER

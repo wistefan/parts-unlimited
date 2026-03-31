@@ -68,6 +68,38 @@ curl -sf ${AUTH} -X PATCH "${GITEA_URL}/api/v1/admin/users/${HUMAN_USERNAME}" \
     }" >/dev/null
 echo "  Admin privileges set."
 
+# Register system-level webhook for the orchestrator.
+# This delivers pull_request and pull_request_review events from ALL repos
+# to the orchestrator's Gitea webhook endpoint.
+ORCHESTRATOR_WEBHOOK_URL="${ORCHESTRATOR_WEBHOOK_URL:-http://orchestrator.agents.svc.cluster.local:8080/webhooks/gitea}"
+echo "Registering system-level Gitea webhook..."
+EXISTING_HOOKS=$(curl -sf ${AUTH} "${GITEA_URL}/api/v1/admin/hooks" 2>/dev/null || echo "[]")
+HOOK_EXISTS=$(echo "${EXISTING_HOOKS}" | python3 -c "
+import sys, json
+hooks = json.load(sys.stdin)
+for h in hooks:
+    if h.get('config', {}).get('url', '') == '${ORCHESTRATOR_WEBHOOK_URL}':
+        print('true')
+        sys.exit()
+print('false')
+" 2>/dev/null || echo "false")
+
+if [ "${HOOK_EXISTS}" = "true" ]; then
+    echo "  System webhook already registered."
+else
+    curl -sf ${AUTH} -X POST "${GITEA_URL}/api/v1/admin/hooks" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"type\": \"gitea\",
+            \"config\": {
+                \"url\": \"${ORCHESTRATOR_WEBHOOK_URL}\",
+                \"content_type\": \"json\"
+            },
+            \"events\": [\"pull_request\", \"pull_request_review\"],
+            \"active\": true
+        }" >/dev/null 2>&1 && echo "  System webhook registered." || echo "  WARNING: Could not register system webhook."
+fi
+
 echo ""
 echo "Gitea initialization complete."
 echo "  URL:    ${GITEA_URL}"

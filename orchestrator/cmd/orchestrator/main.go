@@ -75,6 +75,10 @@ type orchestrator struct {
 	// prMappings maps "{owner}/{repo}#{pr_number}" → ticket ID.
 	// Populated from agent completion comments; used to route PR events.
 	prMappings map[string]int
+
+	// registeredRepos tracks repos that have a Gitea webhook registered.
+	// Prevents duplicate webhook registrations within a single run.
+	registeredRepos map[string]bool
 }
 
 func main() {
@@ -328,6 +332,7 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 		readyForTestID:      readyForTestID,
 		humanTaigaID:        humanTaigaID,
 		prMappings:          prMappings,
+		registeredRepos:     make(map[string]bool),
 	}
 
 	log.Println("Initialization complete.")
@@ -405,8 +410,7 @@ func (o *orchestrator) registerGiteaWebhookHandlers() {
 			log.Printf("Gitea: PR #%d mapped to ticket #%d", event.PullRequest.Number, ticketID)
 		}
 
-		// Trigger auto-review: assign PR to reviewing agent, run Claude review,
-		// then reassign to human.  Run in a goroutine so the webhook returns fast.
+		// Trigger auto-review in a goroutine so the webhook returns fast.
 		parts := strings.SplitN(event.Repository.FullName, "/", 2)
 		prOwner, prRepo := parts[0], parts[1]
 		prNum := event.PullRequest.Number
@@ -596,6 +600,33 @@ func (o *orchestrator) transitionToReadyForTest(ticketID int) {
 	)
 
 	log.Printf("Ticket #%d transitioned to ready-for-test", ticketID)
+}
+
+// ensureGiteaWebhook registers a Gitea webhook on a repo if not already registered.
+// Called when the orchestrator first encounters a repo (e.g., agent creates a PR).
+func (o *orchestrator) ensureGiteaWebhook(owner, repo string) {
+	key := owner + "/" + repo
+	if o.registeredRepos[key] {
+		return
+	}
+
+	webhookURL := fmt.Sprintf("http://orchestrator.agents.svc.cluster.local:%d/webhooks/gitea", WebhookListenPort)
+	err := o.giteaClient.CreateRepoWebhook(owner, repo, &gitea.CreateHookRequest{
+		Type: "gitea",
+		Config: map[string]string{
+			"url":          webhookURL,
+			"content_type": "json",
+		},
+		Events: []string{"pull_request", "pull_request_review"},
+		Active: true,
+	})
+	if err != nil {
+		// May already exist — not fatal
+		log.Printf("Gitea webhook registration on %s/%s: %v (may already exist)", owner, repo, err)
+	} else {
+		log.Printf("Gitea webhook registered on %s/%s", owner, repo)
+	}
+	o.registeredRepos[key] = true
 }
 
 // runAutoReview performs an automated Claude review on a PR.
