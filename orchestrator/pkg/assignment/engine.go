@@ -35,12 +35,14 @@ type QueueEntry struct {
 }
 
 // TicketAssignment tracks the current assignment state of a ticket.
+// TicketAssignment tracks which agent is working on a ticket and in what mode.
 type TicketAssignment struct {
-	TicketID      int      `json:"ticketId"`
-	PrimaryAgent  string   `json:"primaryAgent"`
-	DelegatedTo   []string `json:"delegatedTo"`
-	PlanStep      int      `json:"planStep"`
-	Status        string   `json:"status"` // "queued", "assigned", "delegated", "completed"
+	TicketID     int      `json:"ticketId"`
+	PrimaryAgent string   `json:"primaryAgent"`
+	DelegatedTo  []string `json:"delegatedTo"`
+	PlanStep     int      `json:"planStep"`
+	Mode         string   `json:"mode"`   // "analysis", "plan", "step", "fix"
+	Status       string   `json:"status"` // "queued", "assigned", "delegated", "completed"
 }
 
 // EscalationEntry tracks reassignment cycles for a ticket.
@@ -150,6 +152,16 @@ func (e *Engine) AssignAgent(ticketID int, agentID string) {
 	e.busyAgents[agentID] = ticketID
 
 	log.Printf("Agent %s assigned to ticket %d", agentID, ticketID)
+}
+
+// SetMode updates the current mode for a ticket's assignment.
+func (e *Engine) SetMode(ticketID int, mode string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if a, ok := e.assignments[ticketID]; ok {
+		a.Mode = mode
+	}
 }
 
 // DelegateToSpecialization processes a delegation tag on a ticket.
