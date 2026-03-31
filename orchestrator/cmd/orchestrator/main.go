@@ -738,26 +738,27 @@ func (o *orchestrator) determineMode(ticketID int) string {
 		return "analysis"
 	}
 
-	// Search from newest to oldest for the most recent lifecycle marker
+	// Search from newest to oldest for the most recent lifecycle marker.
+	// Return "" when we're waiting for a PR event (no agent work needed).
 	for i := len(comments) - 1; i >= 0; i-- {
 		c := comments[i].Comment
 		if strings.Contains(c, "[step:complete]") {
 			return "" // all done
 		}
 		if strings.Contains(c, "[fix:applied]") {
-			return "step" // fix done, continue with steps
+			return "" // fix pushed, waiting for human re-review
 		}
 		if strings.Contains(c, "[step:") {
-			return "step" // step in progress, continue
+			return "" // step PR created, waiting for human to merge
 		}
 		if strings.Contains(c, "[phase:plan-created]") {
-			return "step" // plan created, start steps
+			return "" // plan PR created, waiting for human to merge
 		}
 		if strings.Contains(c, "[analysis:proceed]") {
-			return "plan" // analysis done, need plan
+			return "plan" // analysis done, need to create plan
 		}
 		if strings.Contains(c, "[analysis:need-info]") {
-			return "" // waiting for human
+			return "" // waiting for human input
 		}
 	}
 
