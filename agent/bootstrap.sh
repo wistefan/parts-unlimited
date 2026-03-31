@@ -500,9 +500,7 @@ echo "Invoking Claude Code..."
 CLAUDE_ARGS=(
     -p
     --dangerously-skip-permissions
-    --bare
-    --no-session-persistence
-    --output-format json
+    --output-format stream-json
 )
 
 if [ -n "${SYSTEM_PROMPT}" ]; then
@@ -514,11 +512,25 @@ if [ -n "${ALLOWED_TOOLS}" ]; then
     CLAUDE_ARGS+=(--allowedTools "${ALLOWED_TOOLS}")
 fi
 
-TASK_PROMPT=$(cat "${PROMPT_FILE}")
+# Pipe the prompt via stdin to avoid shell argument length limits.
+echo "  Claude args: ${CLAUDE_ARGS[*]}"
+echo "  Prompt size: $(wc -c < "${PROMPT_FILE}") bytes"
 
-claude "${CLAUDE_ARGS[@]}" "${TASK_PROMPT}" > "${RESULT_FILE}" 2>&1 || true
+CLAUDE_EXIT=0
+claude "${CLAUDE_ARGS[@]}" < "${PROMPT_FILE}" > "${RESULT_FILE}" 2>&1 || CLAUDE_EXIT=$?
 
-echo "Claude Code finished."
+echo "Claude Code finished (exit code: ${CLAUDE_EXIT})."
+
+# Show a summary of Claude's output for debugging
+RESULT_SIZE=$(wc -c < "${RESULT_FILE}" 2>/dev/null || echo "0")
+echo "  Result file: ${RESULT_SIZE} bytes"
+if [ "${RESULT_SIZE}" -lt 500 ]; then
+    echo "  Result content:"
+    cat "${RESULT_FILE}" || true
+elif [ "${CLAUDE_EXIT}" -ne 0 ]; then
+    echo "  Last 20 lines of result:"
+    tail -20 "${RESULT_FILE}" || true
+fi
 
 # --- Process result ---
 
