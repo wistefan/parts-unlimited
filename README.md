@@ -10,7 +10,8 @@ A locally-hosted, Kubernetes-based platform that orchestrates Claude AI agents t
 - `curl`
 - `helm` (v3.x)
 - `python3`
-- Ports **3000** (Gitea) and **9000** (Taiga) must be free
+- `docker` (used to cache container images and avoid Docker Hub rate limits)
+- Ports **3001** (Gitea) and **9000** (Taiga) must be free (configurable)
 - Root/sudo access (for k3s installation)
 - At least 4 CPU cores and 8 GB RAM recommended
 
@@ -31,10 +32,231 @@ After setup completes:
 
 | Service | URL | Credentials |
 |---|---|---|
-| Gitea | http://localhost:3000 | `claude` / `password` (system admin) |
+| Gitea | http://localhost:3001 | `claude` / `password` (system admin) |
 | Taiga | http://localhost:9000 | `admin` / `password` (system admin) |
 
 Both services also have a configurable **human user** (default: `wistefan` / `password`) with full admin privileges. See [Configuration](#configuration) for how to customize.
+
+## Usage
+
+This section explains the day-to-day workflow: how to create work for the agents, what to expect while they work, and how to review and merge the results.
+
+### Claude Credentials
+
+Before agents can do any work, they need credentials to call the Anthropic API. Two mechanisms are supported; both can be active at the same time, with the API key taking precedence.
+
+**Option 1: API key** — a standard API key from the [Anthropic Console](https://console.anthropic.com) (under **API Keys**). Straightforward and does not expire unless revoked.
+
+```bash
+ANTHROPIC_API_KEY='sk-ant-...' sudo -E ./scripts/setup.sh
+```
+
+**Option 2: Credentials file** — if you have logged in with `claude login` on the host, the setup script copies `~/.claude/.credentials.json` into the cluster. Each agent container gets its own copy and handles OAuth token refresh independently.
+
+```bash
+# Just run setup — it picks up the credentials file automatically
+sudo ./scripts/setup.sh
+```
+
+Both can be provided. If `ANTHROPIC_API_KEY` is set, agents use it directly. Otherwise they fall back to the mounted credentials file. If neither source is found, the script prints a warning.
+
+To update credentials after setup:
+
+```bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+# Update API key
+kubectl create secret generic anthropic-api-key \
+  --namespace=agents \
+  --from-literal=api-key='sk-ant-...' \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Or update credentials file (e.g., after re-running 'claude login')
+kubectl create secret generic claude-credentials \
+  --namespace=agents \
+  --from-file=credentials.json=~/.claude/.credentials.json \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+### Creating a Ticket
+
+All work starts as a **user story** on the Taiga Kanban board.
+
+1. Open Taiga at `http://localhost:9000` and sign in as your human user.
+2. Open the **Dev Environment** project.
+3. Click **+ Add new** to create a user story.
+4. Fill in the fields:
+
+| Field | Required | Description |
+|---|---|---|
+| **Subject** | Yes | Short title describing the work (e.g., "Add pagination to user list API") |
+| **Description** | Yes | Detailed requirements. The more context you provide, the better the agent's output. |
+| **Target repository** | No | One or more `repo:` lines in the description (see below). If omitted, the agent asks via a comment. |
+| **Base branch** | No | A `base:` line in the description (e.g., `base: develop`). The work branch is created from this branch. Defaults to `main`. |
+
+5. Set the status to **ready** — this is the signal that tells the orchestrator the ticket is available for an agent to pick up.
+
+#### Specifying repositories
+
+Use `repo:` lines in the ticket description to tell the agent which repositories are involved. Several formats are supported:
+
+```
+repo: claude/user-service              # existing local Gitea repo
+repo: https://github.com/org/project   # remote repo — agent creates a local copy in Gitea
+repo: claude/new-service               # does not exist yet — agent creates it
+```
+
+When a remote URL is provided, the agent creates the repository in local Gitea and imports the remote as the initial content. This is useful for contributing to existing projects that are not yet mirrored locally.
+
+Multiple repositories can be listed when a ticket spans several codebases. The agent determines which one is the "main" repo (where most work happens) and creates the implementation plan there. Steps in secondary repos are referenced in the plan, and every PR links back to the ticket.
+
+```
+repo: claude/backend-api
+repo: claude/frontend-app
+```
+
+If no `repo:` line is present, the agent posts a comment on the ticket asking for the target repository before starting work.
+
+#### Specifying a base branch
+
+Use a `base:` line to specify which branch the work branch should be created from. If omitted, `main` is used.
+
+```
+base: develop
+```
+
+The analysis agent validates that the specified base branch exists in the repository.
+
+#### Example tickets
+
+Simple single-repo ticket:
+
+```markdown
+Add a REST endpoint for listing users with cursor-based pagination.
+
+repo: claude/user-service
+
+Requirements:
+- GET /api/v1/users with query params `limit` (default 20, max 100) and `cursor`
+- Return a JSON response with `items` array and `next_cursor` field
+- Include integration tests
+```
+
+Multi-repo ticket with a remote source:
+
+```markdown
+Add OpenAPI documentation generation to the project and publish it
+on the docs site.
+
+repo: https://github.com/acme/billing-api
+repo: claude/docs-site
+
+Requirements:
+- Generate OpenAPI spec from the existing endpoint annotations in billing-api
+- Add a CI step that publishes the spec to the docs-site repo
+- Include a rendered Swagger UI page
+```
+
+### Ticket Lifecycle
+
+Tickets move through three statuses that agents act on:
+
+```
+ready ──→ in progress ──→ ready for test
+  │  ↑          │                │
+  │  │          │                └─ All steps done. Human reviews work branch.
+  │  │          └─ Agent is implementing. PRs appear in Gitea.
+  │  │
+  │  └─ Human provides info and unassigns → re-analysis
+  └─ Ticket queued. Analysis agent evaluates first.
+```
+
+All other statuses (e.g., "done", "closed") are yours to manage — agents ignore them.
+
+### What Happens After You Create a Ticket
+
+1. **Analysis** — The orchestrator detects the "ready" ticket and spawns an **analysis agent**. The agent reads the ticket, examines the repository (if referenced), and evaluates whether the ticket is clear enough to proceed. The ticket stays in "ready" during analysis.
+   - If **clear**: the agent posts `[analysis:proceed]` and the ticket moves to "in progress".
+   - If **unclear**: the agent posts a comment asking for clarification, assigns the ticket to you, and waits. Add the missing info and **unassign yourself** to signal the orchestrator to re-analyze.
+2. **Plan** — A **plan agent** creates an `IMPLEMENTATION_PLAN.md` with numbered steps and opens a PR to the work branch. An automated Claude review is posted as comments. The PR is then assigned to you.
+3. **Plan review** — Review the plan PR. Approve and merge to proceed, or request changes — an agent will address your feedback.
+4. **Step-by-step implementation** — After the plan PR merges, a **step agent** picks up the first step, implements it on a step branch, and opens a PR. Each step gets its own PR targeting the work branch.
+5. **Step review** — Each step PR gets an auto-review, then is assigned to you. Approve and merge to advance, or request changes. The cycle repeats for each step.
+6. **Completion** — When the agent finishes the last step, it posts `[step:complete]` with release notes. The ticket moves to **ready for test** and is assigned to you.
+
+### Reviewing and Handling PRs
+
+Agent PRs appear in Gitea at `http://localhost:3001`. Each PR includes:
+- A link to the Taiga ticket
+- A reference to the implementation plan step it addresses
+- Test results from the agent's own test run
+
+The review workflow:
+
+1. **Auto-review** — When any PR is opened, the orchestrator automatically runs a Claude-powered code review and posts it as comments (informational only — it never approves or requests changes). The PR is assigned to the `claude` account during review, then reassigned to you.
+2. **Human review** — Open the PR in Gitea, read the diff and auto-review comments. You have three options:
+   - **Approve and merge** — The orchestrator detects the merge and spawns the agent for the next step (or transitions to "ready for test" if all steps are done).
+   - **Request changes** — Post a review with "Request Changes". The orchestrator spawns the same agent to address your feedback on the existing branch. After fixing, the agent re-assigns the PR to you.
+   - **Reject** — Close the PR without merging. The orchestrator posts an escalation comment on the Taiga ticket, assigns it to you, and pauses. You can re-queue by moving the ticket back to "ready".
+
+Only the human user can approve and merge PRs. Agents and the orchestrator cannot.
+
+### Branch Naming
+
+All branches follow the convention `ticket-{id}/...`:
+
+| Branch | Purpose |
+|---|---|
+| `ticket-{id}/work` | Integration branch — all step PRs merge here |
+| `ticket-{id}/plan` | Plan PR branch (targets the work branch) |
+| `ticket-{id}/step-{n}` | Step implementation branch (targets the work branch) |
+
+The work branch is created from `main` (or the branch specified by `base:` in the ticket).
+
+### Specialized Work and Delegation
+
+A general-purpose agent may delegate subtasks to specialized agents (Frontend, Backend, Test, Documentation, Operations). Delegation is visible on the ticket as **tags**:
+
+| Tag pattern | Meaning |
+|---|---|
+| `delegate:frontend` | General agent requested frontend work — waiting for a specialist |
+| `active:frontend` | A frontend specialist is actively working |
+| (tag removed) | Specialist finished — general agent resumes |
+
+Multiple specializations can run in parallel (e.g., `active:frontend` and `active:test` at the same time). The general-purpose agent resumes once all `active:` tags are gone.
+
+You do not need to manage these tags — the orchestrator handles them automatically. They are visible on the Kanban board as colored badges for transparency.
+
+### Monitoring Progress
+
+- **Taiga ticket comments** — Agents post progress updates, questions, and results as comments on the ticket. This is the primary communication channel.
+- **Gitea PRs** — Each PR shows the code changes and review discussion for one implementation step.
+- **Notification dashboard** — If configured, visit `http://localhost:8080/notifications` for a feed of events (escalations, PRs ready for review, plan approvals needed).
+- **Desktop notifications** — Enable `desktopNotify: true` in `config.yaml` for Linux desktop alerts via `notify-send`.
+
+### Handling Escalations
+
+Agents escalate to the human via ticket comments in these situations:
+
+| Situation | What the agent does | What you should do |
+|---|---|---|
+| **Unclear requirements** | Posts a comment asking for clarification | Reply on the ticket with the missing information |
+| **Merge conflict** | Posts a comment explaining the conflict | Either resolve it yourself or provide guidance in a comment |
+| **Repeated delegation failures** | After 2 no-op reassignment cycles, escalates | Check the ticket comments to understand why delegation failed, then provide instructions |
+| **Job failure after retries** | Agent failed twice, ticket is flagged | Check the agent logs (`kubectl logs -n agents <pod>`) and the ticket comments, then provide guidance |
+| **PR fully rejected** | Agent pauses and comments on the ticket | Add new instructions on the ticket to resume work |
+
+### Working with Multiple Repositories
+
+A single ticket can span multiple repositories (see [Specifying repositories](#specifying-repositories)). The agent decides which repo is the "main" one — where most of the work happens — and creates the implementation plan there. Steps that affect secondary repos are outlined in the plan and result in separate PRs in those repos. Every PR (regardless of repo) links back to the ticket and references its plan step. If merge ordering between repos matters, the agent documents this in the PR descriptions or creates the PRs sequentially.
+
+### Tips for Writing Good Tickets
+
+- **Be specific about acceptance criteria** — agents follow instructions literally.
+- **Include the target repo** — add `repo:` lines so the agent can start immediately instead of asking.
+- **Reference existing code** — if the change relates to existing files or patterns, mention them (e.g., "follow the same pattern as `pkg/auth/handler.go`").
+- **One concern per ticket** — keep tickets focused. The agent creates an implementation plan regardless, but simpler tickets produce better results.
+- **Use comments for follow-up** — if you need to add context after creation, post a comment rather than editing the description (agents are notified of new comments via webhooks).
 
 ## Scripts
 
@@ -54,19 +276,20 @@ The script is idempotent — running it again will upgrade existing deployments 
 
 | Variable | Default | Description |
 |---|---|---|
-| `GITEA_PORT` | `3000` | Port for Gitea web UI and API |
+| `GITEA_PORT` | `3001` | Port for Gitea web UI and API |
 | `TAIGA_PORT` | `9000` | Port for Taiga web UI and API |
 | `TAIGA_SECRET_KEY` | auto-generated | Django secret key for Taiga |
 | `HUMAN_USERNAME` | `wistefan` | Human user created in both Gitea and Taiga |
 | `HUMAN_PASSWORD` | `password` | Password for the human user |
 | `HUMAN_EMAIL` | `<username>@dev-env.local` | Email for the human user |
+| `ANTHROPIC_API_KEY` | *(none)* | Anthropic API key. If set, used instead of `~/.claude/.credentials.json`. |
 
 The human user is created with **admin privileges** in both Gitea (site admin) and Taiga (superuser), allowing full control over all projects, users, and settings.
 
 Example with custom human user and ports:
 
 ```bash
-HUMAN_USERNAME=johndoe HUMAN_PASSWORD=secret GITEA_PORT=3001 sudo -E ./scripts/setup.sh
+HUMAN_USERNAME=johndoe HUMAN_PASSWORD=secret GITEA_PORT=3002 sudo -E ./scripts/setup.sh
 ```
 
 ### `teardown.sh`
@@ -102,7 +325,7 @@ sudo ./scripts/install-k3s.sh
 Initializes Gitea after deployment: verifies the admin user and creates the `wistefan` user. Called automatically by `setup.sh`.
 
 ```bash
-GITEA_URL=http://localhost:3000 ./scripts/init-gitea.sh
+GITEA_URL=http://localhost:3001 ./scripts/init-gitea.sh
 ```
 
 ### `init-taiga.sh`
@@ -122,6 +345,32 @@ TAIGA_URL=http://localhost:9000 ./scripts/init-taiga.sh
 | `TAIGA_ADMIN_PASSWORD` | `password` | Superuser password |
 | `TAIGA_PROJECT_NAME` | `Dev Environment` | Project name |
 
+### `cache-images.sh`
+
+Pre-pulls external container images to the host Docker daemon and imports them into k3s containerd. On subsequent runs, images already in k3s are skipped; images in Docker but not k3s are imported directly without hitting Docker Hub.
+
+```bash
+# Cache the default set of images used by dev-env manifests
+sudo ./scripts/cache-images.sh
+
+# Cache specific images only
+sudo ./scripts/cache-images.sh postgres:12.3 nginx:1.19-alpine
+```
+
+Called automatically by `setup.sh`. Requires `docker` on the host. If docker is not available, images are pulled directly by k3s (standard behavior, subject to Docker Hub rate limits).
+
+### `import-images.sh`
+
+Builds and imports local container images (`orchestrator`, `agent-worker`) into k3s containerd. Ensures both short and fully-qualified tags exist to prevent `ErrImagePull`. Can be run standalone after code changes.
+
+```bash
+# Build and import both images
+sudo ./scripts/import-images.sh
+
+# Only rebuild the agent worker
+sudo ./scripts/import-images.sh agent-worker
+```
+
 ### `wait-for-ready.sh`
 
 Helper that blocks until all pods in a namespace are running and ready.
@@ -136,8 +385,8 @@ Helper that blocks until all pods in a namespace are running and ready.
 ```
 k3s (single node)
 ├── Namespace: gitea
-│   ├── Gitea (Helm chart) + PostgreSQL
-│   └── (future: act_runner for CI/CD)
+│   ├── Gitea (Helm chart, port 3001) + PostgreSQL
+│   └── act_runner (Gitea Actions CI/CD)
 ├── Namespace: taiga
 │   ├── taiga-back (Django API)
 │   ├── taiga-front (Angular SPA)
@@ -147,7 +396,7 @@ k3s (single node)
 │   ├── taiga-gateway (nginx reverse proxy, port 9000)
 │   ├── PostgreSQL 12.3
 │   └── RabbitMQ 3.8
-├── Namespace: agents (future: orchestrator + worker agents)
+├── Namespace: agents (orchestrator + worker agents)
 └── Storage
     ├── PVCs via local-path-provisioner (PostgreSQL, RabbitMQ)
     └── hostPath volumes at /var/lib/dev-env/taiga/ (shared static/media)
@@ -201,6 +450,43 @@ The init script creates a Taiga project with:
 **Swimlanes** (for Kanban board visualization):
 - General, Frontend, Backend, Test, Documentation, Operations
 
+## Token Usage Optimization
+
+The agent system includes several optimizations to minimize API token consumption. These are especially important when running multiple concurrent agents on Opus.
+
+### Rolling context summaries
+
+Instead of passing the full Taiga comment history to every agent (which can be 20+ comments), the bootstrap only includes:
+
+1. The **last agent comment** — which contains a cumulative context summary
+2. Any **human comments posted after it** — new input the agent needs to see
+
+Every agent is instructed to end its Taiga comment with a `### Context Summary` section that captures cumulative progress, key decisions, current state, and open issues. This rolling summary replaces the full history and keeps prompt input proportional to the current task, not the ticket's total lifetime.
+
+### CLAUDE.md codebase context
+
+During the **plan phase**, the agent creates a `CLAUDE.md` file in the repository root alongside `IMPLEMENTATION_PLAN.md`. This file contains:
+
+- Project overview, tech stack, and build commands
+- Project structure with key directories and files
+- Coding conventions and patterns
+- Important configuration and entry points
+
+Claude Code automatically loads `CLAUDE.md` at session start. Step and fix agents get full codebase orientation without spending tool calls exploring the repository. The bootstrap also appends `CLAUDE.md` to the `--system-prompt` argument (see below).
+
+### Prompt caching via system prompt
+
+The Claude API caches prompt prefixes across turns within a session. The bootstrap maximizes cache hit ratio by placing all stable context into the system prompt:
+
+- **Mode-specific system prompt** — instructions that don't change between turns
+- **CLAUDE.md content** — pre-read from the repo and appended to the system prompt before the first turn
+
+This means the codebase context enters the cached prefix on turn 1 and stays cached (~90% cheaper) for all subsequent turns. Without this, the agent would read `CLAUDE.md` via a tool call, placing it later in the conversation where it can't be cached as effectively.
+
+### Docker-in-Docker sidecar
+
+Agent pods include a DinD sidecar for running Docker commands (builds, compose, test containers). The sidecar is implemented as a Kubernetes native sidecar (init container with `restartPolicy: Always`) so it starts before the agent and is automatically terminated when the agent exits — no stuck pods, no wasted compute.
+
 ## Agent Security Isolation
 
 Agent workers run in sandboxed Kubernetes containers with multiple layers of isolation:
@@ -209,7 +495,7 @@ Agent workers run in sandboxed Kubernetes containers with multiple layers of iso
 |---|---|---|
 | **Network** | `NetworkPolicy` (`k8s/agents/network-policy.yaml`) | Egress limited to Gitea + Taiga (read/write) and public internet on 80/443 (read-only). All other cluster-internal and LAN traffic denied. No ingress. |
 | **Kubernetes API** | `ServiceAccount` with `automountServiceAccountToken: false` | Agent pods cannot read secrets, configmaps, or interact with the K8s API in any way. |
-| **Container** | `securityContext` on pod and container | Non-root user (UID 1000), no privilege escalation, all Linux capabilities dropped. |
+| **Container** | `securityContext` on pod and container | Non-root user (UID 1000) with passwordless sudo for installing toolchains. DinD sidecar runs privileged (required for Docker-in-Docker) but is ephemeral and subject to the same network policies. |
 | **Filesystem** | `emptyDir` workspace volume | Agent works in ephemeral storage. No hostPath mounts, no access to host filesystem. |
 | **RBAC** | Separate `orchestrator` ServiceAccount | Only the orchestrator can manage Jobs, read secrets, and update state. |
 
@@ -232,19 +518,51 @@ kubectl get pods -A
 
 ## Troubleshooting
 
+### General issues
+
+If work is not picked up or assigned as expected, inspect the running containers:
+
+```shell
+  kubectl get pods -n agents
+```
+
+The orchestrator is organizing the overall work and interacts with taiga and gitea, thus checking the log of the orchestrator is a good starting point for investigation.
+
+The concrete work executed by the agents can be inspected via:
+
+```shell
+kubectl exec -n agents <POD_NAME> -- tail /home/agent/result.json
+```
+
+### ErrImageNeverPull by the agent
+
+A currently unresolved issue coming up from time to time is the inability of agents to pull their image:
+
+```shell
+kubectl get pods -n agents
+NAME                                        READY   STATUS              RESTARTS   AGE
+agent-general-agent-1-ticket-3-step-8mdrr   1/2     ErrImageNeverPull   0          57s
+orchestrator-858478d589-6kxff               1/1     Running    
+```
+Due to an unresolved naming issuer, the images get removed from the k3s. This can be solved by just copying them back from the host:
+
+```shell
+docker save orchestrator:latest agent-worker:latest | sudo k3s ctr images import -
+```
+
 ### Port conflicts
 
-If ports 3000 or 9000 are in use, either stop the conflicting service or use custom ports:
+If ports 3001 or 9000 are in use, either stop the conflicting service or use custom ports:
 
 ```bash
 # Check what's using a port
-sudo ss -tlnp | grep ':3000'
+sudo ss -tlnp | grep ':3001'
 
 # Stop a Docker container on that port
 docker stop <container-name>
 
 # Or use different ports
-GITEA_PORT=3001 TAIGA_PORT=9001 sudo -E ./scripts/setup.sh
+GITEA_PORT=3002 TAIGA_PORT=9001 sudo -E ./scripts/setup.sh
 ```
 
 ### Pods not starting
@@ -285,8 +603,24 @@ sudo ./scripts/setup.sh
 The agent worker is a Docker container that runs Claude Code CLI to perform autonomous coding tasks. It lives in `agent/` and contains:
 
 - **Dockerfile** — Based on `node:22-slim` with Claude Code CLI, git, and common build tools
-- **Bootstrap script** (`bootstrap.sh`) — Orchestrates the full agent lifecycle: authenticates with Taiga/Gitea, fetches the ticket, clones the repo, builds a task prompt with full context, invokes Claude Code, pushes changes, and creates a PR
-- **System prompt** (`system-prompt.md`) — Coding guidelines, quality standards, and completion protocol for the agent
+- **Bootstrap script** (`bootstrap.sh`) — Orchestrates the full agent lifecycle: authenticates with Taiga/Gitea, fetches the ticket, clones the repo, selects mode-specific behavior, invokes Claude Code, pushes changes, and creates a PR
+- **System prompts** — one per agent mode:
+  - `system-prompt-analysis.md` — evaluate ticket clarity, post analysis result
+  - `system-prompt-plan.md` — create implementation plan, open plan PR
+  - `system-prompt-step.md` — implement next step, signal progress
+  - `system-prompt-fix.md` — address PR review comments
+  - `system-prompt.md` — generic fallback
+
+### Agent Modes
+
+The orchestrator spawns agents in different modes via the `MODE` environment variable:
+
+| Mode | When | What the agent does |
+|---|---|---|
+| `analysis` | Ticket is "ready" and unassigned | Evaluates ticket + repo, posts `[analysis:proceed]` or `[analysis:need-info]` |
+| `plan` | Analysis confirmed "proceed" | Creates `CLAUDE.md` (codebase context) and `IMPLEMENTATION_PLAN.md`, opens plan PR to work branch |
+| `step` | Plan PR merged, or previous step PR merged | Reads plan, implements next step, opens step PR, signals `[step:N/M]` or `[step:complete]` |
+| `fix` | Human requests changes on a PR | Addresses review comments on existing PR branch, pushes, re-assigns to human |
 
 ### Building
 
@@ -302,17 +636,26 @@ docker build -t agent-worker:latest .
 | `TICKET_ID` | Yes | Taiga user story ID to work on |
 | `AGENT_ID` | Yes | Agent identity (e.g., `general-agent-1`) |
 | `AGENT_SPECIALIZATION` | Yes | Agent role (e.g., `general`, `frontend`) |
+| `MODE` | No | Agent mode: `analysis`, `plan`, `step`, `fix` (default: `step`) |
 | `GITEA_URL` | Yes | Gitea base URL |
 | `GITEA_USERNAME` | Yes | Gitea credentials for this agent |
 | `GITEA_PASSWORD` | Yes | |
 | `TAIGA_URL` | Yes | Taiga base URL |
 | `TAIGA_USERNAME` | Yes | Taiga credentials for this agent |
 | `TAIGA_PASSWORD` | Yes | |
-| `ANTHROPIC_API_KEY` | Yes | Shared Anthropic API key |
+| `ANTHROPIC_API_KEY` | No* | API key from K8s Secret `anthropic-api-key` (takes precedence if present) |
+| *(Claude credentials)* | No* | Mounted at `/home/agent/.claude/.credentials.json` from K8s Secret `claude-credentials` |
+
+\* At least one of `ANTHROPIC_API_KEY` or the credentials file must be available.
+
+| Variable | Required | Description |
+|---|---|---|
 | `PLAN_STEP` | No | Implementation plan step number |
 | `REPO_OWNER` | No | Gitea repo owner (extracted from ticket if not set) |
 | `REPO_NAME` | No | Gitea repo name (extracted from ticket if not set) |
 | `ALLOWED_TOOLS` | No | Space-separated Claude tools (default: all) |
+| `PR_NUMBER` | No | PR number to fix (fix mode only) |
+| `PR_REPO` | No | `{owner}/{repo}` of the PR (fix mode only) |
 
 ### Agent Workflow
 
@@ -320,12 +663,13 @@ docker build -t agent-worker:latest .
 2. Authenticates with Taiga (JWT) and Gitea (basic auth)
 3. Fetches the ticket (subject, description, comments)
 4. Determines the target repo (from env vars or ticket description, format: `repo: owner/name`)
-5. Clones the repo and creates/resumes a branch (`agent/<id>/ticket-<id>/step-<n>`)
-6. Reads the implementation plan if present
-7. Builds a task prompt with full ticket context
-8. Invokes `claude -p --dangerously-skip-permissions` with the task prompt
-9. Pushes changes and creates a PR with a link to the ticket
-10. Posts a progress comment on the ticket
+5. Extracts optional `base:` branch from ticket description (default: `main`)
+6. Clones the repo and creates/resumes branches (`ticket-{id}/work`, `ticket-{id}/plan`, or `ticket-{id}/step-{n}`)
+7. Loads mode-specific system prompt (`system-prompt-{mode}.md`)
+8. Builds a task prompt with full ticket context
+9. Invokes `claude -p --dangerously-skip-permissions` with the task prompt
+10. Pushes changes and creates a PR (plan/step modes) or pushes to existing branch (fix mode)
+11. Posts a progress comment on the ticket with machine-readable markers
 
 ### Testing
 
@@ -473,6 +817,7 @@ dev-env/
     ├── setup.sh                 # Master setup script
     ├── teardown.sh              # Cleanup script
     ├── install-k3s.sh           # k3s installation
+    ├── cache-images.sh          # Docker Hub image cache (host → k3s)
     ├── init-gitea.sh            # Gitea initialization
     ├── init-taiga.sh            # Taiga initialization
     ├── verify.sh                # Health checks

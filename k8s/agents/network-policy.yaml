@@ -32,7 +32,7 @@ spec:
               name: gitea
       ports:
         - protocol: TCP
-          port: 3000
+          port: 3001
         - protocol: TCP
           port: 2222
     # Allow traffic to Taiga (namespace: taiga)

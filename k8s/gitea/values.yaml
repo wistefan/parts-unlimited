@@ -1,6 +1,10 @@
 ## Gitea Helm chart values for dev-env
 ## Chart: gitea-charts/gitea
 
+# Use cached images to avoid Docker Hub rate limits on restarts
+image:
+  pullPolicy: IfNotPresent
+
 # Admin user created on first startup
 gitea:
   admin:
@@ -14,7 +18,7 @@ gitea:
     repository:
       DEFAULT_DELETE_BRANCH_AFTER_MERGE: true
     server:
-      ROOT_URL: http://localhost:3000
+      ROOT_URL: http://localhost:3001
       SSH_DOMAIN: localhost
       SSH_PORT: 2222
     service:
@@ -22,18 +26,22 @@ gitea:
     webhook:
       ALLOWED_HOST_LIST: "*"
 
-# HTTP service exposed on port 3000 via k3s LoadBalancer
+# HTTP service exposed via k3s LoadBalancer (port configurable via setup.sh)
 service:
   http:
     type: LoadBalancer
-    port: 3000
+    port: 3001
   ssh:
     type: LoadBalancer
     port: 2222
 
-# Persistence for Gitea data
+# Persistence for Gitea data — uses pre-provisioned hostPath PVC so data
+# survives k3s reinstalls.  The PVC is created by k8s/gitea/volumes.yaml.
 persistence:
   enabled: true
+  create: false
+  mount: true
+  claimName: gitea-shared-storage
   size: 10Gi
 
 # Bundled PostgreSQL (single-node, not HA)
@@ -47,6 +55,7 @@ postgresql:
         username: gitea
   primary:
     persistence:
+      existingClaim: gitea-postgresql-data
       size: 5Gi
 
 postgresql-ha:

@@ -1,7 +1,7 @@
 # Multi-stage build for the orchestrator binary.
 # Produces a minimal distroless image (~20 MB).
 
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /build
 

@@ -106,6 +106,7 @@ spec:
       containers:
         - name: nginx
           image: nginx:1.19-alpine
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 80
           volumeMounts:

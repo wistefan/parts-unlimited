@@ -32,6 +32,7 @@ type TaigaConfig struct {
 	AdminPassword string `yaml:"adminPassword"`
 	ProjectSlug   string `yaml:"projectSlug"`
 	WebhookSecret string `yaml:"webhookSecret"`
+	HumanUsername string `yaml:"humanUsername"`
 }
 
 // AgentsConfig holds agent orchestration settings.
@@ -77,7 +78,7 @@ func (a *AgentsConfig) TaskTimeout() time.Duration {
 func DefaultConfig() *Config {
 	return &Config{
 		Gitea: GiteaConfig{
-			URL:           "http://gitea-http.gitea.svc.cluster.local:3000",
+			URL:           "http://gitea-http.gitea.svc.cluster.local:3001",
 			AdminUsername: "claude",
 			AdminPassword: "password",
 		},
@@ -86,6 +87,7 @@ func DefaultConfig() *Config {
 			AdminUsername: "admin",
 			AdminPassword: "password",
 			ProjectSlug:   "dev-environment",
+			HumanUsername: "wistefan",
 		},
 		Agents: AgentsConfig{
 			MaxConcurrency:      3,

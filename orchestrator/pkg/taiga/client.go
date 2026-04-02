@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 )
@@ -187,15 +188,18 @@ func (c *Client) AddComment(storyID int, comment string, version int) error {
 
 // HistoryEntry represents an entry in a user story's history.
 type HistoryEntry struct {
-	ID        string `json:"id"`
-	Comment   string `json:"comment"`
-	CreatedAt string `json:"created_at"`
-	User      struct {
+	ID                string  `json:"id"`
+	Comment           string  `json:"comment"`
+	CreatedAt         string  `json:"created_at"`
+	DeleteCommentDate *string `json:"delete_comment_date"`
+	User              struct {
 		Username string `json:"username"`
 	} `json:"user"`
 }
 
 // GetComments retrieves comment history for a user story.
+// Results are sorted newest-first by created_at so callers can iterate
+// from index 0 to find the most recent lifecycle marker.
 func (c *Client) GetComments(storyID int) ([]HistoryEntry, error) {
 	path := fmt.Sprintf("/api/v1/history/userstory/%d?type=comment", storyID)
 
@@ -214,7 +218,21 @@ func (c *Client) GetComments(storyID int) ([]HistoryEntry, error) {
 		return nil, fmt.Errorf("decoding comments: %w", err)
 	}
 
-	return entries, nil
+	// Filter out deleted comments and sort newest-first.
+	filtered := entries[:0]
+	for _, e := range entries {
+		if e.DeleteCommentDate != nil {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+
+	// Sort newest-first by created_at (RFC 3339 strings sort lexicographically).
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].CreatedAt > filtered[j].CreatedAt
+	})
+
+	return filtered, nil
 }
 
 // --- Statuses ---
@@ -284,6 +302,48 @@ func (c *Client) ListProjectMembers(projectID int) ([]User, error) {
 	return users, nil
 }
 
+// RegisterUser creates a new user via Taiga's public registration endpoint.
+// Requires public registration to be enabled on the Taiga instance.
+func (c *Client) RegisterUser(username, password, email, fullName string) (*User, error) {
+	payload := map[string]string{
+		"type":      "public",
+		"username":  username,
+		"password":  password,
+		"email":     email,
+		"full_name": fullName,
+		"accepted_terms": "true",
+	}
+
+	resp, err := c.doRequest(http.MethodPost, "/api/v1/auth/register", payload, false)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("register user %q: status %d, body: %s", username, resp.StatusCode, body)
+	}
+
+	var result struct {
+		ID       int    `json:"id"`
+		Username string `json:"username"`
+		Email    string `json:"email"`
+		FullName string `json:"full_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding registered user: %w", err)
+	}
+
+	return &User{
+		ID:       result.ID,
+		Username: result.Username,
+		Email:    result.Email,
+		FullName: result.FullName,
+		IsActive: true,
+	}, nil
+}
+
 // --- Webhooks ---
 
 // Webhook represents a Taiga webhook configuration.
@@ -343,6 +403,23 @@ func (c *Client) ListWebhooks(projectID int) ([]Webhook, error) {
 	}
 
 	return webhooks, nil
+}
+
+// DeleteWebhook removes a webhook by ID.
+func (c *Client) DeleteWebhook(webhookID int) error {
+	path := fmt.Sprintf("/api/v1/webhooks/%d", webhookID)
+
+	resp, err := c.doRequest(http.MethodDelete, path, nil, true)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("delete webhook %d: status %d", webhookID, resp.StatusCode)
+	}
+
+	return nil
 }
 
 // --- Projects ---

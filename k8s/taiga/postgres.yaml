@@ -17,6 +17,7 @@ spec:
       containers:
         - name: postgres
           image: postgres:12.3
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 5432
           env:
@@ -61,15 +62,10 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
-  volumeClaimTemplates:
-    - metadata:
-        name: taiga-db-data
-      spec:
-        accessModes:
-          - ReadWriteOnce
-        resources:
-          requests:
-            storage: 5Gi
+      volumes:
+        - name: taiga-db-data
+          persistentVolumeClaim:
+            claimName: taiga-db-data
 
 ---
 apiVersion: v1

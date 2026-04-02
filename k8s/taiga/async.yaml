@@ -18,6 +18,7 @@ spec:
       containers:
         - name: taiga-async
           image: taigaio/taiga-back:latest
+          imagePullPolicy: IfNotPresent
           command: ["/taiga-back/docker/async_entrypoint.sh"]
           envFrom:
             - configMapRef:

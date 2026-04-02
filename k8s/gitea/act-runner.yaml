@@ -20,6 +20,7 @@ spec:
       containers:
         - name: runner
           image: gitea/act_runner:latest
+          imagePullPolicy: IfNotPresent
           env:
             - name: DOCKER_HOST
               value: tcp://localhost:2376
@@ -28,7 +29,7 @@ spec:
             - name: DOCKER_CERT_PATH
               value: /certs/client
             - name: GITEA_INSTANCE_URL
-              value: http://gitea-http.gitea.svc.cluster.local:3000
+              value: http://gitea-http.gitea.svc.cluster.local:3001
             - name: GITEA_RUNNER_REGISTRATION_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -48,6 +49,7 @@ spec:
               memory: 512Mi
         - name: dind
           image: docker:dind
+          imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true
           env:

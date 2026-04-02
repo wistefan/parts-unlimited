@@ -46,13 +46,12 @@ echo ""
 # --- Test: branch name generation ---
 echo "Branch naming:"
 
-AGENT_ID="general-agent-1"
 TICKET_ID="42"
+BRANCH_PREFIX="ticket-${TICKET_ID}"
 
 PLAN_STEP="3"
-BRANCH_PREFIX="agent/${AGENT_ID}/ticket-${TICKET_ID}"
 BRANCH_NAME="${BRANCH_PREFIX}/step-${PLAN_STEP}"
-assert_eq "branch with plan step" "agent/general-agent-1/ticket-42/step-3" "${BRANCH_NAME}"
+assert_eq "branch with plan step" "ticket-42/step-3" "${BRANCH_NAME}"
 
 PLAN_STEP=""
 if [ -n "${PLAN_STEP}" ]; then
@@ -60,29 +59,100 @@ if [ -n "${PLAN_STEP}" ]; then
 else
     BRANCH_NAME="${BRANCH_PREFIX}/work"
 fi
-assert_eq "branch without plan step" "agent/general-agent-1/ticket-42/work" "${BRANCH_NAME}"
+assert_eq "branch without plan step" "ticket-42/work" "${BRANCH_NAME}"
+
+MODE="plan"
+BRANCH_NAME="${BRANCH_PREFIX}/plan"
+assert_eq "branch for plan mode" "ticket-42/plan" "${BRANCH_NAME}"
 
 echo ""
 
 # --- Test: repo extraction from description ---
 echo "Repo extraction from description:"
 
-extract_repo() {
+# Replicate the extract_repo_ref function from bootstrap.sh
+extract_repo_ref() {
     local desc="$1"
-    echo "${desc}" | grep -oP '(?:repo|gitea)[:\s]+\K\S+/\S+' | head -1 || true
+    local raw
+    raw=$(echo "${desc}" | grep -oP '(?i)(?:repo|gitea)\s*:\s*\K.*' | head -1 || true)
+    [ -z "${raw}" ] && return
+    raw=$(echo "${raw}" | sed -E 's/^\s+//;s/\s+$//')
+    if echo "${raw}" | grep -qP '^\[.*\]\(.*\)'; then
+        raw=$(echo "${raw}" | sed -E 's/^\[([^]]*)\]\(([^)]*)\).*/\2/')
+    fi
+    raw=$(echo "${raw}" | sed -E 's/^\[([^]]*)\]$/\1/')
+    raw=$(echo "${raw}" | sed 's/^<//;s/>$//')
+    raw=$(echo "${raw}" | awk '{print $1}')
+    echo "${raw}"
 }
 
-RESULT=$(extract_repo "Please work on repo: myorg/myrepo and fix the bug")
+RESULT=$(extract_repo_ref "Please work on repo: myorg/myrepo and fix the bug")
 assert_eq "repo: owner/name format" "myorg/myrepo" "${RESULT}"
 
-RESULT=$(extract_repo "Fix the bug in gitea: claude/dev-env immediately")
+RESULT=$(extract_repo_ref "Fix the bug in gitea: claude/dev-env immediately")
 assert_eq "gitea: owner/name format" "claude/dev-env" "${RESULT}"
 
-RESULT=$(extract_repo "Just fix the bug please")
+RESULT=$(extract_repo_ref "Just fix the bug please")
 assert_eq "no repo in description" "" "${RESULT}"
 
-RESULT=$(extract_repo "repo:team/project-name is the target")
+RESULT=$(extract_repo_ref "repo:team/project-name is the target")
 assert_eq "repo:owner/name no space" "team/project-name" "${RESULT}"
+
+RESULT=$(extract_repo_ref "repo: https://github.com/FIWARE/data-space-connector")
+assert_eq "repo: full https URL" "https://github.com/FIWARE/data-space-connector" "${RESULT}"
+
+RESULT=$(extract_repo_ref "repo: [https://github.com/org/repo](https://github.com/org/repo)")
+assert_eq "repo: markdown link URL" "https://github.com/org/repo" "${RESULT}"
+
+RESULT=$(extract_repo_ref "repo: <https://github.com/org/repo>")
+assert_eq "repo: angle bracket URL" "https://github.com/org/repo" "${RESULT}"
+
+RESULT=$(extract_repo_ref "repo: https://github.com/org/repo.git")
+assert_eq "repo: URL with .git suffix" "https://github.com/org/repo.git" "${RESULT}"
+
+RESULT=$(extract_repo_ref "Repo: claude/my-project")
+assert_eq "repo: case insensitive" "claude/my-project" "${RESULT}"
+
+RESULT=$(extract_repo_ref "repo: owner/name # this is a comment")
+assert_eq "repo: value with trailing comment" "owner/name" "${RESULT}"
+
+# Test that URL is detected as remote (not split into owner/name)
+RESULT=$(extract_repo_ref "repo: https://github.com/FIWARE/data-space-connector")
+if echo "${RESULT}" | grep -qP '^https?://'; then
+    echo "  [PASS] URL detected as remote"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] URL detected as remote"
+    echo "         got: ${RESULT}"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test repo name extraction from URL
+CLEAN_URL="${RESULT%.git}"
+CLEAN_URL="${CLEAN_URL%/}"
+REPO_NAME_FROM_URL=$(basename "${CLEAN_URL}")
+assert_eq "repo name from URL" "data-space-connector" "${REPO_NAME_FROM_URL}"
+
+echo ""
+
+# --- Test: base branch extraction from description ---
+echo "Base branch extraction:"
+
+extract_base_branch() {
+    local desc="$1"
+    local raw
+    raw=$(echo "${desc}" | grep -oP '(?i)base\s*:\s*\K\S+' | head -1 || true)
+    echo "${raw}"
+}
+
+RESULT=$(extract_base_branch "repo: claude/test\nbase: develop")
+assert_eq "base: develop" "develop" "${RESULT}"
+
+RESULT=$(extract_base_branch "repo: claude/test")
+assert_eq "base: not specified" "" "${RESULT}"
+
+RESULT=$(extract_base_branch "Base: release/v2")
+assert_eq "base: case insensitive" "release/v2" "${RESULT}"
 
 echo ""
 
@@ -93,12 +163,11 @@ REQUIRED_VARS=(
     TICKET_ID AGENT_ID AGENT_SPECIALIZATION
     GITEA_URL GITEA_USERNAME GITEA_PASSWORD
     TAIGA_URL TAIGA_USERNAME TAIGA_PASSWORD
-    ANTHROPIC_API_KEY
 )
 
-assert_eq "required vars count" "10" "${#REQUIRED_VARS[@]}"
+assert_eq "required vars count" "9" "${#REQUIRED_VARS[@]}"
 assert_contains "TICKET_ID in required" "TICKET_ID" "${REQUIRED_VARS[*]}"
-assert_contains "ANTHROPIC_API_KEY in required" "ANTHROPIC_API_KEY" "${REQUIRED_VARS[*]}"
+assert_contains "TAIGA_PASSWORD in required" "TAIGA_PASSWORD" "${REQUIRED_VARS[*]}"
 
 echo ""
 

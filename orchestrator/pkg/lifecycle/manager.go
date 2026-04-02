@@ -35,17 +35,23 @@ const (
 
 // AgentJobSpec holds the parameters needed to create an agent worker Job.
 type AgentJobSpec struct {
-	AgentID            string
-	Specialization     string
-	TicketID           int
-	PlanStep           string
-	RepoOwner          string
-	RepoName           string
-	GiteaUsername       string
-	GiteaPassword       string
-	TaigaUsername       string
-	TaigaPassword       string
-	AllowedTools       string
+	AgentID        string
+	Specialization string
+	TicketID       int
+	Mode           string // analysis, plan, step, fix
+	PlanStep       string
+	RepoOwner      string
+	RepoName       string
+	PRNumber       int    // PR to fix (fix mode only)
+	PRRepo         string // "{owner}/{repo}" of the PR (fix mode only)
+	GiteaUsername  string
+	GiteaPassword  string
+	TaigaUsername  string
+	TaigaPassword  string
+	AllowedTools   string
+	HumanUsername  string
+	HumanTaigaID   int
+	TaigaProjectID int
 }
 
 // Config holds lifecycle manager configuration.
@@ -104,14 +110,17 @@ func NewManager(clientset kubernetes.Interface, config *Config) *Manager {
 	}
 }
 
-// JobName generates a deterministic job name for an agent/ticket combination.
-func JobName(agentID string, ticketID int) string {
-	return fmt.Sprintf("agent-%s-ticket-%d", agentID, ticketID)
+// JobName generates a deterministic job name for an agent/ticket/mode combination.
+func JobName(agentID string, ticketID int, mode string) string {
+	if mode == "" {
+		mode = "step"
+	}
+	return fmt.Sprintf("agent-%s-ticket-%d-%s", agentID, ticketID, mode)
 }
 
 // CreateJob creates a Kubernetes Job for an agent worker.
 func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, error) {
-	jobName := JobName(spec.AgentID, spec.TicketID)
+	jobName := JobName(spec.AgentID, spec.TicketID, spec.Mode)
 
 	// Check if job already exists
 	_, err := m.clientset.BatchV1().Jobs(m.config.Namespace).Get(ctx, jobName, metav1.GetOptions{})
@@ -154,27 +163,68 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 					ServiceAccountName:           m.config.ServiceAccount,
 					AutomountServiceAccountToken: &falseVal,
 					RestartPolicy:                corev1.RestartPolicyNever,
-					SecurityContext: &corev1.PodSecurityContext{
-						RunAsNonRoot: boolPtr(true),
-						RunAsUser:    int64Ptr(1000),
-						RunAsGroup:   int64Ptr(1000),
-						FSGroup:      int64Ptr(1000),
+					// DinD runs as a native sidecar (init container with
+					// restartPolicy=Always).  Kubernetes automatically
+					// terminates it when the main "agent" container exits,
+					// so the Job completes cleanly.
+					InitContainers: []corev1.Container{
+						{
+							Name:            "dind",
+							Image:           "docker:dind",
+							ImagePullPolicy: corev1.PullIfNotPresent,
+							RestartPolicy:   func() *corev1.ContainerRestartPolicy { p := corev1.ContainerRestartPolicyAlways; return &p }(),
+							SecurityContext: &corev1.SecurityContext{
+								Privileged: boolPtr(true),
+							},
+							Env: []corev1.EnvVar{
+								{
+									Name:  "DOCKER_TLS_CERTDIR",
+									Value: "", // disable TLS — pod-local communication only
+								},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "docker-sock",
+									MountPath: "/var/run",
+								},
+								{
+									Name:      "docker-storage",
+									MountPath: "/var/lib/docker",
+								},
+							},
+						},
 					},
 					Containers: []corev1.Container{
 						{
-							Name:  "agent",
-							Image: m.config.ContainerImage,
+							Name:            "agent",
+							Image:           m.config.ContainerImage,
+							ImagePullPolicy: corev1.PullNever,
 							SecurityContext: &corev1.SecurityContext{
-								AllowPrivilegeEscalation: &falseVal,
-								Capabilities: &corev1.Capabilities{
-									Drop: []corev1.Capability{"ALL"},
-								},
+								RunAsUser:                int64Ptr(1000),
+								RunAsGroup:               int64Ptr(1000),
+								AllowPrivilegeEscalation: boolPtr(true),
 							},
-							Env: m.buildEnvVars(spec),
+							Env: append(m.buildEnvVars(spec), corev1.EnvVar{
+								Name:  "DOCKER_HOST",
+								Value: "unix:///var/run/docker.sock",
+							}),
 							VolumeMounts: []corev1.VolumeMount{
 								{
 									Name:      "workspace",
 									MountPath: "/home/agent/workspace",
+								},
+								{
+									Name:      "claude-home",
+									MountPath: "/home/agent/.claude",
+								},
+								{
+									Name:      "claude-credentials",
+									MountPath: "/home/agent/.claude-secret",
+									ReadOnly:  true,
+								},
+								{
+									Name:      "docker-sock",
+									MountPath: "/var/run",
 								},
 							},
 						},
@@ -182,6 +232,38 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 					Volumes: []corev1.Volume{
 						{
 							Name: "workspace",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+						{
+							Name: "claude-home",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+						{
+							Name: "claude-credentials",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: "claude-credentials",
+									Items: []corev1.KeyToPath{
+										{
+											Key:  "credentials.json",
+											Path: ".credentials.json",
+										},
+									},
+								},
+							},
+						},
+						{
+							Name: "docker-sock",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+						{
+							Name: "docker-storage",
 							VolumeSource: corev1.VolumeSource{
 								EmptyDir: &corev1.EmptyDirVolumeSource{},
 							},
@@ -313,6 +395,24 @@ func (m *Manager) ListActiveJobs(ctx context.Context) ([]JobStatus, error) {
 	return result, nil
 }
 
+// HasJobForTicket checks whether any Job (running, succeeded, or failed)
+// exists for the given ticket, regardless of mode.  This prevents the
+// reconciliation loop from spawning duplicate agents when the derived mode
+// does not match the mode of the actually running Job.
+func (m *Manager) HasJobForTicket(ctx context.Context, ticketID int) (bool, error) {
+	ticketLabel := fmt.Sprintf("%s=%d", LabelTicketID, ticketID)
+	roleLabel := fmt.Sprintf("%s=%s", LabelRole, LabelRoleValue)
+	selector := roleLabel + "," + ticketLabel
+
+	jobs, err := m.clientset.BatchV1().Jobs(m.config.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil {
+		return false, fmt.Errorf("listing jobs for ticket %d: %w", ticketID, err)
+	}
+	return len(jobs.Items) > 0, nil
+}
+
 // GetActiveJobNames returns the set of currently tracked active job names.
 func (m *Manager) GetActiveJobNames() map[string]string {
 	m.mu.RLock()
@@ -331,6 +431,7 @@ func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 		{Name: "TICKET_ID", Value: fmt.Sprintf("%d", spec.TicketID)},
 		{Name: "AGENT_ID", Value: spec.AgentID},
 		{Name: "AGENT_SPECIALIZATION", Value: spec.Specialization},
+		{Name: "MODE", Value: spec.Mode},
 		{Name: "PLAN_STEP", Value: spec.PlanStep},
 		{Name: "REPO_OWNER", Value: spec.RepoOwner},
 		{Name: "REPO_NAME", Value: spec.RepoName},
@@ -338,6 +439,16 @@ func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 		{Name: "GITEA_PASSWORD", Value: spec.GiteaPassword},
 		{Name: "TAIGA_USERNAME", Value: spec.TaigaUsername},
 		{Name: "TAIGA_PASSWORD", Value: spec.TaigaPassword},
+		{Name: "HUMAN_USERNAME", Value: spec.HumanUsername},
+		{Name: "HUMAN_TAIGA_ID", Value: fmt.Sprintf("%d", spec.HumanTaigaID)},
+		{Name: "TAIGA_PROJECT_ID", Value: fmt.Sprintf("%d", spec.TaigaProjectID)},
+	}
+
+	if spec.Mode == "fix" && spec.PRNumber > 0 {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "PR_NUMBER", Value: fmt.Sprintf("%d", spec.PRNumber)},
+			corev1.EnvVar{Name: "PR_REPO", Value: spec.PRRepo},
+		)
 	}
 
 	if spec.AllowedTools != "" {
@@ -364,17 +475,21 @@ func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 				},
 			},
 		},
-		// API key from Secret
-		corev1.EnvVar{
-			Name: "ANTHROPIC_API_KEY",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: "anthropic-api-key"},
-					Key:                  "api-key",
-				},
+	)
+
+	// Optional: if the anthropic-api-key Secret exists, it takes
+	// precedence over the mounted credentials file.
+	optional := true
+	envVars = append(envVars, corev1.EnvVar{
+		Name: "ANTHROPIC_API_KEY",
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "anthropic-api-key"},
+				Key:                  "api-key",
+				Optional:             &optional,
 			},
 		},
-	)
+	})
 
 	return envVars
 }

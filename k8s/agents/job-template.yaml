@@ -39,6 +39,7 @@ spec:
       containers:
         - name: agent
           image: "${CONTAINER_IMAGE}"
+          imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -51,6 +52,8 @@ spec:
               value: "${AGENT_ID}"
             - name: AGENT_SPECIALIZATION
               value: "${AGENT_SPECIALIZATION}"
+            - name: MODE
+              value: "${MODE}"
             - name: PLAN_STEP
               value: "${PLAN_STEP}"
             - name: REPO_OWNER
@@ -87,14 +90,28 @@ spec:
                 secretKeyRef:
                   name: agent-credentials-${AGENT_ID}
                   key: taiga-password
+            - name: HUMAN_USERNAME
+              value: "${HUMAN_USERNAME}"
+            - name: HUMAN_TAIGA_ID
+              value: "${HUMAN_TAIGA_ID}"
+            - name: TAIGA_PROJECT_ID
+              value: "${TAIGA_PROJECT_ID}"
+            # Optional: if the anthropic-api-key secret exists, it takes
+            # precedence over the mounted credentials file.
             - name: ANTHROPIC_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: anthropic-api-key
                   key: api-key
+                  optional: true
           volumeMounts:
             - name: workspace
               mountPath: /home/agent/workspace
+            - name: claude-home
+              mountPath: /home/agent/.claude
+            - name: claude-credentials
+              mountPath: /home/agent/.claude-secret
+              readOnly: true
           resources:
             requests:
               cpu: 250m
@@ -106,6 +123,14 @@ spec:
         - name: workspace
           emptyDir:
             sizeLimit: 10Gi
+        - name: claude-home
+          emptyDir: {}
+        - name: claude-credentials
+          secret:
+            secretName: claude-credentials
+            items:
+              - key: credentials.json
+                path: .credentials.json
 
 ---
 ## Service endpoints ConfigMap — shared by all agent Jobs.
@@ -116,5 +141,5 @@ metadata:
   name: agent-service-endpoints
   namespace: agents
 data:
-  GITEA_URL: "http://gitea-http.gitea.svc.cluster.local:3000"
+  GITEA_URL: "http://gitea-http.gitea.svc.cluster.local:3001"
   TAIGA_URL: "http://taiga-gateway.taiga.svc.cluster.local:9000"

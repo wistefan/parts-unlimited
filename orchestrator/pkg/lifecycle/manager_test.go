@@ -22,15 +22,18 @@ func TestJobName(t *testing.T) {
 	tests := []struct {
 		agentID  string
 		ticketID int
+		mode     string
 		expected string
 	}{
-		{"general-agent-1", 42, "agent-general-agent-1-ticket-42"},
-		{"frontend-agent-3", 100, "agent-frontend-agent-3-ticket-100"},
+		{"general-agent-1", 42, "analysis", "agent-general-agent-1-ticket-42-analysis"},
+		{"general-agent-1", 42, "plan", "agent-general-agent-1-ticket-42-plan"},
+		{"frontend-agent-3", 100, "step", "agent-frontend-agent-3-ticket-100-step"},
+		{"general-agent-1", 42, "", "agent-general-agent-1-ticket-42-step"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.expected, func(t *testing.T) {
-			result := JobName(tt.agentID, tt.ticketID)
+			result := JobName(tt.agentID, tt.ticketID, tt.mode)
 			if result != tt.expected {
 				t.Errorf("expected %q, got %q", tt.expected, result)
 			}
@@ -51,13 +54,14 @@ func TestCreateJob(t *testing.T) {
 		AgentID:        "general-agent-1",
 		Specialization: "general",
 		TicketID:       42,
+		Mode:           "step",
 		PlanStep:       "3",
 		RepoOwner:      "claude",
 		RepoName:       "test-repo",
-		GiteaUsername:   "general-agent-1",
-		GiteaPassword:   "agent-password",
-		TaigaUsername:   "general-agent-1",
-		TaigaPassword:   "agent-password",
+		GiteaUsername:  "general-agent-1",
+		GiteaPassword:  "agent-password",
+		TaigaUsername:  "general-agent-1",
+		TaigaPassword:  "agent-password",
 	}
 
 	jobName, err := mgr.CreateJob(ctx, spec)
@@ -65,7 +69,7 @@ func TestCreateJob(t *testing.T) {
 		t.Fatalf("CreateJob: %v", err)
 	}
 
-	expectedName := "agent-general-agent-1-ticket-42"
+	expectedName := "agent-general-agent-1-ticket-42-step"
 	if jobName != expectedName {
 		t.Errorf("expected job name %q, got %q", expectedName, jobName)
 	}
@@ -127,9 +131,33 @@ func TestCreateJob(t *testing.T) {
 	if envMap["PLAN_STEP"].Value != "3" {
 		t.Errorf("expected PLAN_STEP=3, got %s", envMap["PLAN_STEP"].Value)
 	}
-	// ANTHROPIC_API_KEY should come from secret
-	if envMap["ANTHROPIC_API_KEY"].ValueFrom == nil || envMap["ANTHROPIC_API_KEY"].ValueFrom.SecretKeyRef == nil {
+	// ANTHROPIC_API_KEY should be optional from secret
+	apiKeyEnv := envMap["ANTHROPIC_API_KEY"]
+	if apiKeyEnv.ValueFrom == nil || apiKeyEnv.ValueFrom.SecretKeyRef == nil {
 		t.Error("expected ANTHROPIC_API_KEY from secret")
+	} else if apiKeyEnv.ValueFrom.SecretKeyRef.Optional == nil || !*apiKeyEnv.ValueFrom.SecretKeyRef.Optional {
+		t.Error("expected ANTHROPIC_API_KEY secret ref to be optional")
+	}
+	// Claude credentials should be mounted as a volume
+	var hasCredentialsMount bool
+	for _, vm := range container.VolumeMounts {
+		if vm.Name == "claude-home" && vm.MountPath == "/home/agent/.claude" {
+			hasCredentialsMount = true
+			break
+		}
+	}
+	if !hasCredentialsMount {
+		t.Error("expected claude-home volume mount at /home/agent/.claude")
+	}
+	var hasCredentialsVolume bool
+	for _, v := range podSpec.Volumes {
+		if v.Name == "claude-credentials" && v.Secret != nil && v.Secret.SecretName == "claude-credentials" {
+			hasCredentialsVolume = true
+			break
+		}
+	}
+	if !hasCredentialsVolume {
+		t.Error("expected claude-credentials volume from secret")
 	}
 	// GITEA_URL should come from configmap
 	if envMap["GITEA_URL"].ValueFrom == nil || envMap["GITEA_URL"].ValueFrom.ConfigMapKeyRef == nil {

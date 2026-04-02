@@ -19,9 +19,22 @@ READY_STATUS_NAME="ready"
 IN_PROGRESS_STATUS_NAME="in progress"
 READY_FOR_TEST_STATUS_NAME="ready for test"
 
-# --- Create superuser via kubectl exec ---
+# --- Wait for Taiga API to be reachable ---
 
-echo "Creating Taiga superuser '${ADMIN_USERNAME}'..."
+echo "Waiting for Taiga API at ${TAIGA_URL}..."
+TIMEOUT=120
+ELAPSED=0
+until curl -sf "${TAIGA_URL}/api/v1/" >/dev/null 2>&1; do
+    if [ "${ELAPSED}" -ge "${TIMEOUT}" ]; then
+        echo "ERROR: Taiga API not reachable at ${TAIGA_URL} after ${TIMEOUT}s"
+        exit 1
+    fi
+    sleep 2
+    ELAPSED=$((ELAPSED + 2))
+done
+echo "Taiga API is reachable."
+
+# --- Create superuser via kubectl exec ---
 
 TAIGA_BACK_POD=$(kubectl get pods -n taiga -l app=taiga-back --no-headers -o custom-columns=":metadata.name" | head -1)
 
@@ -30,7 +43,7 @@ if [ -z "${TAIGA_BACK_POD}" ]; then
     exit 1
 fi
 
-# Create superuser (ignore error if already exists)
+echo "Creating Taiga superuser '${ADMIN_USERNAME}'..."
 kubectl exec -n taiga "${TAIGA_BACK_POD}" -- python manage.py shell -c "
 from django.contrib.auth import get_user_model
 User = get_user_model()
@@ -39,9 +52,8 @@ if not User.objects.filter(username='${ADMIN_USERNAME}').exists():
     print('Superuser created.')
 else:
     print('Superuser already exists.')
-" 2>/dev/null || echo "WARNING: Could not create superuser via kubectl exec."
-
-# --- Create human user with admin powers ---
+"
+echo "  Done."
 
 echo "Creating human user '${HUMAN_USERNAME}' (superuser)..."
 kubectl exec -n taiga "${TAIGA_BACK_POD}" -- python manage.py shell -c "
@@ -59,36 +71,24 @@ else:
         print('Human user promoted to superuser.')
     else:
         print('Human user already exists as superuser.')
-" 2>/dev/null || echo "WARNING: Could not create human user via kubectl exec."
-
-# Wait for API to be reachable
-echo "Waiting for Taiga API at ${TAIGA_URL}..."
-TIMEOUT=60
-ELAPSED=0
-until curl -sf "${TAIGA_URL}/api/v1/" >/dev/null 2>&1; do
-    if [ "${ELAPSED}" -ge "${TIMEOUT}" ]; then
-        echo "ERROR: Taiga API not reachable at ${TAIGA_URL} after ${TIMEOUT}s"
-        exit 1
-    fi
-    sleep 2
-    ELAPSED=$((ELAPSED + 2))
-done
-echo "Taiga API is reachable."
+"
+echo "  Done."
 
 # --- Authenticate ---
 
 echo "Authenticating as '${ADMIN_USERNAME}'..."
-AUTH_RESPONSE=$(curl -sf -X POST "${TAIGA_URL}/api/v1/auth" \
+AUTH_RESPONSE=$(curl -s -X POST "${TAIGA_URL}/api/v1/auth" \
     -H "Content-Type: application/json" \
     -d "{\"type\": \"normal\", \"username\": \"${ADMIN_USERNAME}\", \"password\": \"${ADMIN_PASSWORD}\"}")
 
-AUTH_TOKEN=$(echo "${AUTH_RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['auth_token'])")
+AUTH_TOKEN=$(echo "${AUTH_RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('auth_token',''))" 2>/dev/null)
 
 if [ -z "${AUTH_TOKEN}" ]; then
-    echo "ERROR: Failed to authenticate with Taiga"
+    echo "ERROR: Failed to authenticate with Taiga."
+    echo "  Response: ${AUTH_RESPONSE}"
     exit 1
 fi
-echo "Authenticated."
+echo "  Authenticated."
 
 AUTH_HEADER="Authorization: Bearer ${AUTH_TOKEN}"
 
@@ -97,41 +97,65 @@ AUTH_HEADER="Authorization: Bearer ${AUTH_TOKEN}"
 echo "Creating project '${PROJECT_NAME}'..."
 
 # Check if project already exists
-EXISTING_PROJECT=$(curl -sf -H "${AUTH_HEADER}" "${TAIGA_URL}/api/v1/projects?member=${ADMIN_USERNAME}" \
+EXISTING_PROJECT=$(curl -s -H "${AUTH_HEADER}" "${TAIGA_URL}/api/v1/projects" \
     | python3 -c "
 import sys, json
 projects = json.load(sys.stdin)
 for p in projects:
-    if p['slug'] == '${PROJECT_SLUG}':
+    if p.get('slug') == '${PROJECT_SLUG}':
         print(p['id'])
         break
 " 2>/dev/null || true)
 
+# Resolve Kanban template ID
+KANBAN_TEMPLATE_ID=$(curl -s -H "${AUTH_HEADER}" "${TAIGA_URL}/api/v1/project-templates" \
+    | python3 -c "
+import sys, json
+for t in json.load(sys.stdin):
+    if t.get('slug') == 'kanban':
+        print(t['id'])
+        break
+" 2>/dev/null || true)
+echo "  Kanban template ID: ${KANBAN_TEMPLATE_ID:-not found}"
+
 if [ -n "${EXISTING_PROJECT}" ]; then
     PROJECT_ID="${EXISTING_PROJECT}"
-    echo "Project already exists (ID: ${PROJECT_ID})"
+    echo "  Project already exists (ID: ${PROJECT_ID}), ensuring Kanban mode..."
 else
-    PROJECT_RESPONSE=$(curl -sf -X POST "${TAIGA_URL}/api/v1/projects" \
+    PROJECT_RESPONSE=$(curl -s -X POST "${TAIGA_URL}/api/v1/projects" \
         -H "${AUTH_HEADER}" \
         -H "Content-Type: application/json" \
         -d "{
             \"name\": \"${PROJECT_NAME}\",
             \"description\": \"AI agent development orchestration project\",
-            \"is_backlog_activated\": true,
+            \"creation_template\": ${KANBAN_TEMPLATE_ID:-2},
+            \"is_backlog_activated\": false,
             \"is_kanban_activated\": true,
             \"is_wiki_activated\": false,
             \"is_issues_activated\": false
         }")
-    PROJECT_ID=$(echo "${PROJECT_RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-    echo "Project created (ID: ${PROJECT_ID})"
+    PROJECT_ID=$(echo "${PROJECT_RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+    if [ -z "${PROJECT_ID}" ]; then
+        echo "ERROR: Failed to create project."
+        echo "  Response: ${PROJECT_RESPONSE}"
+        exit 1
+    fi
+    echo "  Project created (ID: ${PROJECT_ID})"
 fi
+
+# Ensure Kanban mode is active (handles both new and existing projects)
+curl -s -X PATCH "${TAIGA_URL}/api/v1/projects/${PROJECT_ID}" \
+    -H "${AUTH_HEADER}" \
+    -H "Content-Type: application/json" \
+    -d '{"is_backlog_activated": false, "is_kanban_activated": true}' >/dev/null
+echo "  Kanban mode enabled."
 
 # --- Configure user story statuses ---
 
 echo "Configuring user story statuses..."
 
 # Get existing statuses
-EXISTING_STATUSES=$(curl -sf -H "${AUTH_HEADER}" \
+EXISTING_STATUSES=$(curl -s -H "${AUTH_HEADER}" \
     "${TAIGA_URL}/api/v1/userstory-statuses?project=${PROJECT_ID}")
 
 # Helper: create or update a status
@@ -152,7 +176,7 @@ for s in statuses:
 " 2>/dev/null || true)
 
     if [ -n "${existing_id}" ]; then
-        curl -sf -X PATCH "${TAIGA_URL}/api/v1/userstory-statuses/${existing_id}" \
+        curl -s -X PATCH "${TAIGA_URL}/api/v1/userstory-statuses/${existing_id}" \
             -H "${AUTH_HEADER}" \
             -H "Content-Type: application/json" \
             -d "{\"name\": \"${name}\", \"order\": ${order}, \"is_closed\": ${is_closed}, \"color\": \"${color}\"}" \
@@ -160,13 +184,17 @@ for s in statuses:
         echo "  Updated status: ${name} (ID: ${existing_id})"
     else
         local response
-        response=$(curl -sf -X POST "${TAIGA_URL}/api/v1/userstory-statuses" \
+        response=$(curl -s -X POST "${TAIGA_URL}/api/v1/userstory-statuses" \
             -H "${AUTH_HEADER}" \
             -H "Content-Type: application/json" \
             -d "{\"name\": \"${name}\", \"project\": ${PROJECT_ID}, \"order\": ${order}, \"is_closed\": ${is_closed}, \"color\": \"${color}\"}")
         local new_id
-        new_id=$(echo "${response}" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-        echo "  Created status: ${name} (ID: ${new_id})"
+        new_id=$(echo "${response}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || true)
+        if [ -n "${new_id}" ]; then
+            echo "  Created status: ${name} (ID: ${new_id})"
+        else
+            echo "  WARNING: Could not create status '${name}': ${response}"
+        fi
     fi
 }
 
@@ -182,7 +210,7 @@ SPECIALIZATIONS=("General" "Frontend" "Backend" "Test" "Documentation" "Operatio
 SWIMLANE_ORDER=1
 
 for spec in "${SPECIALIZATIONS[@]}"; do
-    existing_swimlane=$(curl -sf -H "${AUTH_HEADER}" \
+    existing_swimlane=$(curl -s -H "${AUTH_HEADER}" \
         "${TAIGA_URL}/api/v1/swimlanes?project=${PROJECT_ID}" \
         | python3 -c "
 import sys, json
@@ -193,7 +221,7 @@ for s in json.load(sys.stdin):
 " 2>/dev/null || true)
 
     if [ -z "${existing_swimlane}" ]; then
-        curl -sf -X POST "${TAIGA_URL}/api/v1/swimlanes" \
+        curl -s -X POST "${TAIGA_URL}/api/v1/swimlanes" \
             -H "${AUTH_HEADER}" \
             -H "Content-Type: application/json" \
             -d "{\"name\": \"${spec}\", \"project\": ${PROJECT_ID}, \"order\": ${SWIMLANE_ORDER}}" \
@@ -205,35 +233,34 @@ for s in json.load(sys.stdin):
     SWIMLANE_ORDER=$((SWIMLANE_ORDER + 1))
 done
 
-# --- Add human user as project member ---
+# --- Add human user as project member (via Django ORM) ---
+# The Taiga REST API requires users to be "contacts" before they can be added
+# as project members. Since this is a fresh local setup with no social graph,
+# we bypass the API and create the membership directly via Django ORM.
 
-echo "Adding '${HUMAN_USERNAME}' to project..."
+echo "Adding '${HUMAN_USERNAME}' to project as admin member..."
+kubectl exec -n taiga "${TAIGA_BACK_POD}" -- python manage.py shell -c "
+from taiga.projects.models import Project, Membership
+from taiga.users.models import User
 
-# Get the admin role (highest privilege) for membership
-ADMIN_ROLE_ID=$(curl -sf -H "${AUTH_HEADER}" "${TAIGA_URL}/api/v1/roles?project=${PROJECT_ID}" \
-    | python3 -c "
-import sys, json
-roles = json.load(sys.stdin)
-# Pick the role with the most permissions (typically the first/admin role)
-best = roles[0]
-for r in roles:
-    if len(r.get('permissions', [])) > len(best.get('permissions', [])):
-        best = r
-print(best['id'])
-" 2>/dev/null || true)
+project = Project.objects.get(id=${PROJECT_ID})
+user = User.objects.get(username='${HUMAN_USERNAME}')
+role = project.roles.order_by('-order').first()
 
-if [ -n "${ADMIN_ROLE_ID}" ]; then
-    curl -sf -X POST "${TAIGA_URL}/api/v1/memberships" \
-        -H "${AUTH_HEADER}" \
-        -H "Content-Type: application/json" \
-        -d "{\"project\": ${PROJECT_ID}, \"role\": ${ADMIN_ROLE_ID}, \"username\": \"${HUMAN_USERNAME}\"}" \
-        >/dev/null 2>&1 || true
-    echo "  ${HUMAN_USERNAME} added to project with admin role."
-fi
+if not Membership.objects.filter(project=project, user=user).exists():
+    Membership.objects.create(project=project, user=user, role=role, is_admin=True)
+    print('Membership created with admin privileges.')
+else:
+    m = Membership.objects.get(project=project, user=user)
+    m.is_admin = True
+    m.save()
+    print('Membership updated with admin privileges.')
+"
+echo "  Done."
 
 echo ""
 echo "Taiga initialization complete."
 echo "  URL:      ${TAIGA_URL}"
 echo "  Admin:    ${ADMIN_USERNAME} / ${ADMIN_PASSWORD}"
 echo "  Human:    ${HUMAN_USERNAME} / ${HUMAN_PASSWORD} (superuser)"
-echo "  Project:  ${PROJECT_NAME}"
+echo "  Project:  ${PROJECT_NAME} (ID: ${PROJECT_ID})"

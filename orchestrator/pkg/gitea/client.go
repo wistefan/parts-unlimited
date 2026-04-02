@@ -101,16 +101,18 @@ func (c *Client) GetRepo(owner, name string) (*Repository, error) {
 
 // PullRequest represents a Gitea pull request.
 type PullRequest struct {
-	ID        int    `json:"id"`
-	Number    int    `json:"number"`
-	Title     string `json:"title"`
-	Body      string `json:"body"`
-	State     string `json:"state"`
-	HTMLURL   string `json:"html_url"`
-	Head      PRRef  `json:"head"`
-	Base      PRRef  `json:"base"`
-	Merged    bool   `json:"merged"`
-	Mergeable bool   `json:"mergeable"`
+	ID        int        `json:"id"`
+	Number    int        `json:"number"`
+	Title     string     `json:"title"`
+	Body      string     `json:"body"`
+	State     string     `json:"state"`
+	HTMLURL   string     `json:"html_url"`
+	Head      PRRef      `json:"head"`
+	Base      PRRef      `json:"base"`
+	Merged    bool       `json:"merged"`
+	Mergeable bool       `json:"mergeable"`
+	User      *GiteaUser `json:"user,omitempty"`
+	Assignees []GiteaUser `json:"assignees,omitempty"`
 }
 
 // PRRef represents a branch reference in a pull request.
@@ -361,6 +363,162 @@ func (c *Client) ListBranches(owner, repo string) ([]Branch, error) {
 	}
 
 	return branches, nil
+}
+
+// --- PR Editing ---
+
+// EditPRRequest holds parameters for updating a pull request.
+type EditPRRequest struct {
+	Title     string   `json:"title,omitempty"`
+	Body      string   `json:"body,omitempty"`
+	Assignees []string `json:"assignees,omitempty"`
+}
+
+// EditPullRequest updates a pull request (assignees, title, body).
+func (c *Client) EditPullRequest(owner, repo string, number int, opts *EditPRRequest) (*PullRequest, error) {
+	path := fmt.Sprintf("/api/v1/repos/%s/%s/pulls/%d", owner, repo, number)
+
+	resp, err := c.doRequest(http.MethodPatch, path, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("edit PR #%d: status %d, body: %s", number, resp.StatusCode, body)
+	}
+
+	var pr PullRequest
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		return nil, fmt.Errorf("decoding PR: %w", err)
+	}
+
+	return &pr, nil
+}
+
+// --- PR Diff ---
+
+// GetPRDiff retrieves the diff for a pull request as a string.
+func (c *Client) GetPRDiff(owner, repo string, number int) (string, error) {
+	path := fmt.Sprintf("/api/v1/repos/%s/%s/pulls/%d.diff", owner, repo, number)
+
+	resp, err := c.doRequest(http.MethodGet, path, nil)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("get PR diff #%d: status %d", number, resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading diff: %w", err)
+	}
+
+	return string(data), nil
+}
+
+// --- PR Reviews (read) ---
+
+// PRReview represents a review submitted on a pull request.
+type PRReview struct {
+	ID                int64  `json:"id"`
+	Body              string `json:"body"`
+	State             string `json:"state"` // "APPROVED", "REQUEST_CHANGES", "COMMENT", "PENDING"
+	CommitID          string `json:"commit_id"`
+	Stale             bool   `json:"stale"`
+	CodeCommentsCount int    `json:"code_comments_count"`
+	User              struct {
+		Login string `json:"login"`
+	} `json:"user"`
+}
+
+// GetPRReviews retrieves all reviews on a pull request.
+func (c *Client) GetPRReviews(owner, repo string, prNumber int) ([]PRReview, error) {
+	path := fmt.Sprintf("/api/v1/repos/%s/%s/pulls/%d/reviews", owner, repo, prNumber)
+
+	resp, err := c.doRequest(http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("get PR reviews #%d: status %d", prNumber, resp.StatusCode)
+	}
+
+	var reviews []PRReview
+	if err := json.NewDecoder(resp.Body).Decode(&reviews); err != nil {
+		return nil, fmt.Errorf("decoding reviews: %w", err)
+	}
+
+	return reviews, nil
+}
+
+// ReviewComment represents a code-level comment within a PR review.
+type ReviewComment struct {
+	ID       int64  `json:"id"`
+	Body     string `json:"body"`
+	Path     string `json:"path"`
+	OldLine  int    `json:"old_position"`
+	NewLine  int    `json:"new_position"`
+	DiffHunk string `json:"diff_hunk"`
+	User     struct {
+		Login string `json:"login"`
+	} `json:"user"`
+}
+
+// GetPRReviewComments retrieves the code-level comments for a specific review.
+func (c *Client) GetPRReviewComments(owner, repo string, prNumber int, reviewID int64) ([]ReviewComment, error) {
+	path := fmt.Sprintf("/api/v1/repos/%s/%s/pulls/%d/reviews/%d/comments", owner, repo, prNumber, reviewID)
+
+	resp, err := c.doRequest(http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("get review comments for review %d on PR #%d: status %d", reviewID, prNumber, resp.StatusCode)
+	}
+
+	var comments []ReviewComment
+	if err := json.NewDecoder(resp.Body).Decode(&comments); err != nil {
+		return nil, fmt.Errorf("decoding review comments: %w", err)
+	}
+
+	return comments, nil
+}
+
+// --- Webhooks ---
+
+// CreateHookRequest holds parameters for creating a webhook.
+type CreateHookRequest struct {
+	Type   string            `json:"type"` // "gitea"
+	Config map[string]string `json:"config"`
+	Events []string          `json:"events"`
+	Active bool              `json:"active"`
+}
+
+// CreateRepoWebhook registers a webhook on a repository.
+func (c *Client) CreateRepoWebhook(owner, repo string, hook *CreateHookRequest) error {
+	path := fmt.Sprintf("/api/v1/repos/%s/%s/hooks", owner, repo)
+
+	resp, err := c.doRequest(http.MethodPost, path, hook)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("create webhook on %s/%s: status %d, body: %s", owner, repo, resp.StatusCode, body)
+	}
+
+	return nil
 }
 
 // --- Internal helpers ---

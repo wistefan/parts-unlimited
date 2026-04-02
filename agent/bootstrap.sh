@@ -13,13 +13,20 @@
 #   TAIGA_URL              - Taiga base URL
 #   TAIGA_USERNAME         - Taiga username for this agent
 #   TAIGA_PASSWORD         - Taiga password for this agent
-#   ANTHROPIC_API_KEY      - Anthropic API key for Claude
+#
+# Claude credentials are provided via a mounted file at
+# /home/agent/.claude/.credentials.json (from K8s Secret).
 #
 # Optional environment variables:
+#   MODE                   - Agent mode: analysis, plan, step, fix (default: step)
 #   PLAN_STEP              - Implementation plan step number to work on
 #   REPO_OWNER             - Gitea repo owner (extracted from ticket if not set)
 #   REPO_NAME              - Gitea repo name (extracted from ticket if not set)
 #   ALLOWED_TOOLS          - Space-separated list of allowed Claude tools
+#   HUMAN_USERNAME         - Taiga username of the human user (for reassignment)
+#   HUMAN_TAIGA_ID         - Taiga user ID of the human user (for reassignment)
+#   PR_NUMBER              - PR number to fix (fix mode only)
+#   PR_REPO                - "{owner}/{repo}" of the PR (fix mode only)
 
 set -euo pipefail
 
@@ -33,8 +40,9 @@ REQUIRED_VARS=(
     TICKET_ID AGENT_ID AGENT_SPECIALIZATION
     GITEA_URL GITEA_USERNAME GITEA_PASSWORD
     TAIGA_URL TAIGA_USERNAME TAIGA_PASSWORD
-    ANTHROPIC_API_KEY
 )
+
+CLAUDE_CREDENTIALS="/home/agent/.claude-secret/.credentials.json"
 
 for var in "${REQUIRED_VARS[@]}"; do
     if [ -z "${!var:-}" ]; then
@@ -43,8 +51,67 @@ for var in "${REQUIRED_VARS[@]}"; do
     fi
 done
 
+if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ ! -f "${CLAUDE_CREDENTIALS}" ]; then
+    echo "ERROR: No Claude credentials found."
+    echo "  Provide either ANTHROPIC_API_KEY env var or mount credentials at ${CLAUDE_CREDENTIALS}."
+    exit 1
+fi
+
+MODE="${MODE:-step}"
 PLAN_STEP="${PLAN_STEP:-}"
 ALLOWED_TOOLS="${ALLOWED_TOOLS:-Read Edit Write Glob Grep Bash}"
+HUMAN_USERNAME="${HUMAN_USERNAME:-}"
+HUMAN_TAIGA_ID="${HUMAN_TAIGA_ID:-}"
+PR_NUMBER="${PR_NUMBER:-}"
+PR_REPO="${PR_REPO:-}"
+
+# --- Helper: request human input and exit cleanly ---
+
+# Posts a comment on the ticket, reassigns to the human user, and exits 0.
+# Usage: request_human_input <comment_text>
+request_human_input() {
+    local comment="$1"
+    local version
+
+    # Fetch current ticket version
+    version=$(curl -s -H "${TAIGA_AUTH_HEADER}" \
+        "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
+        | jq -r '.version') || true
+
+    if [ -z "${version}" ] || [ "${version}" = "null" ]; then
+        echo "WARNING: Could not fetch ticket version."
+        echo ""
+        echo "=== Agent Worker Complete (awaiting human input) ==="
+        exit 0
+    fi
+
+    # Build the patch payload: always include comment, optionally reassign
+    local patch_data
+    if [ -n "${HUMAN_TAIGA_ID}" ]; then
+        patch_data="{\"comment\": $(echo "${comment}" | jq -Rs .), \"assigned_to\": ${HUMAN_TAIGA_ID}, \"version\": ${version}}"
+    else
+        patch_data="{\"comment\": $(echo "${comment}" | jq -Rs .), \"version\": ${version}}"
+    fi
+
+    local response
+    response=$(curl -s -w "\n%{http_code}" -X PATCH "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
+        -H "${TAIGA_AUTH_HEADER}" \
+        -H "Content-Type: application/json" \
+        -d "${patch_data}") || true
+
+    local http_code
+    http_code=$(echo "${response}" | tail -1)
+    if [ "${http_code}" = "200" ]; then
+        echo "  Comment posted and ticket reassigned to ${HUMAN_USERNAME:-human}."
+    else
+        echo "WARNING: Ticket update failed (HTTP ${http_code})."
+        echo "  Response: $(echo "${response}" | head -n -1)"
+    fi
+
+    echo ""
+    echo "=== Agent Worker Complete (awaiting human input) ==="
+    exit 0
+}
 
 echo "=== Agent Worker Bootstrap ==="
 echo "  Agent:          ${AGENT_ID}"
@@ -56,6 +123,9 @@ echo "  Plan step:      ${PLAN_STEP:-none}"
 
 git config --global user.name "${AGENT_ID}"
 git config --global user.email "${AGENT_ID}@dev-env.local"
+# The workspace emptyDir volume is created by kubelet (root-owned) but the
+# container runs as UID 1000.  Mark it safe so git does not refuse to operate.
+git config --global --add safe.directory "${WORKSPACE}"
 
 # --- Authenticate with Taiga ---
 
@@ -87,36 +157,170 @@ echo "  Subject: ${TICKET_SUBJECT}"
 echo "  Tags:    ${TICKET_TAGS:-none}"
 
 # --- Fetch ticket comments ---
+#
+# To reduce token usage, we only pass relevant context to the agent:
+#   1. The last agent comment (which should contain a cumulative context summary)
+#   2. Any human comments posted after it (new input the agent needs to see)
+# This gives full context in a fraction of the tokens.
 
 echo "Fetching ticket comments..."
-COMMENTS=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
+ALL_COMMENTS=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
     "${TAIGA_URL}/api/v1/history/userstory/${TICKET_ID}" \
-    | jq -r '[.[] | select(.comment != null and .comment != "") | {user: .user.username, comment: .comment, date: .created_at}]')
-COMMENT_COUNT=$(echo "${COMMENTS}" | jq 'length')
-echo "  Comments: ${COMMENT_COUNT}"
+    | jq -r '[.[] | select(.comment != null and .comment != "" and .delete_comment_date == null) | {user: .user.username, comment: .comment, date: .created_at}]')
+COMMENT_COUNT=$(echo "${ALL_COMMENTS}" | jq 'length')
+echo "  Total comments: ${COMMENT_COUNT}"
+
+# Find the index of the last agent comment (any user containing "-agent-").
+# Comments are returned newest-first by Taiga; we sort oldest-first for indexing.
+COMMENTS_ASC=$(echo "${ALL_COMMENTS}" | jq 'sort_by(.date)')
+LAST_AGENT_IDX=$(echo "${COMMENTS_ASC}" | jq '[.[] | .user] | to_entries | map(select(.value | contains("-agent-"))) | last | .key // -1')
+
+if [ "${LAST_AGENT_IDX}" -ge 0 ] 2>/dev/null; then
+    # Extract: the last agent comment + all comments after it (human input)
+    COMMENTS=$(echo "${COMMENTS_ASC}" | jq --argjson idx "${LAST_AGENT_IDX}" '.[$idx:]')
+    RELEVANT_COUNT=$(echo "${COMMENTS}" | jq 'length')
+    echo "  Relevant comments (last agent + newer): ${RELEVANT_COUNT}"
+else
+    # No agent comments yet — pass latest 5 for initial context
+    COMMENTS=$(echo "${COMMENTS_ASC}" | jq '.[-5:]')
+    echo "  No prior agent comments, using latest 5"
+fi
 
 # --- Determine repo from ticket or env ---
+
+# Extracts the repo reference from a ticket description line.
+# Handles plain owner/name, full URLs, and markdown-formatted links.
+# Outputs the cleaned value (URL or owner/name) to stdout.
+extract_repo_ref() {
+    local desc="$1"
+    # Grab everything after "repo:" or "gitea:" (case-insensitive)
+    local raw
+    raw=$(echo "${desc}" | grep -oP '(?i)(?:repo|gitea)\s*:\s*\K.*' | head -1 || true)
+    [ -z "${raw}" ] && return
+
+    # Strip leading/trailing whitespace
+    raw=$(echo "${raw}" | sed -E 's/^\s+//;s/\s+$//')
+
+    # Strip markdown link syntax: [text](url) → url
+    if echo "${raw}" | grep -qP '^\[.*\]\(.*\)'; then
+        raw=$(echo "${raw}" | sed -E 's/^\[([^]]*)\]\(([^)]*)\).*/\2/')
+    fi
+    # Strip bare markdown brackets: [url] → url
+    raw=$(echo "${raw}" | sed -E 's/^\[([^]]*)\]$/\1/')
+    # Strip angle brackets: <url> → url
+    raw=$(echo "${raw}" | sed 's/^<//;s/>$//')
+    # Take only the first whitespace-delimited token (drop trailing comments etc.)
+    raw=$(echo "${raw}" | awk '{print $1}')
+
+    echo "${raw}"
+}
 
 if [ -n "${REPO_OWNER:-}" ] && [ -n "${REPO_NAME:-}" ]; then
     echo "Using repo from environment: ${REPO_OWNER}/${REPO_NAME}"
 else
-    # Try to extract repo info from ticket description
-    # Expected format: repo owner/name or a Gitea URL
-    REPO_MATCH=$(echo "${TICKET_DESCRIPTION}" | grep -oP '(?:repo|gitea)[:\s]+\K\S+/\S+' | head -1 || true)
-    if [ -n "${REPO_MATCH}" ]; then
-        REPO_OWNER=$(echo "${REPO_MATCH}" | cut -d/ -f1)
-        REPO_NAME=$(echo "${REPO_MATCH}" | cut -d/ -f2)
+    REPO_REF=$(extract_repo_ref "${TICKET_DESCRIPTION}")
+
+    if [ -z "${REPO_REF}" ]; then
+        echo "Cannot determine target repository — requesting human input."
+        request_human_input "Cannot determine the target repository. Please specify the repository in the description (e.g., \`repo: owner/name\`) or provide it in a comment."
+    elif echo "${REPO_REF}" | grep -qP '^https?://'; then
+        # Remote URL — import into local Gitea
+        REMOTE_URL="${REPO_REF}"
+        CLEAN_URL="${REMOTE_URL%.git}"
+        CLEAN_URL="${CLEAN_URL%/}"
+        REPO_NAME=$(basename "${CLEAN_URL}")
+        REPO_OWNER="${GITEA_USERNAME}"
+
+        echo "Detected remote repository: ${REMOTE_URL}"
+        echo "Importing into Gitea as ${REPO_OWNER}/${REPO_NAME}..."
+
+        if curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+            "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}" > /dev/null 2>&1; then
+            echo "  Repo already exists in Gitea."
+        else
+            MIGRATE_RESPONSE=$(curl -s -w "\n%{http_code}" \
+                -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+                -X POST "${GITEA_URL}/api/v1/repos/migrate" \
+                -H "Content-Type: application/json" \
+                -d "{
+                    \"clone_addr\": \"${REMOTE_URL}\",
+                    \"repo_name\": \"${REPO_NAME}\",
+                    \"repo_owner\": \"${REPO_OWNER}\",
+                    \"service\": \"git\",
+                    \"mirror\": false
+                }")
+            MIGRATE_CODE=$(echo "${MIGRATE_RESPONSE}" | tail -1)
+            if [ "${MIGRATE_CODE}" = "201" ] || [ "${MIGRATE_CODE}" = "200" ]; then
+                echo "  Migration accepted — waiting for import to finish..."
+            else
+                echo "ERROR: Failed to import repo from ${REMOTE_URL} (HTTP ${MIGRATE_CODE})"
+                echo "  Response: $(echo "${MIGRATE_RESPONSE}" | head -n -1)"
+                request_human_input "Failed to import repository from \`${REMOTE_URL}\` into Gitea (HTTP ${MIGRATE_CODE}). Please create it manually or check the URL."
+            fi
+        fi
+
+        # Gitea migrations can be async.  Poll until the repo is cloneable
+        # (i.e. its default branch exists) or until we time out.
+        MIGRATE_WAIT_MAX=60
+        MIGRATE_WAIT=0
+        MIGRATE_POLL_INTERVAL=3
+        while [ "${MIGRATE_WAIT}" -lt "${MIGRATE_WAIT_MAX}" ]; do
+            REPO_STATUS=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+                "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}" 2>/dev/null || true)
+            if [ -n "${REPO_STATUS}" ]; then
+                REPO_EMPTY=$(echo "${REPO_STATUS}" | jq -r '.empty')
+                if [ "${REPO_EMPTY}" = "false" ]; then
+                    echo "  Repo ready."
+                    break
+                fi
+            fi
+            sleep "${MIGRATE_POLL_INTERVAL}"
+            MIGRATE_WAIT=$((MIGRATE_WAIT + MIGRATE_POLL_INTERVAL))
+            echo "  Waiting for migration to complete... (${MIGRATE_WAIT}s/${MIGRATE_WAIT_MAX}s)"
+        done
+        if [ "${MIGRATE_WAIT}" -ge "${MIGRATE_WAIT_MAX}" ]; then
+            echo "ERROR: Migration did not complete within ${MIGRATE_WAIT_MAX}s."
+            request_human_input "Repository migration from \`${REMOTE_URL}\` timed out. The repo may still be importing — check Gitea and retry."
+        fi
+
+        echo "Using imported repo: ${REPO_OWNER}/${REPO_NAME}"
+    elif echo "${REPO_REF}" | grep -q '/'; then
+        # Local owner/name format
+        REPO_OWNER=$(echo "${REPO_REF}" | cut -d/ -f1)
+        REPO_NAME=$(echo "${REPO_REF}" | cut -d/ -f2)
         echo "Extracted repo from description: ${REPO_OWNER}/${REPO_NAME}"
     else
-        echo "ERROR: Cannot determine target repository."
-        echo "  Set REPO_OWNER and REPO_NAME, or include 'repo: owner/name' in the ticket description."
-        # Post a comment asking for the repo
-        curl -sf -X PATCH "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
-            -H "${TAIGA_AUTH_HEADER}" \
-            -H "Content-Type: application/json" \
-            -d "{\"comment\": \"Cannot determine the target repository. Please specify the repository in the description (e.g., \`repo: owner/name\`).\", \"version\": ${TICKET_VERSION}}" \
-            >/dev/null 2>&1 || true
-        exit 1
+        # Plain repo name — greenfield project.  Create under the agent's
+        # own Gitea identity if it does not exist yet.
+        REPO_NAME="${REPO_REF}"
+        REPO_OWNER="${GITEA_USERNAME}"
+        echo "Detected plain repo name: ${REPO_NAME}"
+
+        if curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+            "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}" > /dev/null 2>&1; then
+            echo "  Repo ${REPO_OWNER}/${REPO_NAME} already exists in Gitea."
+        else
+            echo "Creating new repo ${REPO_OWNER}/${REPO_NAME} in Gitea..."
+            CREATE_RESPONSE=$(curl -s -w "\n%{http_code}" \
+                -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+                -X POST "${GITEA_URL}/api/v1/user/repos" \
+                -H "Content-Type: application/json" \
+                -d "{
+                    \"name\": \"${REPO_NAME}\",
+                    \"auto_init\": true,
+                    \"default_branch\": \"main\"
+                }")
+            CREATE_CODE=$(echo "${CREATE_RESPONSE}" | tail -1)
+            if [ "${CREATE_CODE}" = "201" ]; then
+                echo "  Created repo ${REPO_OWNER}/${REPO_NAME}"
+            else
+                echo "ERROR: Failed to create repo ${REPO_NAME} (HTTP ${CREATE_CODE})"
+                echo "  Response: $(echo "${CREATE_RESPONSE}" | head -n -1)"
+                request_human_input "Failed to create repository \`${REPO_NAME}\` in Gitea (HTTP ${CREATE_CODE}). Please create it manually."
+            fi
+        fi
+
+        echo "Using repo: ${REPO_OWNER}/${REPO_NAME}"
     fi
 fi
 
@@ -133,22 +337,66 @@ mkdir -p "${WORKSPACE}"
 git clone "${CLONE_URL}" "${WORKSPACE}"
 cd "${WORKSPACE}"
 
+# --- Extract base branch from ticket (optional "base: <branch>" field) ---
+
+extract_base_branch() {
+    local desc="$1"
+    local raw
+    raw=$(echo "${desc}" | grep -oP '(?i)base\s*:\s*\K\S+' | head -1 || true)
+    echo "${raw}"
+}
+
+BASE_BRANCH=$(extract_base_branch "${TICKET_DESCRIPTION}")
+BASE_BRANCH="${BASE_BRANCH:-main}"
+echo "Base branch: ${BASE_BRANCH}"
+
 # --- Determine branch ---
 
-BRANCH_PREFIX="agent/${AGENT_ID}/ticket-${TICKET_ID}"
-if [ -n "${PLAN_STEP}" ]; then
-    BRANCH_NAME="${BRANCH_PREFIX}/step-${PLAN_STEP}"
-else
-    BRANCH_NAME="${BRANCH_PREFIX}/work"
+BRANCH_PREFIX="ticket-${TICKET_ID}"
+case "${MODE}" in
+    analysis)
+        # Analysis mode may not need a branch (works on default branch).
+        BRANCH_NAME=""
+        ;;
+    plan)
+        BRANCH_NAME="${BRANCH_PREFIX}/plan"
+        ;;
+    fix)
+        # Fix mode: check out the existing PR branch (bootstrap determines it later
+        # from the PR data).  Set a placeholder — overridden after PR fetch.
+        BRANCH_NAME=""
+        ;;
+    step|*)
+        if [ -n "${PLAN_STEP}" ]; then
+            BRANCH_NAME="${BRANCH_PREFIX}/step-${PLAN_STEP}"
+        else
+            BRANCH_NAME="${BRANCH_PREFIX}/work"
+        fi
+        ;;
+esac
+
+# Ensure the work branch exists (all modes except analysis branch off it)
+WORK_BRANCH="${BRANCH_PREFIX}/work"
+if [ "${MODE}" != "analysis" ]; then
+    if git ls-remote --heads origin "${WORK_BRANCH}" | grep -q "${WORK_BRANCH}"; then
+        echo "Work branch exists: ${WORK_BRANCH}"
+        git fetch origin "${WORK_BRANCH}"
+    else
+        echo "Creating work branch: ${WORK_BRANCH} from ${BASE_BRANCH}"
+        git checkout -b "${WORK_BRANCH}" "origin/${BASE_BRANCH}"
+        git push -u origin "${WORK_BRANCH}"
+    fi
 fi
 
-# Check if branch already exists (resuming previous work)
-if git ls-remote --heads origin "${BRANCH_NAME}" | grep -q "${BRANCH_NAME}"; then
-    echo "Resuming work on existing branch: ${BRANCH_NAME}"
-    git checkout "${BRANCH_NAME}"
-else
-    echo "Creating new branch: ${BRANCH_NAME}"
-    git checkout -b "${BRANCH_NAME}"
+# Check out or create the target branch
+if [ -n "${BRANCH_NAME}" ]; then
+    if git ls-remote --heads origin "${BRANCH_NAME}" | grep -q "${BRANCH_NAME}"; then
+        echo "Resuming work on existing branch: ${BRANCH_NAME}"
+        git checkout "${BRANCH_NAME}"
+    else
+        echo "Creating new branch: ${BRANCH_NAME} from ${WORK_BRANCH}"
+        git checkout -b "${BRANCH_NAME}" "origin/${WORK_BRANCH}"
+    fi
 fi
 
 # --- Read implementation plan if it exists ---
@@ -166,23 +414,109 @@ done
 
 echo "Building task prompt..."
 
+# Build the mode-specific instructions section
+MODE_INSTRUCTIONS=""
+case "${MODE}" in
+    analysis)
+        MODE_INSTRUCTIONS="You are an analysis agent. Evaluate this ticket and determine if it is clear enough to create an implementation plan.
+
+Your ONLY task is to write /home/agent/completion-status.json with your analysis.
+Do NOT write code, create branches, or make commits.
+
+If the ticket is clear enough to proceed:
+\`\`\`json
+{
+  \"status\": \"success\",
+  \"summary\": \"Analysis complete: ticket is ready for implementation planning.\",
+  \"analysis_result\": \"proceed\",
+  \"analysis_comment\": \"[analysis:proceed]\\n\\n**Analysis Summary:**\\n<your understanding>\\n\\n**Repositories:** <repos>\\n**Base branch:** <branch>\\n**Estimated steps:** <number>\"
+}
+\`\`\`
+
+If more information is needed:
+\`\`\`json
+{
+  \"status\": \"blocked\",
+  \"reason\": \"Additional information required: <summary>\",
+  \"analysis_result\": \"need-info\",
+  \"analysis_comment\": \"[analysis:need-info]\\n\\n**Missing Information:**\\n<specific questions>\"
+}
+\`\`\`"
+        ;;
+    plan)
+        MODE_INSTRUCTIONS="You are a planning agent. Create an implementation plan for this ticket.
+
+Write IMPLEMENTATION_PLAN.md in the repo root with steps using \`### Step N: Title\` format.
+Commit the plan. Do not implement any code.
+
+When done, write /home/agent/completion-status.json:
+\`\`\`json
+{
+  \"status\": \"success\",
+  \"summary\": \"Implementation plan created with N steps.\",
+  \"taiga_comment\": \"[phase:plan-created]\\n\\n**Steps:** N\\n**Summary:** <one-line summary>\"
+}
+\`\`\`"
+        ;;
+    fix)
+        MODE_INSTRUCTIONS="You are a fix agent. Address the review comments on the existing PR.
+
+Review the PR diff and comments below. Fix every issue raised.
+Commit your changes. Do not create new branches or PRs.
+
+When done, write /home/agent/completion-status.json:
+\`\`\`json
+{
+  \"status\": \"success\",
+  \"summary\": \"Addressed N review comments on PR #${PR_NUMBER}.\",
+  \"taiga_comment\": \"[fix:applied]\\n\\nAddressed review feedback on PR #${PR_NUMBER}: <summary>\"
+}
+\`\`\`"
+        ;;
+    step|*)
+        MODE_INSTRUCTIONS="You are a step implementation agent. Implement the next step from the implementation plan.
+
+Read IMPLEMENTATION_PLAN.md, determine which step to work on next, implement it.
+Create a step branch, commit, and follow the plan.
+
+When done, write /home/agent/completion-status.json:
+If more steps remain:
+\`\`\`json
+{
+  \"status\": \"success\",
+  \"summary\": \"Implemented step N of M: <title>\",
+  \"taiga_comment\": \"[step:N/M]\\n\\nCompleted step N of M: <title>\\n\\n**Summary:** <description>\"
+}
+\`\`\`
+If this was the last step:
+\`\`\`json
+{
+  \"status\": \"success\",
+  \"summary\": \"All steps complete.\",
+  \"taiga_comment\": \"[step:complete]\\n\\nAll steps completed.\\n\\n**Release Notes:**\\n<summary of all changes>\"
+}
+\`\`\`"
+        ;;
+esac
+
 cat > "${PROMPT_FILE}" <<PROMPT_EOF
 # Task Assignment
 
 ## Agent Identity
 - **Agent:** ${AGENT_ID}
 - **Specialization:** ${AGENT_SPECIALIZATION}
+- **Mode:** ${MODE}
 
 ## Ticket
 - **ID:** ${TICKET_ID}
 - **Subject:** ${TICKET_SUBJECT}
-$([ -n "${PLAN_STEP}" ] && echo "- **Plan Step:** ${PLAN_STEP}")
+$([ -n "${PLAN_STEP}" ] && echo "- **Plan Step:** ${PLAN_STEP}" || true)
 
 ## Ticket Description
 
 ${TICKET_DESCRIPTION}
 
-## Ticket Comments
+## Ticket Comments (last agent context + new human input)
 
 $(echo "${COMMENTS}" | jq -r '.[] | "**\(.user)** (\(.date)):\n\(.comment)\n"' 2>/dev/null || echo "No comments.")
 
@@ -195,57 +529,65 @@ PLAN_SECTION
 
 ## Instructions
 
-You are an autonomous coding agent. Your task is to implement the work described in the ticket above.
-
-Guidelines:
-- Follow the implementation plan if one exists. Work on step ${PLAN_STEP:-"as described in the ticket"}.
-- Write clean, well-documented code following the language's best practices.
-- Every public method and class must be documented.
-- Never use magic constants — define named constants.
-- Use parameterized tests where possible.
-- Include sufficient tests to verify your work.
-- Run tests and linters before finishing.
-- Commit your work with clear, descriptive commit messages.
-- Do not push to remote — the bootstrap script handles that.
-
-When you are done, create a file at /home/agent/completion-status.json with:
-\`\`\`json
-{
-  "status": "success",
-  "summary": "Brief description of what was done",
-  "files_changed": ["list", "of", "files"]
-}
-\`\`\`
-
-If you encounter a blocking issue, create the file with:
-\`\`\`json
-{
-  "status": "blocked",
-  "reason": "Description of the blocking issue"
-}
-\`\`\`
+${MODE_INSTRUCTIONS}
 PROMPT_EOF
 
 echo "  Prompt written to ${PROMPT_FILE}"
 
-# --- Load system prompt template ---
+# --- Load system prompt template (mode-specific) ---
 
 SYSTEM_PROMPT=""
-if [ -f "/home/agent/system-prompt.md" ]; then
+SYSTEM_PROMPT_FILE="/home/agent/system-prompt-${MODE}.md"
+if [ -f "${SYSTEM_PROMPT_FILE}" ]; then
+    SYSTEM_PROMPT=$(cat "${SYSTEM_PROMPT_FILE}")
+    echo "  Using mode-specific system prompt: ${SYSTEM_PROMPT_FILE}"
+elif [ -f "/home/agent/system-prompt.md" ]; then
     SYSTEM_PROMPT=$(cat /home/agent/system-prompt.md)
+    echo "  Using default system prompt"
+fi
+
+# --- Append CLAUDE.md to system prompt for prompt caching ---
+# Claude Code caches the system prompt prefix across all turns in a session.
+# By including CLAUDE.md here (instead of letting the agent read it via a tool
+# call), the codebase context stays in the cached prefix from turn 1 — saving
+# significant input tokens on every subsequent turn.
+
+CLAUDE_MD="${WORKSPACE}/CLAUDE.md"
+if [ -f "${CLAUDE_MD}" ]; then
+    CLAUDE_MD_SIZE=$(wc -c < "${CLAUDE_MD}")
+    SYSTEM_PROMPT="${SYSTEM_PROMPT}
+
+# Codebase Context (CLAUDE.md)
+
+$(cat "${CLAUDE_MD}")"
+    echo "  CLAUDE.md appended to system prompt (${CLAUDE_MD_SIZE} bytes)"
 fi
 
 # --- Invoke Claude Code ---
+
+# Copy credentials into the writable .claude directory (mounted as emptyDir).
+# The secret is mounted separately; we copy the file so Claude Code has a
+# fully writable ~/.claude for session-env and other runtime files.
+CRED_SECRET="/home/agent/.claude-secret/.credentials.json"
+if [ -f "${CRED_SECRET}" ]; then
+    cp "${CRED_SECRET}" /home/agent/.claude/.credentials.json
+    echo "  Credentials copied to ~/.claude/"
+fi
+mkdir -p /home/agent/.claude/session-env
 
 echo "Invoking Claude Code..."
 
 CLAUDE_ARGS=(
     -p
     --dangerously-skip-permissions
-    --bare
-    --no-session-persistence
-    --output-format json
+    --output-format stream-json
+    --verbose
 )
+
+if [ -n "${CLAUDE_MODEL:-}" ]; then
+    CLAUDE_ARGS+=(--model "${CLAUDE_MODEL}")
+    echo "  Model: ${CLAUDE_MODEL}"
+fi
 
 if [ -n "${SYSTEM_PROMPT}" ]; then
     CLAUDE_ARGS+=(--system-prompt "${SYSTEM_PROMPT}")
@@ -256,11 +598,180 @@ if [ -n "${ALLOWED_TOOLS}" ]; then
     CLAUDE_ARGS+=(--allowedTools "${ALLOWED_TOOLS}")
 fi
 
-TASK_PROMPT=$(cat "${PROMPT_FILE}")
+# --- Session chaining ---
+#
+# Running one long Claude session accumulates context across all turns.
+# At 200+ turns the cache reads alone can cost $20+.  Session chaining
+# breaks the work into bounded sessions (default: 50 turns each).  After
+# each session the bootstrap extracts a context summary from the last
+# assistant message and feeds it into the NEXT session's prompt, so the
+# agent picks up where it left off with a fresh, compact context.
+#
+# The task is done when the agent writes completion-status.json.
 
-claude "${CLAUDE_ARGS[@]}" "${TASK_PROMPT}" > "${RESULT_FILE}" 2>&1 || true
+TURNS_PER_SESSION="${TURNS_PER_SESSION:-50}"
+MAX_SESSIONS="${MAX_SESSIONS:-20}"
 
-echo "Claude Code finished."
+# extract_context_summary <result_file>
+# Pulls the last assistant text block from stream-json output.  The agent
+# is instructed to end with a "### Context Summary" section; if present we
+# use that, otherwise we take the last 2000 chars of assistant text.
+extract_context_summary() {
+    python3 -c "
+import json, sys
+
+last_text = ''
+for line in open('$1'):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except:
+        continue
+    if msg.get('type') != 'assistant':
+        continue
+    for block in msg.get('message', {}).get('content', []):
+        if block.get('type') == 'text':
+            last_text = block['text']
+
+# Prefer the Context Summary section if present
+idx = last_text.rfind('### Context Summary')
+if idx >= 0:
+    print(last_text[idx:])
+elif last_text:
+    print(last_text[-2000:])
+" 2>/dev/null || true
+}
+
+echo "  Claude args: ${CLAUDE_ARGS[*]}"
+echo "  Prompt size: $(wc -c < "${PROMPT_FILE}") bytes"
+echo "  Session chaining: ${TURNS_PER_SESSION} turns/session, max ${MAX_SESSIONS} sessions"
+
+CLAUDE_EXIT=0
+SESSION_NUM=0
+CUMULATIVE_RESULT="${RESULT_FILE}"
+SESSION_CONTEXT=""
+> "${CUMULATIVE_RESULT}"  # initialize empty
+
+while [ "${SESSION_NUM}" -lt "${MAX_SESSIONS}" ]; do
+    SESSION_NUM=$((SESSION_NUM + 1))
+
+    # Build per-session prompt: original task + context from previous session
+    SESSION_PROMPT_FILE="/home/agent/session-prompt.md"
+    if [ -n "${SESSION_CONTEXT}" ]; then
+        {
+            cat "${PROMPT_FILE}"
+            echo ""
+            echo "## Previous Session Context"
+            echo ""
+            echo "You are continuing work from a previous session. Here is where you left off:"
+            echo ""
+            echo "${SESSION_CONTEXT}"
+        } > "${SESSION_PROMPT_FILE}"
+        echo "  Session ${SESSION_NUM}: continuing with $(echo "${SESSION_CONTEXT}" | wc -c) bytes of context"
+    else
+        cp "${PROMPT_FILE}" "${SESSION_PROMPT_FILE}"
+        echo "  Session ${SESSION_NUM}: initial session"
+    fi
+
+    # Run Claude with a per-session turn limit
+    SESSION_RESULT="/home/agent/session-result-${SESSION_NUM}.json"
+    CLAUDE_EXIT=0
+    claude "${CLAUDE_ARGS[@]}" --max-turns "${TURNS_PER_SESSION}" \
+        < "${SESSION_PROMPT_FILE}" > "${SESSION_RESULT}" 2>&1 || CLAUDE_EXIT=$?
+
+    echo "  Session ${SESSION_NUM} finished (exit ${CLAUDE_EXIT}, $(wc -c < "${SESSION_RESULT}" 2>/dev/null || echo 0) bytes)"
+
+    # Append session result to cumulative result for usage tracking
+    cat "${SESSION_RESULT}" >> "${CUMULATIVE_RESULT}"
+
+    # Check if the agent completed its task
+    if [ -f "/home/agent/completion-status.json" ]; then
+        echo "  Task completed in session ${SESSION_NUM}."
+        break
+    fi
+
+    # Non-zero exit without completion means Claude hit the turn limit
+    # or encountered an issue — extract context and continue
+    SESSION_CONTEXT=$(extract_context_summary "${SESSION_RESULT}")
+    if [ -z "${SESSION_CONTEXT}" ]; then
+        echo "  WARNING: Could not extract context summary from session ${SESSION_NUM}. Stopping."
+        break
+    fi
+done
+
+if [ "${SESSION_NUM}" -ge "${MAX_SESSIONS}" ] && [ ! -f "/home/agent/completion-status.json" ]; then
+    echo "  WARNING: Reached max sessions (${MAX_SESSIONS}) without completing task."
+fi
+
+echo "Claude Code finished after ${SESSION_NUM} session(s) (last exit code: ${CLAUDE_EXIT})."
+
+# Show a summary of Claude's output for debugging
+RESULT_SIZE=$(wc -c < "${CUMULATIVE_RESULT}" 2>/dev/null || echo "0")
+echo "  Result file: ${RESULT_SIZE} bytes"
+if [ "${RESULT_SIZE}" -lt 500 ]; then
+    echo "  Result content:"
+    cat "${CUMULATIVE_RESULT}" || true
+elif [ "${CLAUDE_EXIT}" -ne 0 ]; then
+    echo "  Last 20 lines of result:"
+    tail -20 "${CUMULATIVE_RESULT}" || true
+fi
+
+# --- Extract token usage ---
+
+USAGE_SUMMARY=""
+if [ -f "${RESULT_FILE}" ]; then
+    USAGE_SUMMARY=$(python3 -c "
+import json, sys
+
+input_tok = 0
+output_tok = 0
+cache_write = 0
+cache_read = 0
+turns = 0
+
+for line in open('${RESULT_FILE}'):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except:
+        continue
+    if msg.get('type') != 'assistant':
+        continue
+    usage = msg.get('message', {}).get('usage', {})
+    if not usage:
+        continue
+    turns += 1
+    input_tok += usage.get('input_tokens', 0)
+    output_tok += usage.get('output_tokens', 0)
+    cache_write += usage.get('cache_creation_input_tokens', 0)
+    cache_read += usage.get('cache_read_input_tokens', 0)
+
+# Opus pricing: input \$15/MTok, output \$75/MTok, cache_write \$18.75/MTok, cache_read \$1.50/MTok
+i_cost = input_tok * 15 / 1_000_000
+o_cost = output_tok * 75 / 1_000_000
+cw_cost = cache_write * 18.75 / 1_000_000
+cr_cost = cache_read * 1.50 / 1_000_000
+total = i_cost + o_cost + cw_cost + cr_cost
+
+print(f'| Metric | Tokens | Est. Cost |')
+print(f'|---|---:|---:|')
+print(f'| Input | {input_tok:,} | \${i_cost:.2f} |')
+print(f'| Output | {output_tok:,} | \${o_cost:.2f} |')
+print(f'| Cache write | {cache_write:,} | \${cw_cost:.2f} |')
+print(f'| Cache read | {cache_read:,} | \${cr_cost:.2f} |')
+print(f'| **Total** | | **\${total:.2f}** |')
+print(f'| Turns | {turns} | |')
+" 2>/dev/null || true)
+
+    if [ -n "${USAGE_SUMMARY}" ]; then
+        echo "Token usage:"
+        echo "${USAGE_SUMMARY}"
+    fi
+fi
 
 # --- Process result ---
 
@@ -275,35 +786,83 @@ fi
 echo "  Completion status: ${COMPLETION_STATUS}"
 echo "  Summary: ${COMPLETION_SUMMARY}"
 
-# --- Push changes ---
+# --- Mode-specific post-processing ---
 
-if [ -n "$(git status --porcelain)" ] || [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/$(git rev-parse --abbrev-ref HEAD) 2>/dev/null || echo '')" ]; then
-    echo "Pushing changes..."
-    # Stage and commit any uncommitted work
-    if [ -n "$(git status --porcelain)" ]; then
+if [ "${MODE}" = "analysis" ]; then
+    # --- Analysis mode: post result comment, handle need-info ---
+
+    ANALYSIS_RESULT=$(jq -r '.analysis_result // ""' /home/agent/completion-status.json 2>/dev/null || true)
+    ANALYSIS_COMMENT=$(jq -r '.analysis_comment // ""' /home/agent/completion-status.json 2>/dev/null || true)
+
+    echo "  Analysis result: ${ANALYSIS_RESULT}"
+
+    # Append usage summary to analysis comment
+    if [ -n "${USAGE_SUMMARY}" ] && [ -n "${ANALYSIS_COMMENT}" ]; then
+        ANALYSIS_COMMENT="${ANALYSIS_COMMENT}\n\n### Token Usage\n${USAGE_SUMMARY}"
+    fi
+
+    if [ -n "${ANALYSIS_COMMENT}" ]; then
+        echo "Posting analysis comment on ticket..."
+        CURRENT_VERSION=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
+            "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
+            | jq -r '.version')
+
+        curl -sf -X PATCH "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
+            -H "${TAIGA_AUTH_HEADER}" \
+            -H "Content-Type: application/json" \
+            -d "{\"comment\": $(echo "${ANALYSIS_COMMENT}" | jq -Rs .), \"version\": ${CURRENT_VERSION}}" \
+            >/dev/null 2>&1 || echo "WARNING: Could not post analysis comment on ticket."
+    fi
+
+    if [ "${ANALYSIS_RESULT}" = "need-info" ]; then
+        echo "Analysis requires human input — assigning ticket to human."
+        request_human_input "Analysis requires additional information. See the analysis comment above for details."
+    fi
+
+else
+    # --- Plan/Step/Fix modes: push, create PR, post comment ---
+
+    # Handle blocked status
+    if [ "${COMPLETION_STATUS}" = "blocked" ]; then
+        BLOCKED_REASON=$(jq -r '.reason // "No reason provided"' /home/agent/completion-status.json 2>/dev/null || echo "No reason provided")
+        echo "Agent is blocked — requesting human input."
+        request_human_input "**Agent ${AGENT_ID}** is blocked and needs human input.\n\n**Reason:** ${BLOCKED_REASON}"
+    fi
+
+    # Push changes
+    if [ -n "${BRANCH_NAME}" ] && [ -n "$(git status --porcelain)" ]; then
+        echo "Pushing changes..."
         git add -A
         git commit -m "Agent ${AGENT_ID}: work on ticket #${TICKET_ID}
 
 ${COMPLETION_SUMMARY:-Work in progress}"
+        git push -u origin "${BRANCH_NAME}"
+        echo "  Pushed to ${BRANCH_NAME}"
+    elif [ -n "${BRANCH_NAME}" ]; then
+        # Check if there are unpushed commits
+        LOCAL_HEAD=$(git rev-parse HEAD)
+        REMOTE_HEAD=$(git rev-parse "origin/${BRANCH_NAME}" 2>/dev/null || echo "")
+        if [ "${LOCAL_HEAD}" != "${REMOTE_HEAD}" ]; then
+            echo "Pushing commits..."
+            git push -u origin "${BRANCH_NAME}"
+            echo "  Pushed to ${BRANCH_NAME}"
+        else
+            echo "  No changes to push."
+        fi
     fi
-    git push -u origin "${BRANCH_NAME}"
-    echo "  Pushed to ${BRANCH_NAME}"
-else
-    echo "  No changes to push."
-fi
 
-# --- Create or update PR ---
+    # Create or update PR (skip for fix mode — PR already exists)
+    if [ -n "${BRANCH_NAME}" ] && [ "${MODE}" != "fix" ]; then
+        echo "Checking for existing PR..."
+        EXISTING_PR=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+            "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}/pulls?state=open&head=${BRANCH_NAME}" \
+            | jq '.[0].number // empty' 2>/dev/null || true)
 
-echo "Checking for existing PR..."
-EXISTING_PR=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
-    "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}/pulls?state=open&head=${BRANCH_NAME}" \
-    | jq '.[0].number // empty' 2>/dev/null || true)
-
-PR_BODY="## Ticket
+        PR_BODY="## Ticket
 [#${TICKET_ID}: ${TICKET_SUBJECT}](${TAIGA_URL}/project/dev-environment/us/${TICKET_ID})
 $([ -n "${PLAN_STEP}" ] && echo "
 ## Plan Step
-Step ${PLAN_STEP}")
+Step ${PLAN_STEP}" || true)
 
 ## Summary
 ${COMPLETION_SUMMARY:-Work by agent ${AGENT_ID}}
@@ -311,43 +870,94 @@ ${COMPLETION_SUMMARY:-Work by agent ${AGENT_ID}}
 ## Status
 ${COMPLETION_STATUS}"
 
-if [ -n "${EXISTING_PR}" ]; then
-    echo "  PR #${EXISTING_PR} already exists, updated with latest push."
-else
-    echo "Creating PR..."
-    PR_RESPONSE=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
-        -X POST "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}/pulls" \
-        -H "Content-Type: application/json" \
-        -d "{
-            \"title\": \"[${AGENT_ID}] Ticket #${TICKET_ID}$([ -n "${PLAN_STEP}" ] && echo " - Step ${PLAN_STEP}"): ${TICKET_SUBJECT}\",
-            \"body\": $(echo "${PR_BODY}" | jq -Rs .),
-            \"head\": \"${BRANCH_NAME}\",
-            \"base\": \"main\"
-        }" 2>/dev/null || true)
+        if [ -n "${EXISTING_PR}" ]; then
+            echo "  PR #${EXISTING_PR} already exists, updated with latest push."
+        else
+            echo "Creating PR..."
+            # Plan/step PRs target the work branch; only the work branch itself targets the base branch.
+            if [ "${BRANCH_NAME}" = "${WORK_BRANCH}" ]; then
+                PR_BASE="${BASE_BRANCH}"
+            else
+                PR_BASE="${WORK_BRANCH}"
+            fi
 
-    PR_NUMBER=$(echo "${PR_RESPONSE}" | jq -r '.number // empty' 2>/dev/null || true)
-    if [ -n "${PR_NUMBER}" ]; then
-        echo "  Created PR #${PR_NUMBER}"
-    else
-        echo "  WARNING: Could not create PR"
+            PR_TITLE="Ticket #${TICKET_ID}"
+            if [ "${MODE}" = "plan" ]; then
+                PR_TITLE="${PR_TITLE}: Implementation Plan"
+            elif [ -n "${PLAN_STEP}" ]; then
+                PR_TITLE="${PR_TITLE} - Step ${PLAN_STEP}: ${TICKET_SUBJECT}"
+            else
+                PR_TITLE="${PR_TITLE}: ${TICKET_SUBJECT}"
+            fi
+
+            PR_RESPONSE=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+                -X POST "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}/pulls" \
+                -H "Content-Type: application/json" \
+                -d "{
+                    \"title\": $(echo "${PR_TITLE}" | jq -Rs .),
+                    \"body\": $(echo "${PR_BODY}" | jq -Rs .),
+                    \"head\": \"${BRANCH_NAME}\",
+                    \"base\": \"${PR_BASE}\"
+                }" 2>/dev/null || true)
+
+            PR_NUMBER=$(echo "${PR_RESPONSE}" | jq -r '.number // empty' 2>/dev/null || true)
+            if [ -n "${PR_NUMBER}" ]; then
+                echo "  Created PR #${PR_NUMBER}"
+            else
+                echo "  WARNING: Could not create PR"
+            fi
+        fi
     fi
+
+    # Post progress comment on ticket (use taiga_comment from completion-status if available)
+    TAIGA_COMMENT=$(jq -r '.taiga_comment // ""' /home/agent/completion-status.json 2>/dev/null || true)
+    if [ -z "${TAIGA_COMMENT}" ]; then
+        TAIGA_COMMENT="**Agent ${AGENT_ID}** completed work.\n\n**Status:** ${COMPLETION_STATUS}\n**Summary:** ${COMPLETION_SUMMARY:-N/A}\n**Branch:** \`${BRANCH_NAME:-N/A}\`"
+    fi
+
+    # Ensure lifecycle markers are present so the orchestrator can derive
+    # the correct mode.  The agent may not have written the expected marker
+    # in completion-status.json, so we inject it when a PR exists.
+    HAS_PR="false"
+    if [ -n "${PR_NUMBER}" ] || [ -n "${EXISTING_PR}" ]; then
+        HAS_PR="true"
+    fi
+    if [ "${HAS_PR}" = "true" ]; then
+        case "${MODE}" in
+            plan)
+                if ! echo "${TAIGA_COMMENT}" | grep -qF '[phase:plan-created]'; then
+                    TAIGA_COMMENT="[phase:plan-created]\n\n${TAIGA_COMMENT}"
+                fi
+                ;;
+            step)
+                if ! echo "${TAIGA_COMMENT}" | grep -qF '[step:'; then
+                    TAIGA_COMMENT="[step:in-progress]\n\n${TAIGA_COMMENT}"
+                fi
+                ;;
+            fix)
+                if ! echo "${TAIGA_COMMENT}" | grep -qF '[fix:applied]'; then
+                    TAIGA_COMMENT="[fix:applied]\n\n${TAIGA_COMMENT}"
+                fi
+                ;;
+        esac
+    fi
+
+    # Append usage summary to Taiga comment
+    if [ -n "${USAGE_SUMMARY}" ]; then
+        TAIGA_COMMENT="${TAIGA_COMMENT}\n\n### Token Usage\n${USAGE_SUMMARY}"
+    fi
+
+    echo "Posting progress comment on ticket..."
+    CURRENT_VERSION=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
+        "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
+        | jq -r '.version')
+
+    curl -sf -X PATCH "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
+        -H "${TAIGA_AUTH_HEADER}" \
+        -H "Content-Type: application/json" \
+        -d "{\"comment\": $(echo "${TAIGA_COMMENT}" | jq -Rs .), \"version\": ${CURRENT_VERSION}}" \
+        >/dev/null 2>&1 || echo "WARNING: Could not post comment on ticket."
 fi
-
-# --- Update ticket with progress comment ---
-
-echo "Posting progress comment on ticket..."
-COMMENT_TEXT="**Agent ${AGENT_ID}** completed work.\n\n**Status:** ${COMPLETION_STATUS}\n**Summary:** ${COMPLETION_SUMMARY:-N/A}\n**Branch:** \`${BRANCH_NAME}\`"
-
-# Re-fetch ticket version to avoid conflict
-CURRENT_VERSION=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
-    "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
-    | jq -r '.version')
-
-curl -sf -X PATCH "${TAIGA_URL}/api/v1/userstories/${TICKET_ID}" \
-    -H "${TAIGA_AUTH_HEADER}" \
-    -H "Content-Type: application/json" \
-    -d "{\"comment\": \"$(echo -e "${COMMENT_TEXT}")\", \"version\": ${CURRENT_VERSION}}" \
-    >/dev/null 2>&1 || echo "WARNING: Could not post comment on ticket."
 
 echo ""
 echo "=== Agent Worker Complete ==="

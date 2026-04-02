@@ -246,7 +246,8 @@ Secrets are stored as Kubernetes Secrets in the `agents` namespace:
 
 | Secret | Contents | Used By |
 |---|---|---|
-| `anthropic-api-key` | Anthropic API key for Claude | Agent Jobs, Orchestrator (PR review) |
+| `anthropic-api-key` | (Optional) Anthropic API key — takes precedence over credentials file if present | Agent Jobs, Orchestrator (PR review) |
+| `claude-credentials` | (Optional) Claude Code credentials file (`~/.claude/.credentials.json`) — copied from the host during setup; each agent gets its own copy and handles OAuth refresh independently | Agent Jobs, Orchestrator (PR review) |
 | `orchestrator-admin` | Gitea admin token, Taiga admin credentials | Orchestrator (user management) |
 | `agent-credentials` | Per-agent Gitea tokens and Taiga credentials | Injected into agent Jobs at creation |
 | `webhook-secret` | HMAC key for Taiga webhook signature verification | Orchestrator |
@@ -663,3 +664,417 @@ Step 1: Infrastructure Foundation
 | **PR linking** | Ticket link + plan step reference in PR description | Minimal overhead; human can navigate from PR → ticket → plan |
 | **Notifications** | Local web dashboard + optional desktop notifications | Works fully locally; no external service dependency |
 | **CI/CD runners** | Gitea Actions act_runner in DinD mode, separate from agent containers | Isolated from agent work; standard GitHub Actions compatibility |
+
+---
+
+## Phase 2: Ticket Lifecycle Implementation
+
+Steps 1-15 above describe the infrastructure and orchestrator scaffold that is now in
+place.  Phase 2 implements the full ticket lifecycle as defined in the [mermaid flow
+diagram](mermaid.md): analysis → plan → step-by-step implementation → review → completion.
+
+All architectural decisions are documented with rationale in `mermaid.md` (Gap Analysis
+section).
+
+### Key Architectural Decisions (Phase 2)
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| **Step management** | Agent-driven (not orchestrator) | The agent owns the plan and step progression.  The orchestrator spawns/re-spawns agents but never parses or tracks the plan.  Simpler orchestrator; agent has full context. |
+| **Parallel steps** | Deferred (sequential only) | Avoids merge conflicts and complex coordination.  Can be added later. |
+| **Analysis Job weight** | Full-weight (clones repo) | Agent needs repo access for proper evaluation.  Whether analysis and plan creation merge into one Job is an implementational decision — clone overhead is negligible. |
+| **Ticket status during analysis** | Stays "ready" | Moves to "in-progress" only after the agent confirms it can proceed.  Assignment engine tracks the ticket internally to prevent double-assignment. |
+| **Re-spawn trigger** | Ticket unassigned (not any human activity) | Allows human to add info in multiple comments before signaling "ready" by unassigning. |
+| **PR event source** | Gitea webhooks on same port (8080) | Listens to `pull_request` and `pull_request_review` events.  Auto-review triggered by `pull_request:opened`. |
+| **Auto-review scope** | All PRs on watched repos | Including human-opened PRs.  Post-review lifecycle events silently ignored for PRs with no ticket mapping. |
+| **Auto-review type** | COMMENT only | Human decides on approve/reject.  Auto-review comments are processed together with human feedback. |
+| **Agent modes** | Separate system prompts per mode | One focused template file per mode: analysis, plan, step, PR-fix.  Bootstrap.sh selects mode via `MODE` env var. |
+| **Branch naming** | `ticket-{id}/work`, `ticket-{id}/plan`, `ticket-{id}/step-{n}` | No agent-id in branch names.  Base branch configurable via `base:` field in ticket (default: `main`). |
+| **PR-to-ticket mapping** | Both: orchestrator state + PR body parsing | Populated from agent completion comment; falls back to parsing ticket ID from PR body/title. |
+| **Step progress signal** | Taiga comment with `[step:N/M]` or `[step:complete]` | Orchestrator reads agent completion comment to decide re-spawn vs. transition to "ready for test". |
+| **PR rejection** | Escalate | Post Taiga comment, assign to human, pause.  Human decides whether to keep/delete work branch before re-queuing. |
+| **Re-engagement** | Full restart on existing work | Human moves ticket back to "ready".  Agent reuses existing work branch and updates plan. |
+| **`pkg/plan/` code** | Remove | Agent manages steps; orchestrator doesn't need plan parsing.  Reuse individual functions elsewhere if applicable. |
+
+---
+
+### Step 16: Foundation Rework and Cleanup
+
+Rework existing orchestrator and agent code to align with the Phase 2 architecture before
+adding new features.
+
+**Deliverables:**
+
+- **Remove `pkg/plan/`** — delete `orchestrator/pkg/plan/` package.  Remove references from
+  `pkg/state/manager.go` (`Plans` field in state), `cmd/orchestrator/main.go`, and any
+  imports.  Clean up tests.
+- **Assignment flow** — rework `assignTicket()` in `main.go` to NOT set ticket status to
+  "in-progress" at assignment time.  The ticket stays "ready"; only the internal assignment
+  engine tracks it.  Status transitions to "in-progress" when the analysis agent confirms
+  "proceed" (implemented in Step 19).
+- **Human input trigger** — rework `isHumanInput()` in `main.go` to trigger ONLY on
+  "ticket unassigned" events (check webhook diff for `assigned_to` changing from a
+  non-null value to null), not on any human comment or edit.  Existing comment-based
+  detection is removed.
+- **Branch naming** — update `bootstrap.sh` branch creation to use
+  `ticket-{id}/work` instead of `agent/{agent-id}/ticket-{id}/work`.  No agent-id in
+  branch names.
+- **`base:` field** — add parsing of optional `base: <branch>` lines in ticket
+  descriptions (alongside existing `repo:` parsing in `bootstrap.sh`).  Default to `main`
+  when not specified.
+- **PR-to-ticket mapping** — add a `PRMappings map[string]int` field to the orchestrator
+  state (`pkg/state/manager.go`).  Key: `{owner}/{repo}#{pr_number}`, value: ticket ID.
+  Populated when agents report PR creation; used to route Gitea PR events to tickets.
+- **`AgentJobSpec` mode field** — add a `Mode string` field to
+  `pkg/lifecycle/manager.go:AgentJobSpec`.  Passed as `MODE` env var to the agent
+  container.  Valid values: `analysis`, `plan`, `step`, `fix`.
+
+**Tests:** Update all affected unit tests.  Verify that reconciliation loop no longer
+re-enqueues tickets that are "ready" but tracked by the assignment engine.
+
+**Depends on:** Nothing (reworks existing code).
+
+---
+
+### Step 17: Gitea Client Extensions
+
+Extend the Gitea API client with methods needed for PR lifecycle management.
+
+**Deliverables:**
+
+- **`EditPullRequest(owner, repo string, number int, opts *EditPRRequest) error`** — update
+  PR assignees and reviewers after creation.  Uses `PATCH /repos/{owner}/{repo}/pulls/{index}`.
+  `EditPRRequest` struct includes `Assignees []string`.
+- **`GetPRDiff(owner, repo string, number int) (string, error)`** — fetch the actual diff
+  for a PR.  Uses `GET /repos/{owner}/{repo}/pulls/{index}.diff` (or the `Accept: text/plain`
+  header on the PR endpoint).  Replaces the placeholder in `pkg/review/service.go:getPRDiff()`.
+- **`GetPRReviews(owner, repo string, number int) ([]PRReview, error)`** — fetch all
+  reviews on a PR.  Uses `GET /repos/{owner}/{repo}/pulls/{index}/reviews`.
+- **`GetPRReviewComments(owner, repo string, number int, reviewID int64) ([]ReviewComment, error)`**
+  — fetch review comments with file paths and line numbers.  Uses
+  `GET /repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments`.
+- **`CreateOrgWebhook(org string, hook *CreateHookRequest) error`** or
+  **`CreateRepoWebhook(owner, repo string, hook *CreateHookRequest) error`** — register
+  Gitea webhooks.  Used by the orchestrator to set up PR event delivery.
+- **Structs:** `EditPRRequest`, `PRReview`, `ReviewComment` (with `Path`, `Line`,
+  `Body` fields), `CreateHookRequest`.
+- **Update `PullRequest` struct** — add `User` (author), `Assignees`, `MergedBy`,
+  `Merged` boolean fields.
+
+**Tests:** Unit tests with `httptest` mocks for all new methods.
+
+**Depends on:** Nothing (extends existing client).
+
+**Can be parallelized with:** Step 16.
+
+---
+
+### Step 18: Gitea Webhook Handler
+
+Add a Gitea webhook receiver to the orchestrator so it can react to PR events.
+
+**Deliverables:**
+
+- **Gitea webhook handler** (`orchestrator/pkg/webhooks/gitea_handler.go`) — parses Gitea
+  webhook payloads for `pull_request` and `pull_request_review` events.  Structs for Gitea
+  webhook event format (different from Taiga's format).
+- **HTTP route** — register `/webhooks/gitea` on the existing HTTP server (port 8080)
+  alongside the existing `/webhooks/taiga` route.  Optionally verify Gitea webhook secret
+  (HMAC-SHA256).
+- **Event routing in `main.go`** — handle:
+  - `pull_request` action `opened` → trigger auto-review (Step 21).
+  - `pull_request` action `closed` + `merged: true` → re-spawn agent for next step (Step 23).
+  - `pull_request` action `closed` + `merged: false` → PR rejected, escalate (Step 24).
+  - `pull_request_review` action `submitted` + review type `request_changes` (from human) →
+    spawn PR-fix agent (Step 22).
+- **PR-to-ticket resolution** — on each PR event, look up ticket ID from
+  `state.PRMappings`.  If not found, parse ticket ID from PR body/title.  If still not
+  found (human-opened PR with no ticket reference), proceed only for auto-review; silently
+  ignore lifecycle events.
+- **Webhook registration** — on first encounter of a repo (when an agent creates a PR), the
+  orchestrator registers a webhook on that repo via the Gitea API (Step 17).  Stores
+  registered repos in state to avoid duplicate registrations.  Alternatively, register a
+  system-level or org-level webhook in `init-gitea.sh`.
+
+**Tests:** Unit tests for event parsing and routing.  Integration test with a mock Gitea
+webhook payload.
+
+**Depends on:** Step 17 (Gitea client webhook registration method).
+
+---
+
+### Step 19: Agent Mode — Analysis
+
+Implement the analysis phase: a dedicated agent Job that evaluates the ticket and decides
+whether to proceed or request human input.
+
+**Deliverables:**
+
+- **System prompt** (`agent/system-prompt-analysis.md`) — instructs Claude to:
+  - Read the ticket subject, description, and all comments.
+  - If a repo is referenced (`repo:` lines), examine the codebase structure.
+  - If a `base:` branch is specified, verify it exists.
+  - Decide: is the ticket sufficiently clear to create an implementation plan?
+  - If yes: post a comment with `[analysis:proceed]` and a brief summary of understanding.
+  - If no: post a comment with `[analysis:need-info]` explaining what info is missing,
+    then assign the ticket to the human user.
+- **Bootstrap mode `analysis`** — in `bootstrap.sh` (or a mode-selected code path):
+  - Fetch ticket from Taiga (subject, description, comments).
+  - Parse `repo:` and `base:` lines.
+  - If a repo is referenced: clone it, provide it as context to Claude.
+  - If `base:` specified: check branch exists via `git ls-remote` or Gitea API.
+  - Invoke Claude with the analysis system prompt and ticket context.
+  - On `[analysis:need-info]`: assign ticket to human (`HUMAN_TAIGA_ID`), exit 0.
+  - On `[analysis:proceed]`: exit 0.
+- **Orchestrator integration** — after the analysis Job completes:
+  - Parse the latest Taiga comment for `[analysis:proceed]` or `[analysis:need-info]`.
+  - On `proceed`: set ticket status to "in-progress", spawn plan agent (Step 20).
+  - On `need-info`: ticket is now assigned to human, stays "ready".  Orchestrator
+    clears internal assignment.  When human unassigns → ticket re-enters the queue →
+    full re-analysis.
+- **Assignment flow change** — when a "ready" unassigned ticket is detected:
+  1. Enqueue and assign internally (assignment engine).
+  2. Spawn analysis Job (Mode=`analysis`).
+  3. Do NOT change Taiga ticket status.
+
+**Tests:** Unit tests for comment parsing.  Test bootstrap analysis mode with mock Taiga/Gitea.
+
+**Depends on:** Step 16 (assignment rework, `base:` parsing, `MODE` env var).
+
+---
+
+### Step 20: Agent Mode — Plan Creation
+
+Implement the plan creation phase: the agent clones the repo, writes an implementation
+plan, and opens a PR.
+
+**Deliverables:**
+
+- **System prompt** (`agent/system-prompt-plan.md`) — instructs Claude to:
+  - Read the ticket, all comments, and the full codebase.
+  - Create a `ticket-{id}/work` branch from the base branch (default `main`, or `base:`
+    value).
+  - Create a `ticket-{id}/plan` sub-branch from the work branch.
+  - Write `IMPLEMENTATION_PLAN.md` with `### Step N: Title` format (as expected by the
+    plan parser convention).
+  - Commit the plan and create a PR targeting the work branch.
+  - Post a Taiga comment with the PR link and `[phase:plan-created]`.
+- **Bootstrap mode `plan`** — in `bootstrap.sh`:
+  - Fetch ticket, clone repo, set up git identity.
+  - Create or reuse work branch from base branch.
+  - Create plan sub-branch from work branch.
+  - Invoke Claude with the plan system prompt.
+  - Push branch and create PR (assign to the reviewing agent/claude per Step 21 flow).
+  - Post completion comment on Taiga ticket.
+- **Orchestrator integration** — after analysis succeeds (`[analysis:proceed]`):
+  - Spawn plan agent (Mode=`plan`) for the same ticket.
+  - The resulting PR triggers auto-review via Gitea webhook (Step 21).
+
+**Tests:** Test bootstrap plan mode.  Verify branch naming convention.
+
+**Depends on:** Step 16 (branch naming), Step 18 (Gitea webhook for PR detection — the
+plan PR triggers the auto-review pipeline).
+
+---
+
+### Step 21: Auto-Review Pipeline
+
+Wire the existing `pkg/review/service.go` into the Gitea webhook flow so every new PR
+gets an automated Claude review before human review.
+
+**Deliverables:**
+
+- **Fix `getPRDiff()`** — replace the placeholder string in `pkg/review/service.go` with a
+  call to `giteaClient.GetPRDiff()` (from Step 17).
+- **Auto-review trigger** — in the Gitea webhook handler (Step 18), on
+  `pull_request:opened`:
+  1. Assign the PR to the reviewing agent/claude identity (via `EditPullRequest`).
+  2. Invoke `ReviewPR()` — Claude reviews the diff, posts a `COMMENT` review on Gitea.
+  3. After the review posts, reassign the PR to the human user.
+- **Non-blocking execution** — the auto-review is a Claude CLI subprocess invocation that
+  takes time.  Run it in a goroutine so the webhook handler returns immediately.  Track
+  in-progress reviews in orchestrator state to avoid duplicate reviews on rapid webhook
+  re-delivery.
+- **All PRs** — auto-review fires for all PRs on watched repos (including human-opened PRs).
+  For PRs with no ticket mapping, auto-review still runs but no lifecycle actions follow.
+
+**Tests:** Integration test with mock PR diff and Claude review output.
+
+**Depends on:** Step 17 (GetPRDiff, EditPullRequest), Step 18 (Gitea webhook handler).
+
+---
+
+### Step 22: Agent Mode — PR Review-Fix
+
+Implement the PR-fix phase: when a human requests changes on a PR, the orchestrator
+spawns the same agent to address the feedback.
+
+**Deliverables:**
+
+- **System prompt** (`agent/system-prompt-fix.md`) — instructs Claude to:
+  - Read the full PR diff and all review comments (with file paths and line numbers).
+  - Read the ticket context and implementation plan for broader understanding.
+  - Address each review comment.
+  - Commit changes on the existing branch, push.
+  - Post a comment on the PR: "Changes addressed, ready for re-review."
+  - Reassign the PR to the human user.
+  - Post a Taiga comment with `[fix:applied]` and a brief summary.
+- **Bootstrap mode `fix`** — in `bootstrap.sh`:
+  - Receive `PR_NUMBER` and `PR_REPO` environment variables (set by orchestrator).
+  - Fetch ticket from Taiga, clone repo, check out the existing PR branch.
+  - Fetch PR diff and review comments from Gitea API (with file/line references).
+  - Format review comments for Claude (file path, line number, comment body).
+  - Invoke Claude with the fix system prompt and review context.
+  - Push changes, post PR comment, reassign PR, post Taiga comment.
+- **Orchestrator trigger** — on `pull_request_review` webhook with action `submitted` and
+  type `request_changes`:
+  - Skip if reviewer is an agent (only react to human reviews).
+  - Look up the ticket via PR-to-ticket mapping.
+  - Look up the same agent identity that created the PR (from assignment state).
+  - Spawn a PR-fix Job (Mode=`fix`) with `PR_NUMBER` and `PR_REPO` env vars.
+- **AgentJobSpec extension** — add `PRNumber int` and `PRRepo string` fields, passed as
+  environment variables to the agent container.
+
+**Tests:** Test bootstrap fix mode with mock review comments.
+
+**Depends on:** Step 17 (GetPRReviews, GetPRReviewComments, EditPullRequest),
+Step 18 (Gitea webhook handler), Step 21 (auto-review — ensures review flow works).
+
+---
+
+### Step 23: Agent Mode — Step Implementation
+
+Implement the step implementation phase: agent reads the plan, determines the next step,
+implements it, and opens a PR.
+
+**Deliverables:**
+
+- **System prompt** (`agent/system-prompt-step.md`) — instructs Claude to:
+  - Read the ticket, all Taiga comments, and the implementation plan from the repo.
+  - Determine which step to work on next (based on merged PRs and plan state).
+  - Create a `ticket-{id}/step-{n}` branch from the work branch.
+  - Implement the step.  Run tests.
+  - Commit, push, create PR targeting the work branch.
+  - Post a Taiga comment: `[step:N/M]` (e.g. `[step:2/5]`) if more steps remain, or
+    `[step:complete]` if this was the last step.
+  - If the plan needs updating (discovered during implementation), the agent may open a
+    plan-update PR instead of a step PR and signal `[plan-update]` in the Taiga comment.
+- **Bootstrap mode `step`** — in `bootstrap.sh`:
+  - Fetch ticket, clone repo (check out the work branch).
+  - Read the implementation plan from the repo.
+  - Invoke Claude with the step system prompt and full context.
+  - Push branch, create PR, post completion comment on Taiga.
+- **Orchestrator trigger** — on `pull_request` webhook with action `closed` + `merged: true`:
+  - Look up the ticket via PR-to-ticket mapping.
+  - Read the latest Taiga comment from the agent:
+    - `[step:N/M]` → spawn step agent again (Mode=`step`).  The new agent reads the
+      repo state and picks up the next step.
+    - `[step:complete]` → proceed to completion (Step 24).
+    - `[plan-update]` → treat like any other PR; after merge, re-spawn agent.
+  - If no matching marker found, re-spawn agent anyway (agent decides what to do — per the
+    "orchestrator always re-spawns, agent decides" principle).
+
+**Tests:** Test bootstrap step mode.  Test orchestrator comment parsing for step markers.
+
+**Depends on:** Step 20 (plan exists in repo), Step 18 (Gitea webhook for merge detection).
+
+---
+
+### Step 24: Completion Lifecycle
+
+Implement the end-of-lifecycle transitions: ready-for-test, PR rejection escalation, and
+re-engagement.
+
+**Deliverables:**
+
+- **Ready for test** — when the orchestrator reads `[step:complete]` from the agent's Taiga
+  comment:
+  1. Set ticket status to "ready for test".
+  2. Assign ticket to the human user.
+  3. Post a release notes summary as a Taiga comment (generated by the agent in the
+     `[step:complete]` comment or in a separate final comment).
+  4. Clear the internal assignment in the assignment engine.
+- **PR rejection** — when the Gitea webhook fires `pull_request` with action `closed` +
+  `merged: false` (PR closed without merge):
+  1. Look up ticket via PR-to-ticket mapping.
+  2. Post a Taiga comment: "PR #{number} was rejected by the reviewer.  Ticket paused —
+     awaiting human guidance."
+  3. Assign ticket to human user.
+  4. Clear internal assignment.
+  5. Ticket status stays "in-progress".  Human can: add guidance and move to "ready"
+     (full restart), or close the ticket.
+- **Re-engagement** — when a "ready for test" ticket is moved back to "ready" by the human:
+  - The orchestrator's existing reconciliation loop picks it up as an unassigned "ready"
+    ticket.
+  - Spawns a new analysis Job.  The agent sees the full comment history (including test
+    feedback), reuses the existing work branch, and updates the plan as needed.
+- **Release notes** — the step agent's `[step:complete]` comment should include a
+  human-readable summary of all changes made across the ticket.  The system prompt for
+  step mode instructs Claude to write this summary when it determines all steps are done.
+
+**Tests:** Integration test for the full lifecycle: analysis → plan → step → complete.
+Test PR rejection escalation.  Test re-engagement flow.
+
+**Depends on:** Step 23 (step signaling), Step 18 (Gitea webhook for PR close events).
+
+---
+
+### Step 25: Documentation Update
+
+Update all documentation to reflect the Phase 2 architecture.
+
+**Deliverables:**
+
+- **README.md** — update the "Usage" section:
+  - Document the `base:` field in ticket descriptions (alongside `repo:`).
+  - Update the "Ticket Lifecycle" section to match the new flow (analysis → plan → steps).
+  - Update the "What Happens After You Create a Ticket" section.
+  - Update the "Reviewing and Handling PRs" section (auto-review, PR-fix flow).
+  - Remove references to orchestrator-driven plan parsing.
+  - Add "Agent Modes" section describing the four modes.
+- **README.md** — update the "Architecture" section:
+  - Update the Architecture diagram (Gitea webhook, agent modes).
+  - Update the Orchestrator description (Gitea webhook handler).
+- **README.md** — update the "Agent Worker" section:
+  - Document `MODE` environment variable and the four modes.
+  - Document `PR_NUMBER`, `PR_REPO` environment variables (for fix mode).
+  - Update the agent workflow description.
+- **System prompts** — ensure all four system prompt files are complete and consistent:
+  - `agent/system-prompt-analysis.md`
+  - `agent/system-prompt-plan.md`
+  - `agent/system-prompt-step.md`
+  - `agent/system-prompt-fix.md`
+- **Config documentation** — document any new configuration fields.
+
+**Depends on:** All previous steps.
+
+---
+
+### Phase 2 — Step Dependency and Parallelism Overview
+
+```
+Step 16: Foundation Rework ──────────┬── Step 19: Analysis Mode
+                                     │
+Step 17: Gitea Client Extensions ────┼── Step 18: Gitea Webhook Handler
+                                     │     │
+                                     │     ├── Step 20: Plan Mode
+                                     │     │
+                                     │     ├── Step 21: Auto-Review Pipeline
+                                     │     │     │
+                                     │     │     └── Step 22: PR Review-Fix Mode
+                                     │     │
+                                     │     └── Step 23: Step Implementation Mode
+                                     │           │
+                                     │           └── Step 24: Completion Lifecycle
+                                     │
+                                     └── All steps complete → Step 25: Documentation
+```
+
+**Parallel tracks:**
+- Steps 16 + 17 run in parallel (independent rework + new client methods)
+- Step 18 depends on Step 17; Step 19 depends on Step 16
+- Steps 20, 21 depend on Step 18 (both need Gitea webhooks)
+- Step 22 depends on Steps 17, 18, 21
+- Step 23 depends on Steps 18, 20
+- Step 24 depends on Steps 18, 23
+- Step 25 depends on all

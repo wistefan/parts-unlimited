@@ -14,13 +14,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     python3 \
     python3-pip \
+    sudo \
+    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
 
-# Create non-root agent user
-RUN useradd -m -s /bin/bash agent
+# Create non-root agent user with UID 1000 (matching the K8s pod securityContext).
+# The node base image ships a 'node' user at UID 1000, so remove it first.
+# Grant passwordless sudo so the agent can install project-specific toolchains
+# (Java, Maven, Docker, Go, etc.) at runtime.  The container is ephemeral and
+# network-isolated, so sudo inside it carries no meaningful security risk.
+RUN userdel -r node 2>/dev/null || true \
+    && useradd -m -s /bin/bash -u 1000 agent \
+    && echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
 USER agent
 WORKDIR /home/agent
 
@@ -28,8 +36,12 @@ WORKDIR /home/agent
 RUN git config --global init.defaultBranch main \
     && git config --global advice.detachedHead false
 
-# Copy bootstrap script and system prompt template
+# Copy bootstrap script and system prompt templates (one per mode)
 COPY --chown=agent:agent bootstrap.sh /home/agent/bootstrap.sh
 COPY --chown=agent:agent system-prompt.md /home/agent/system-prompt.md
+COPY --chown=agent:agent system-prompt-analysis.md /home/agent/system-prompt-analysis.md
+COPY --chown=agent:agent system-prompt-plan.md /home/agent/system-prompt-plan.md
+COPY --chown=agent:agent system-prompt-step.md /home/agent/system-prompt-step.md
+COPY --chown=agent:agent system-prompt-fix.md /home/agent/system-prompt-fix.md
 
 ENTRYPOINT ["/bin/bash", "/home/agent/bootstrap.sh"]

@@ -11,7 +11,6 @@ import (
 
 	"github.com/wistefan/dev-env/orchestrator/pkg/assignment"
 	"github.com/wistefan/dev-env/orchestrator/pkg/identity"
-	"github.com/wistefan/dev-env/orchestrator/pkg/plan"
 )
 
 func newTestManager() (*Manager, *fake.Clientset) {
@@ -38,11 +37,8 @@ func sampleState() *OrchestratorState {
 			42: {TicketID: 42, PrimaryAgent: "general-agent-1", Status: "assigned"},
 		},
 		Escalations: map[int]*assignment.EscalationEntry{},
-		Plans: map[int]*plan.Plan{
-			42: {TicketID: 42, Phase: plan.PhaseExecuting, Steps: []plan.Step{
-				{Number: 1, Title: "Setup", Status: plan.StepCompleted},
-				{Number: 2, Title: "Build", Status: plan.StepInProgress},
-			}},
+		PRMappings: map[string]int{
+			"claude/test-repo#1": 42,
 		},
 	}
 }
@@ -83,11 +79,8 @@ func TestSaveAndLoad(t *testing.T) {
 	if loaded.Assignments[42].PrimaryAgent != "general-agent-1" {
 		t.Errorf("expected primary agent, got %q", loaded.Assignments[42].PrimaryAgent)
 	}
-	if loaded.Plans[42] == nil {
-		t.Fatal("expected plan for ticket 42")
-	}
-	if loaded.Plans[42].Steps[1].Status != plan.StepInProgress {
-		t.Errorf("expected step 2 in progress, got %q", loaded.Plans[42].Steps[1].Status)
+	if loaded.PRMappings["claude/test-repo#1"] != 42 {
+		t.Errorf("expected PR mapping for ticket 42, got %d", loaded.PRMappings["claude/test-repo#1"])
 	}
 	if loaded.LastSaved.IsZero() {
 		t.Error("expected non-zero LastSaved")
@@ -179,7 +172,7 @@ func TestStateJSON_RoundTrip(t *testing.T) {
 	if len(loaded.Agents) != len(state.Agents) {
 		t.Errorf("agents mismatch: %d vs %d", len(loaded.Agents), len(state.Agents))
 	}
-	if len(loaded.Plans) != len(state.Plans) {
-		t.Errorf("plans mismatch: %d vs %d", len(loaded.Plans), len(state.Plans))
+	if len(loaded.PRMappings) != len(state.PRMappings) {
+		t.Errorf("PR mappings mismatch: %d vs %d", len(loaded.PRMappings), len(state.PRMappings))
 	}
 }

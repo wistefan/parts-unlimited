@@ -19,6 +19,7 @@ spec:
       containers:
         - name: rabbitmq
           image: rabbitmq:3.8-management-alpine
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 5672
               name: amqp
@@ -60,7 +61,8 @@ spec:
               memory: 512Mi
       volumes:
         - name: rabbitmq-data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: taiga-rabbitmq-data
 
 ---
 apiVersion: v1
