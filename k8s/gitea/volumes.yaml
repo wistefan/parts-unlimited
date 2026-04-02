@@ -1,0 +1,61 @@
+## Persistent volumes for Gitea and its bundled PostgreSQL.
+## Uses hostPath so data survives k3s reinstalls (not just restarts).
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gitea-data-pv
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /var/lib/dev-env/gitea/data
+    type: DirectoryOrCreate
+  storageClassName: gitea-shared
+  persistentVolumeReclaimPolicy: Retain
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gitea-shared-storage
+  namespace: gitea
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: gitea-shared
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gitea-postgresql-pv
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /var/lib/dev-env/gitea/postgresql
+    type: DirectoryOrCreate
+  storageClassName: gitea-shared
+  persistentVolumeReclaimPolicy: Retain
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gitea-postgresql-data
+  namespace: gitea
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: gitea-shared

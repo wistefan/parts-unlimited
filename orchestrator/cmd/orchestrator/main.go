@@ -311,11 +311,11 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 		if savedState.PRMappings != nil {
 			prMappings = savedState.PRMappings
 		}
-		// Restore ticket assignments so the orchestrator knows which
-		// tickets are already being worked on and in which mode.
+		// Restore ticket assignments with their original status so that
+		// "waiting" assignments stay waiting (not re-spawned).
 		if savedState.Assignments != nil {
-			for ticketID, a := range savedState.Assignments {
-				assignEngine.AssignAgent(ticketID, a.PrimaryAgent)
+			for _, a := range savedState.Assignments {
+				assignEngine.RestoreAssignment(a)
 			}
 		}
 		log.Printf("  State: restored %d agents, %d assignments, %d PR mappings",
@@ -440,6 +440,17 @@ func (o *orchestrator) registerGiteaWebhookHandlers() {
 		log.Printf("Gitea: PR #%d merged on %s for ticket #%d",
 			event.PullRequest.Number, event.Repository.FullName, ticketID)
 
+		// Guard against duplicate webhooks: if an agent is already actively
+		// assigned (not just "waiting"), another webhook already handled
+		// this merge event.
+		if existing := o.assignEngine.GetAssignment(ticketID); existing != nil && existing.Status == "assigned" {
+			log.Printf("Gitea: ticket #%d already has active assignment (%s), skipping duplicate merge event", ticketID, existing.PrimaryAgent)
+			return nil
+		}
+
+		// Clear the "waiting" assignment before spawning the next agent
+		o.assignEngine.CompleteTicket(ticketID)
+
 		// Check the agent's last Taiga comment for step markers
 		if o.isStepComplete(ticketID) {
 			log.Printf("Gitea: ticket #%d all steps complete — transitioning to ready-for-test", ticketID)
@@ -501,16 +512,29 @@ func (o *orchestrator) registerGiteaWebhookHandlers() {
 		log.Printf("Gitea: human %s requested changes on PR #%d (ticket #%d) — spawning fix agent",
 			event.Sender.Login, event.PullRequest.Number, ticketID)
 
-		existing := o.assignEngine.GetAssignment(ticketID)
-		if existing == nil {
-			log.Printf("WARNING: no assignment for ticket %d, cannot spawn fix agent", ticketID)
+		// Guard against duplicate webhooks: if a job already exists for
+		// this ticket, skip — a previous webhook already handled it.
+		if hasJob, _ := o.lifecycleMgr.HasJobForTicket(context.Background(), ticketID); hasJob {
+			log.Printf("Gitea: ticket #%d already has a running job, skipping duplicate review event", ticketID)
 			return nil
 		}
 
-		agent := o.identityMgr.GetAgent(existing.PrimaryAgent)
+		// Try to reuse the existing agent; if none is assigned (e.g. after
+		// restart or PR-close cleared it), get or create one.
+		var agent *identity.AgentIdentity
+		existing := o.assignEngine.GetAssignment(ticketID)
+		if existing != nil {
+			o.assignEngine.AssignAgent(ticketID, existing.PrimaryAgent)
+			agent = o.identityMgr.GetAgent(existing.PrimaryAgent)
+		}
 		if agent == nil {
-			log.Printf("WARNING: agent %s not found for ticket %d", existing.PrimaryAgent, ticketID)
-			return nil
+			var err error
+			agent, err = o.identityMgr.GetOrCreateAgent("general", o.assignEngine.GetBusyAgents())
+			if err != nil {
+				log.Printf("ERROR: could not get agent for fix on ticket %d: %v", ticketID, err)
+				return nil
+			}
+			o.assignEngine.AssignAgent(ticketID, agent.ID)
 		}
 
 		// Parse owner/repo from the full name
@@ -556,8 +580,8 @@ func (o *orchestrator) isStepComplete(ticketID int) bool {
 		return false
 	}
 
-	// Search from newest to oldest
-	for i := len(comments) - 1; i >= 0; i-- {
+	// Search from newest to oldest (API returns newest-first)
+	for i := 0; i < len(comments); i++ {
 		c := comments[i].Comment
 		if strings.Contains(c, "[step:complete]") {
 			return true
@@ -713,8 +737,8 @@ func extractModeFromJobName(jobName string) string {
 }
 
 // determineMode derives the agent mode from the ticket's Taiga comment history.
-// This is the single source of truth for lifecycle state — no mode is stored in the
-// orchestrator's own state.
+// It scans all comments to build a complete lifecycle picture rather than
+// relying on the single most-recent marker (which can be stale or duplicated).
 func (o *orchestrator) determineMode(ticketID int) string {
 	comments, err := o.taigaClient.GetComments(ticketID)
 	if err != nil {
@@ -722,31 +746,94 @@ func (o *orchestrator) determineMode(ticketID int) string {
 		return "analysis"
 	}
 
-	// Search from newest to oldest for the most recent lifecycle marker.
-	// Return "" when we're waiting for a PR event (no agent work needed).
-	for i := len(comments) - 1; i >= 0; i-- {
-		c := comments[i].Comment
+	// Collect which lifecycle markers exist anywhere in the history.
+	hasAnalysisProceed := false
+	hasAnalysisNeedInfo := false
+	hasPlanCreated := false
+	hasStep := false
+	hasStepComplete := false
+	hasFixApplied := false
+
+	// Also find the newest marker of each type (comments are newest-first).
+	newestMarker := ""
+	for _, entry := range comments {
+		c := entry.Comment
 		if strings.Contains(c, "[step:complete]") {
-			return "" // all done
+			hasStepComplete = true
+			if newestMarker == "" {
+				newestMarker = "step:complete"
+			}
 		}
 		if strings.Contains(c, "[fix:applied]") {
-			return "" // fix pushed, waiting for human re-review
+			hasFixApplied = true
+			if newestMarker == "" {
+				newestMarker = "fix:applied"
+			}
 		}
-		if strings.Contains(c, "[step:") {
-			return "" // step PR created, waiting for human to merge
+		if strings.Contains(c, "[step:") && !strings.Contains(c, "[step:complete]") {
+			hasStep = true
+			if newestMarker == "" {
+				newestMarker = "step"
+			}
 		}
 		if strings.Contains(c, "[phase:plan-created]") {
-			return "" // plan PR created, waiting for human to merge
+			hasPlanCreated = true
+			if newestMarker == "" {
+				newestMarker = "phase:plan-created"
+			}
 		}
 		if strings.Contains(c, "[analysis:proceed]") {
-			return "plan" // analysis done, need to create plan
+			hasAnalysisProceed = true
+			if newestMarker == "" {
+				newestMarker = "analysis:proceed"
+			}
 		}
 		if strings.Contains(c, "[analysis:need-info]") {
-			return "" // waiting for human input
+			hasAnalysisNeedInfo = true
+			if newestMarker == "" {
+				newestMarker = "analysis:need-info"
+			}
 		}
 	}
 
-	return "analysis" // no markers — start from the beginning
+	// Decision logic using the full picture:
+	//
+	// 1. If steps were ever started, the plan was already merged — ignore
+	//    stale [phase:plan-created] markers from duplicate agent runs.
+	// 2. If [step:complete] exists, all implementation is done.
+	// 3. The newest marker determines the current waiting state.
+
+	if hasStepComplete {
+		return "" // all done
+	}
+	if hasStep {
+		// Steps are in progress.  The newest marker tells us what to wait for.
+		if newestMarker == "fix:applied" || newestMarker == "step" {
+			return "" // step or fix PR open, waiting for human
+		}
+		// If newest marker is a stale plan-created, we're actually in step
+		// mode — a step PR was merged or is pending.
+		return "step"
+	}
+	if hasPlanCreated {
+		if newestMarker == "fix:applied" {
+			return "" // fix pushed for plan PR, waiting for re-review
+		}
+		// Plan created, no steps yet — waiting for plan PR merge.
+		return ""
+	}
+	if hasAnalysisProceed {
+		return "plan"
+	}
+	if hasAnalysisNeedInfo {
+		return ""
+	}
+	if !hasAnalysisProceed && !hasPlanCreated && !hasStep {
+		return "analysis"
+	}
+
+	_ = hasFixApplied // used implicitly via newestMarker
+	return "analysis"
 }
 
 // handleJobCompletion processes the result of a completed agent Job.
@@ -756,12 +843,14 @@ func (o *orchestrator) handleJobCompletion(ctx context.Context, ticketID int, mo
 	case "analysis":
 		o.handleAnalysisCompletion(ctx, ticketID, assgn)
 	default:
-		// For plan/step/fix modes, the Job posted comments and created PRs.
-		// Clear the assignment so the reconciliation loop doesn't re-spawn.
-		// The Gitea webhook handlers (PR merge, review) will create new
-		// assignments when the next action is needed.
-		log.Printf("Ticket #%d: %s Job completed, clearing assignment (PR events drive next steps)", ticketID, mode)
-		o.assignEngine.CompleteTicket(ticketID)
+		// For plan/step/fix modes, keep the assignment alive in "waiting"
+		// status.  This prevents the reconciliation loop from re-spawning
+		// agents while we wait for a Gitea PR event (merge, review).
+		// The agent is released from the busy pool so it can work on other
+		// tickets.  The Gitea webhook handlers (PR merge, review) will
+		// either clear the assignment or reactivate it.
+		log.Printf("Ticket #%d: %s Job completed, waiting for PR events", ticketID, mode)
+		o.assignEngine.WaitForPR(ticketID)
 		o.saveState(ctx)
 	}
 }
@@ -777,9 +866,10 @@ func (o *orchestrator) handleAnalysisCompletion(ctx context.Context, ticketID in
 		return
 	}
 
-	// Search comments from newest to oldest for the analysis marker
+	// Search from newest to oldest for the analysis marker.
+	// Taiga history API returns newest-first (index 0 = newest).
 	analysisResult := ""
-	for i := len(comments) - 1; i >= 0; i-- {
+	for i := 0; i < len(comments); i++ {
 		c := comments[i]
 		if strings.Contains(c.Comment, "[analysis:proceed]") {
 			analysisResult = "proceed"
@@ -854,6 +944,7 @@ func (o *orchestrator) spawnAgentForTicket(ticketID int, mode string) {
 	}
 
 	o.assignEngine.AssignAgent(ticketID, agent.ID)
+	o.assignTicketInTaiga(ticketID, agent.TaigaUserID)
 
 	spec := &lifecycle.AgentJobSpec{
 		AgentID:        agent.ID,
@@ -885,9 +976,8 @@ func (o *orchestrator) spawnAgentForTicket(ticketID int, mode string) {
 func (o *orchestrator) respawnAgent(ticketID int, mode string) {
 	existing := o.assignEngine.GetAssignment(ticketID)
 	if existing == nil {
-		log.Printf("Ticket #%d: no existing assignment, enqueuing as new work", ticketID)
-		o.assignEngine.Enqueue(ticketID)
-		o.processQueue()
+		log.Printf("Ticket #%d: no existing assignment, spawning fresh agent in %s mode", ticketID, mode)
+		o.spawnAgentForTicket(ticketID, mode)
 		return
 	}
 
@@ -901,6 +991,8 @@ func (o *orchestrator) respawnAgent(ticketID int, mode string) {
 			return
 		}
 	}
+
+	o.assignTicketInTaiga(ticketID, agent.TaigaUserID)
 
 	spec := &lifecycle.AgentJobSpec{
 		AgentID:        agent.ID,
@@ -924,6 +1016,224 @@ func (o *orchestrator) respawnAgent(ticketID int, mode string) {
 
 	log.Printf("Ticket #%d: agent %s re-spawned in %s mode (job: %s)", ticketID, agent.ID, mode, jobName)
 	o.saveState(context.Background())
+}
+
+// prNeedingFix holds info about a PR that needs a fix agent.
+type prNeedingFix struct {
+	repo   string // "owner/repo"
+	number int
+}
+
+// findPRNeedingFix checks Gitea for open PRs associated with a ticket that
+// have non-stale REQUEST_CHANGES reviews.  Returns the first such PR, or nil.
+// This catches review events the orchestrator missed (e.g. during a restart).
+func (o *orchestrator) findPRNeedingFix(ticketID int) *prNeedingFix {
+	for key, tid := range o.prMappings {
+		if tid != ticketID {
+			continue
+		}
+		// key format: "owner/repo#number"
+		hashIdx := strings.LastIndex(key, "#")
+		if hashIdx < 0 {
+			continue
+		}
+		repo := key[:hashIdx]
+		prNum, err := strconv.Atoi(key[hashIdx+1:])
+		if err != nil {
+			continue
+		}
+		parts := strings.SplitN(repo, "/", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		pr, err := o.giteaClient.GetPullRequest(parts[0], parts[1], prNum)
+		if err != nil || pr.State != "open" {
+			continue
+		}
+
+		reviews, err := o.giteaClient.GetPRReviews(parts[0], parts[1], prNum)
+		if err != nil {
+			continue
+		}
+		for _, r := range reviews {
+			if r.State == "REQUEST_CHANGES" && !r.Stale {
+				return &prNeedingFix{repo: repo, number: prNum}
+			}
+		}
+	}
+	return nil
+}
+
+// determineModeFromPRState checks Gitea for merged PRs associated with a ticket
+// and returns the next agent mode that should be spawned.  This recovers from
+// events the orchestrator missed (e.g. a plan PR merged while the orchestrator
+// was down).  Returns "" if no follow-up is needed.
+func (o *orchestrator) determineModeFromPRState(ticketID int) string {
+	hasMergedPlanPR := false
+	hasMergedStepPR := false
+	hasOpenPR := false
+
+	for key, tid := range o.prMappings {
+		if tid != ticketID {
+			continue
+		}
+		hashIdx := strings.LastIndex(key, "#")
+		if hashIdx < 0 {
+			continue
+		}
+		repo := key[:hashIdx]
+		prNum, err := strconv.Atoi(key[hashIdx+1:])
+		if err != nil {
+			continue
+		}
+		parts := strings.SplitN(repo, "/", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		pr, err := o.giteaClient.GetPullRequest(parts[0], parts[1], prNum)
+		if err != nil {
+			continue
+		}
+		if pr.State == "open" {
+			hasOpenPR = true
+			continue
+		}
+		if !pr.Merged {
+			continue
+		}
+		// Classify the merged PR by its title or target branch.
+		if strings.Contains(pr.Title, "Implementation Plan") || strings.Contains(pr.Title, "implementation plan") {
+			hasMergedPlanPR = true
+		} else {
+			hasMergedStepPR = true
+		}
+	}
+
+	if hasOpenPR {
+		return "" // still waiting for review/merge
+	}
+	if hasMergedStepPR {
+		// A step PR was merged — check if all steps are done (via comments).
+		if o.isStepComplete(ticketID) {
+			return ""
+		}
+		return "step"
+	}
+	if hasMergedPlanPR {
+		return "step" // plan merged, need to start step work
+	}
+	return ""
+}
+
+// spawnFixAgent creates a fix agent for a specific PR on a ticket.
+func (o *orchestrator) spawnFixAgent(ticketID int, repoFullName, repoOwner, repoName string, prNumber int) {
+	agent, err := o.identityMgr.GetOrCreateAgent("general", o.assignEngine.GetBusyAgents())
+	if err != nil {
+		log.Printf("ERROR: could not get agent for fix on ticket %d: %v", ticketID, err)
+		return
+	}
+	o.assignEngine.AssignAgent(ticketID, agent.ID)
+	o.assignTicketInTaiga(ticketID, agent.TaigaUserID)
+
+	spec := &lifecycle.AgentJobSpec{
+		AgentID:        agent.ID,
+		Specialization: agent.Specialization,
+		TicketID:       ticketID,
+		Mode:           "fix",
+		PRNumber:       prNumber,
+		PRRepo:         repoFullName,
+		RepoOwner:      repoOwner,
+		RepoName:       repoName,
+		GiteaUsername:   agent.ID,
+		GiteaPassword:   agent.Password,
+		TaigaUsername:   agent.ID,
+		TaigaPassword:   agent.Password,
+		HumanUsername:   o.cfg.Taiga.HumanUsername,
+		HumanTaigaID:   o.humanTaigaID,
+		TaigaProjectID: o.projectID,
+	}
+	jobName, err := o.lifecycleMgr.CreateJob(context.Background(), spec)
+	if err != nil {
+		log.Printf("ERROR: could not spawn fix agent for ticket %d: %v", ticketID, err)
+		return
+	}
+	log.Printf("Ticket #%d: fix agent %s spawned (job: %s) for PR %s#%d",
+		ticketID, agent.ID, jobName, repoFullName, prNumber)
+	o.saveState(context.Background())
+}
+
+// postLifecycleMarker posts a lifecycle comment on a Taiga ticket so that
+// determineMode() knows the ticket is waiting for a PR event.  The marker
+// is mode-specific and tells the orchestrator not to re-spawn an agent.
+// If the agent already posted the marker, the duplicate is harmless — the
+// newest occurrence wins in the comment search.
+func (o *orchestrator) postLifecycleMarker(ticketID int, mode string) {
+	var marker string
+	switch mode {
+	case "plan":
+		marker = "[phase:plan-created]"
+	case "step":
+		// Use a generic step marker; the agent may have posted a more
+		// specific [step:N/M] or [step:complete] already.
+		marker = "[step:in-progress]"
+	case "fix":
+		marker = "[fix:applied]"
+	default:
+		return
+	}
+
+	// Check whether an equivalent marker is already present (avoid noisy duplicates).
+	// For step mode, any [step:*] marker suffices (e.g. [step:3/7]).
+	comments, err := o.taigaClient.GetComments(ticketID)
+	if err == nil {
+		checkPrefix := marker
+		if mode == "step" {
+			checkPrefix = "[step:"
+		}
+		for i := 0; i < len(comments); i++ {
+			if strings.Contains(comments[i].Comment, checkPrefix) {
+				return // already posted
+			}
+			// Stop searching once we hit [analysis:proceed] — only check
+			// comments that are newer than the last mode transition.
+			if strings.Contains(comments[i].Comment, "[analysis:proceed]") {
+				break
+			}
+		}
+	}
+
+	story, err := o.taigaClient.GetUserStory(ticketID)
+	if err != nil {
+		log.Printf("WARNING: could not fetch ticket %d to post lifecycle marker: %v", ticketID, err)
+		return
+	}
+
+	comment := fmt.Sprintf("%s\n\nAgent job completed — waiting for PR review/merge.", marker)
+	_, err = o.taigaClient.UpdateUserStory(ticketID, &taiga.UserStoryUpdate{
+		Comment: comment,
+		Version: story.Version,
+	})
+	if err != nil {
+		log.Printf("WARNING: could not post lifecycle marker on ticket %d: %v", ticketID, err)
+	}
+}
+
+// assignTicketInTaiga sets the assigned_to field on a Taiga ticket so the
+// assignment is visible in the board UI.  It does not change the ticket status.
+func (o *orchestrator) assignTicketInTaiga(ticketID, taigaUserID int) {
+	story, err := o.taigaClient.GetUserStory(ticketID)
+	if err != nil {
+		log.Printf("WARNING: Could not fetch ticket %d for assignment: %v", ticketID, err)
+		return
+	}
+	_, err = o.taigaClient.UpdateUserStory(ticketID, &taiga.UserStoryUpdate{
+		AssignedTo: &taigaUserID,
+		Version:    story.Version,
+	})
+	if err != nil {
+		log.Printf("WARNING: Could not assign ticket %d to agent: %v", ticketID, err)
+	}
 }
 
 // handleTagChange checks for delegation tags on a user story change event.
@@ -974,21 +1284,7 @@ func (o *orchestrator) assignTicket(ticketID int) error {
 
 	// Record the assignment internally — ticket status stays "ready" in Taiga
 	o.assignEngine.AssignAgent(ticketID, agent.ID)
-
-	// Assign the ticket to the agent user in Taiga (makes the assignment visible)
-	// but do NOT change the status — it stays "ready" until analysis confirms.
-	story, err := o.taigaClient.GetUserStory(ticketID)
-	if err != nil {
-		log.Printf("WARNING: Could not fetch ticket %d for assignment: %v", ticketID, err)
-	} else {
-		_, err = o.taigaClient.UpdateUserStory(ticketID, &taiga.UserStoryUpdate{
-			AssignedTo: &agent.TaigaUserID,
-			Version:    story.Version,
-		})
-		if err != nil {
-			log.Printf("WARNING: Could not assign ticket %d to agent: %v", ticketID, err)
-		}
-	}
+	o.assignTicketInTaiga(ticketID, agent.TaigaUserID)
 
 	// Derive the mode from ticket state (comments) — always start fresh
 	mode := o.determineMode(ticketID)
@@ -1074,32 +1370,70 @@ func (o *orchestrator) reconcile(ctx context.Context) error {
 		}
 	}
 
-	// Check for restored assignments that have no running Job — the
-	// orchestrator may have restarted after a Job completed but before
-	// the next mode was spawned.  Re-trigger the lifecycle for these.
-	// For each assigned ticket, check if a Job is running.  If not,
-	// derive the mode from the ticket's Taiga comments and re-spawn.
+	// Check all tracked assignments (both "assigned" and "waiting").
+	// After an orchestrator restart, events may have occurred while we were
+	// down (PRs merged, tickets closed, etc.) so we re-validate everything.
 	for ticketID, a := range o.assignEngine.GetAllAssignments() {
-		if a.Status != "assigned" {
+		if a.Status != "assigned" && a.Status != "waiting" {
 			continue
 		}
-		mode := o.determineMode(ticketID)
-		if mode == "" {
-			log.Printf("Reconcile: ticket #%d is complete or waiting for human, clearing assignment", ticketID)
+
+		// Validate the ticket still exists and is in a workable status.
+		story, err := o.taigaClient.GetUserStory(ticketID)
+		if err != nil {
+			log.Printf("Reconcile: ticket #%d no longer accessible, clearing assignment: %v", ticketID, err)
 			o.assignEngine.CompleteTicket(ticketID)
 			continue
 		}
-		jobName := lifecycle.JobName(a.PrimaryAgent, ticketID, mode)
-		js, _ := o.lifecycleMgr.GetJobStatus(ctx, jobName)
-		if js != nil {
-			continue // Job exists (running, succeeded, or failed — handled below)
+		if story.Status != o.readyStatusID && story.Status != o.inProgressID {
+			log.Printf("Reconcile: ticket #%d is not in ready/in-progress status, clearing assignment", ticketID)
+			o.assignEngine.CompleteTicket(ticketID)
+			continue
 		}
+
+		// Check whether ANY job exists for this ticket (regardless of mode).
+		hasJob, err := o.lifecycleMgr.HasJobForTicket(ctx, ticketID)
+		if err != nil {
+			log.Printf("WARNING: could not check jobs for ticket %d: %v", ticketID, err)
+			continue
+		}
+		if hasJob {
+			continue
+		}
+
+		// Derive the correct mode from the ticket's comment history.
+		mode := o.determineMode(ticketID)
+		if mode == "" {
+			// Comments say "waiting for PR" or "done".  Check Gitea for
+			// open PRs with pending review-requested-changes that the
+			// orchestrator may have missed (e.g. during a restart).
+			if pr := o.findPRNeedingFix(ticketID); pr != nil {
+				parts := strings.SplitN(pr.repo, "/", 2)
+				log.Printf("Reconcile: ticket #%d has open PR %s#%d with requested changes, spawning fix agent",
+					ticketID, pr.repo, pr.number)
+				o.spawnFixAgent(ticketID, pr.repo, parts[0], parts[1], pr.number)
+				continue
+			}
+			// Check if a PR was merged while the orchestrator was down
+			// (e.g. plan PR merged → need step agent).
+			if recoveredMode := o.determineModeFromPRState(ticketID); recoveredMode != "" {
+				log.Printf("Reconcile: ticket #%d has merged PR requiring follow-up, spawning %s agent", ticketID, recoveredMode)
+				mode = recoveredMode
+			} else {
+				if a.Status == "assigned" {
+					log.Printf("Reconcile: ticket #%d is complete or waiting for PR, clearing assignment", ticketID)
+					o.assignEngine.CompleteTicket(ticketID)
+				}
+				continue
+			}
+		}
+
 		log.Printf("Reconcile: ticket #%d has no Job, derived mode=%s, spawning", ticketID, mode)
 		o.respawnAgent(ticketID, mode)
 	}
 
 	// Check for "in progress" tickets that have no running Job and are
-	// not assigned to the human — these need an agent re-spawned.
+	// not assigned to the human — these may need an agent re-spawned.
 	inProgressStories, err := o.taigaClient.ListUserStories(o.projectID, &taiga.UserStoryListOptions{
 		StatusID: o.inProgressID,
 	})
@@ -1111,15 +1445,41 @@ func (o *orchestrator) reconcile(ctx context.Context) error {
 			if o.assignEngine.GetAssignment(story.ID) != nil {
 				continue
 			}
-			assignedToHuman := false
 			if story.AssignedTo != nil && *story.AssignedTo == o.humanTaigaID {
-				assignedToHuman = true
-			}
-			if assignedToHuman {
 				continue
 			}
-			log.Printf("Reconcile: in-progress ticket #%d has no agent, re-spawning", story.ID)
-			o.respawnAgent(story.ID, "step")
+			// Check if a Job already exists for this ticket (e.g. spawned by
+			// a webhook handler but not yet tracked in the assignment engine).
+			hasJob, jobErr := o.lifecycleMgr.HasJobForTicket(ctx, story.ID)
+			if jobErr != nil {
+				log.Printf("WARNING: could not check jobs for ticket %d: %v", story.ID, jobErr)
+				continue
+			}
+			if hasJob {
+				continue
+			}
+			// Derive the correct mode from the ticket's comment history.
+			mode := o.determineMode(story.ID)
+			if mode == "" {
+				// Comments say "waiting" or "done" — check Gitea for open
+				// PRs with pending review-requested-changes that were missed.
+				if pr := o.findPRNeedingFix(story.ID); pr != nil {
+					parts := strings.SplitN(pr.repo, "/", 2)
+					log.Printf("Reconcile: in-progress ticket #%d has open PR %s#%d with requested changes, spawning fix agent",
+						story.ID, pr.repo, pr.number)
+					o.spawnFixAgent(story.ID, pr.repo, parts[0], parts[1], pr.number)
+					continue
+				}
+				// Check if a PR was merged while the orchestrator was down.
+				if recoveredMode := o.determineModeFromPRState(story.ID); recoveredMode != "" {
+					log.Printf("Reconcile: in-progress ticket #%d has merged PR requiring follow-up, spawning %s agent", story.ID, recoveredMode)
+					mode = recoveredMode
+				} else {
+					continue
+				}
+			}
+			log.Printf("Reconcile: in-progress ticket #%d has no agent, re-spawning in %s mode", story.ID, mode)
+			o.respawnAgent(story.ID, mode)
 		}
 	}
 

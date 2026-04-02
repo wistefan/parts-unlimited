@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 )
@@ -187,15 +188,18 @@ func (c *Client) AddComment(storyID int, comment string, version int) error {
 
 // HistoryEntry represents an entry in a user story's history.
 type HistoryEntry struct {
-	ID        string `json:"id"`
-	Comment   string `json:"comment"`
-	CreatedAt string `json:"created_at"`
-	User      struct {
+	ID                string  `json:"id"`
+	Comment           string  `json:"comment"`
+	CreatedAt         string  `json:"created_at"`
+	DeleteCommentDate *string `json:"delete_comment_date"`
+	User              struct {
 		Username string `json:"username"`
 	} `json:"user"`
 }
 
 // GetComments retrieves comment history for a user story.
+// Results are sorted newest-first by created_at so callers can iterate
+// from index 0 to find the most recent lifecycle marker.
 func (c *Client) GetComments(storyID int) ([]HistoryEntry, error) {
 	path := fmt.Sprintf("/api/v1/history/userstory/%d?type=comment", storyID)
 
@@ -214,7 +218,21 @@ func (c *Client) GetComments(storyID int) ([]HistoryEntry, error) {
 		return nil, fmt.Errorf("decoding comments: %w", err)
 	}
 
-	return entries, nil
+	// Filter out deleted comments and sort newest-first.
+	filtered := entries[:0]
+	for _, e := range entries {
+		if e.DeleteCommentDate != nil {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+
+	// Sort newest-first by created_at (RFC 3339 strings sort lexicographically).
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].CreatedAt > filtered[j].CreatedAt
+	})
+
+	return filtered, nil
 }
 
 // --- Statuses ---

@@ -59,7 +59,7 @@ spec:
       containers:
         - name: orchestrator
           image: orchestrator:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Never
           args:
             - "--config=/etc/orchestrator/config.yaml"
           ports:

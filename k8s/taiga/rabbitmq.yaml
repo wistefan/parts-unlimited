@@ -61,7 +61,8 @@ spec:
               memory: 512Mi
       volumes:
         - name: rabbitmq-data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: taiga-rabbitmq-data
 
 ---
 apiVersion: v1

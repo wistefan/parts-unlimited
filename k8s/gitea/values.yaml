@@ -35,9 +35,13 @@ service:
     type: LoadBalancer
     port: 2222
 
-# Persistence for Gitea data
+# Persistence for Gitea data — uses pre-provisioned hostPath PVC so data
+# survives k3s reinstalls.  The PVC is created by k8s/gitea/volumes.yaml.
 persistence:
   enabled: true
+  create: false
+  mount: true
+  claimName: gitea-shared-storage
   size: 10Gi
 
 # Bundled PostgreSQL (single-node, not HA)
@@ -51,6 +55,7 @@ postgresql:
         username: gitea
   primary:
     persistence:
+      existingClaim: gitea-postgresql-data
       size: 5Gi
 
 postgresql-ha:

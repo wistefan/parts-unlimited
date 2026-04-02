@@ -59,3 +59,65 @@ spec:
     requests:
       storage: 5Gi
   storageClassName: taiga-shared
+
+---
+## PostgreSQL data — survives k3s reinstalls because it lives on the host.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: taiga-db-pv
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /var/lib/dev-env/taiga/db
+    type: DirectoryOrCreate
+  storageClassName: taiga-shared
+  persistentVolumeReclaimPolicy: Retain
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: taiga-db-data
+  namespace: taiga
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: taiga-shared
+
+---
+## RabbitMQ data — previously used emptyDir which was lost on every restart.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: taiga-rabbitmq-pv
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /var/lib/dev-env/taiga/rabbitmq
+    type: DirectoryOrCreate
+  storageClassName: taiga-shared
+  persistentVolumeReclaimPolicy: Retain
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: taiga-rabbitmq-data
+  namespace: taiga
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: taiga-shared

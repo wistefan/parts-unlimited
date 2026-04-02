@@ -157,13 +157,34 @@ echo "  Subject: ${TICKET_SUBJECT}"
 echo "  Tags:    ${TICKET_TAGS:-none}"
 
 # --- Fetch ticket comments ---
+#
+# To reduce token usage, we only pass relevant context to the agent:
+#   1. The last agent comment (which should contain a cumulative context summary)
+#   2. Any human comments posted after it (new input the agent needs to see)
+# This gives full context in a fraction of the tokens.
 
 echo "Fetching ticket comments..."
-COMMENTS=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
+ALL_COMMENTS=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
     "${TAIGA_URL}/api/v1/history/userstory/${TICKET_ID}" \
-    | jq -r '[.[] | select(.comment != null and .comment != "") | {user: .user.username, comment: .comment, date: .created_at}]')
-COMMENT_COUNT=$(echo "${COMMENTS}" | jq 'length')
-echo "  Comments: ${COMMENT_COUNT}"
+    | jq -r '[.[] | select(.comment != null and .comment != "" and .delete_comment_date == null) | {user: .user.username, comment: .comment, date: .created_at}]')
+COMMENT_COUNT=$(echo "${ALL_COMMENTS}" | jq 'length')
+echo "  Total comments: ${COMMENT_COUNT}"
+
+# Find the index of the last agent comment (any user containing "-agent-").
+# Comments are returned newest-first by Taiga; we sort oldest-first for indexing.
+COMMENTS_ASC=$(echo "${ALL_COMMENTS}" | jq 'sort_by(.date)')
+LAST_AGENT_IDX=$(echo "${COMMENTS_ASC}" | jq '[.[] | .user] | to_entries | map(select(.value | contains("-agent-"))) | last | .key // -1')
+
+if [ "${LAST_AGENT_IDX}" -ge 0 ] 2>/dev/null; then
+    # Extract: the last agent comment + all comments after it (human input)
+    COMMENTS=$(echo "${COMMENTS_ASC}" | jq --argjson idx "${LAST_AGENT_IDX}" '.[$idx:]')
+    RELEVANT_COUNT=$(echo "${COMMENTS}" | jq 'length')
+    echo "  Relevant comments (last agent + newer): ${RELEVANT_COUNT}"
+else
+    # No agent comments yet — pass latest 5 for initial context
+    COMMENTS=$(echo "${COMMENTS_ASC}" | jq '.[-5:]')
+    echo "  No prior agent comments, using latest 5"
+fi
 
 # --- Determine repo from ticket or env ---
 
@@ -263,11 +284,43 @@ else
         fi
 
         echo "Using imported repo: ${REPO_OWNER}/${REPO_NAME}"
-    else
+    elif echo "${REPO_REF}" | grep -q '/'; then
         # Local owner/name format
         REPO_OWNER=$(echo "${REPO_REF}" | cut -d/ -f1)
         REPO_NAME=$(echo "${REPO_REF}" | cut -d/ -f2)
         echo "Extracted repo from description: ${REPO_OWNER}/${REPO_NAME}"
+    else
+        # Plain repo name — greenfield project.  Create under the agent's
+        # own Gitea identity if it does not exist yet.
+        REPO_NAME="${REPO_REF}"
+        REPO_OWNER="${GITEA_USERNAME}"
+        echo "Detected plain repo name: ${REPO_NAME}"
+
+        if curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+            "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}" > /dev/null 2>&1; then
+            echo "  Repo ${REPO_OWNER}/${REPO_NAME} already exists in Gitea."
+        else
+            echo "Creating new repo ${REPO_OWNER}/${REPO_NAME} in Gitea..."
+            CREATE_RESPONSE=$(curl -s -w "\n%{http_code}" \
+                -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+                -X POST "${GITEA_URL}/api/v1/user/repos" \
+                -H "Content-Type: application/json" \
+                -d "{
+                    \"name\": \"${REPO_NAME}\",
+                    \"auto_init\": true,
+                    \"default_branch\": \"main\"
+                }")
+            CREATE_CODE=$(echo "${CREATE_RESPONSE}" | tail -1)
+            if [ "${CREATE_CODE}" = "201" ]; then
+                echo "  Created repo ${REPO_OWNER}/${REPO_NAME}"
+            else
+                echo "ERROR: Failed to create repo ${REPO_NAME} (HTTP ${CREATE_CODE})"
+                echo "  Response: $(echo "${CREATE_RESPONSE}" | head -n -1)"
+                request_human_input "Failed to create repository \`${REPO_NAME}\` in Gitea (HTTP ${CREATE_CODE}). Please create it manually."
+            fi
+        fi
+
+        echo "Using repo: ${REPO_OWNER}/${REPO_NAME}"
     fi
 fi
 
@@ -463,7 +516,7 @@ $([ -n "${PLAN_STEP}" ] && echo "- **Plan Step:** ${PLAN_STEP}" || true)
 
 ${TICKET_DESCRIPTION}
 
-## Ticket Comments
+## Ticket Comments (last agent context + new human input)
 
 $(echo "${COMMENTS}" | jq -r '.[] | "**\(.user)** (\(.date)):\n\(.comment)\n"' 2>/dev/null || echo "No comments.")
 
@@ -493,6 +546,23 @@ elif [ -f "/home/agent/system-prompt.md" ]; then
     echo "  Using default system prompt"
 fi
 
+# --- Append CLAUDE.md to system prompt for prompt caching ---
+# Claude Code caches the system prompt prefix across all turns in a session.
+# By including CLAUDE.md here (instead of letting the agent read it via a tool
+# call), the codebase context stays in the cached prefix from turn 1 — saving
+# significant input tokens on every subsequent turn.
+
+CLAUDE_MD="${WORKSPACE}/CLAUDE.md"
+if [ -f "${CLAUDE_MD}" ]; then
+    CLAUDE_MD_SIZE=$(wc -c < "${CLAUDE_MD}")
+    SYSTEM_PROMPT="${SYSTEM_PROMPT}
+
+# Codebase Context (CLAUDE.md)
+
+$(cat "${CLAUDE_MD}")"
+    echo "  CLAUDE.md appended to system prompt (${CLAUDE_MD_SIZE} bytes)"
+fi
+
 # --- Invoke Claude Code ---
 
 # Copy credentials into the writable .claude directory (mounted as emptyDir).
@@ -514,6 +584,11 @@ CLAUDE_ARGS=(
     --verbose
 )
 
+if [ -n "${CLAUDE_MODEL:-}" ]; then
+    CLAUDE_ARGS+=(--model "${CLAUDE_MODEL}")
+    echo "  Model: ${CLAUDE_MODEL}"
+fi
+
 if [ -n "${SYSTEM_PROMPT}" ]; then
     CLAUDE_ARGS+=(--system-prompt "${SYSTEM_PROMPT}")
 fi
@@ -523,24 +598,179 @@ if [ -n "${ALLOWED_TOOLS}" ]; then
     CLAUDE_ARGS+=(--allowedTools "${ALLOWED_TOOLS}")
 fi
 
-# Pipe the prompt via stdin to avoid shell argument length limits.
+# --- Session chaining ---
+#
+# Running one long Claude session accumulates context across all turns.
+# At 200+ turns the cache reads alone can cost $20+.  Session chaining
+# breaks the work into bounded sessions (default: 50 turns each).  After
+# each session the bootstrap extracts a context summary from the last
+# assistant message and feeds it into the NEXT session's prompt, so the
+# agent picks up where it left off with a fresh, compact context.
+#
+# The task is done when the agent writes completion-status.json.
+
+TURNS_PER_SESSION="${TURNS_PER_SESSION:-50}"
+MAX_SESSIONS="${MAX_SESSIONS:-20}"
+
+# extract_context_summary <result_file>
+# Pulls the last assistant text block from stream-json output.  The agent
+# is instructed to end with a "### Context Summary" section; if present we
+# use that, otherwise we take the last 2000 chars of assistant text.
+extract_context_summary() {
+    python3 -c "
+import json, sys
+
+last_text = ''
+for line in open('$1'):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except:
+        continue
+    if msg.get('type') != 'assistant':
+        continue
+    for block in msg.get('message', {}).get('content', []):
+        if block.get('type') == 'text':
+            last_text = block['text']
+
+# Prefer the Context Summary section if present
+idx = last_text.rfind('### Context Summary')
+if idx >= 0:
+    print(last_text[idx:])
+elif last_text:
+    print(last_text[-2000:])
+" 2>/dev/null || true
+}
+
 echo "  Claude args: ${CLAUDE_ARGS[*]}"
 echo "  Prompt size: $(wc -c < "${PROMPT_FILE}") bytes"
+echo "  Session chaining: ${TURNS_PER_SESSION} turns/session, max ${MAX_SESSIONS} sessions"
 
 CLAUDE_EXIT=0
-claude "${CLAUDE_ARGS[@]}" < "${PROMPT_FILE}" > "${RESULT_FILE}" 2>&1 || CLAUDE_EXIT=$?
+SESSION_NUM=0
+CUMULATIVE_RESULT="${RESULT_FILE}"
+SESSION_CONTEXT=""
+> "${CUMULATIVE_RESULT}"  # initialize empty
 
-echo "Claude Code finished (exit code: ${CLAUDE_EXIT})."
+while [ "${SESSION_NUM}" -lt "${MAX_SESSIONS}" ]; do
+    SESSION_NUM=$((SESSION_NUM + 1))
+
+    # Build per-session prompt: original task + context from previous session
+    SESSION_PROMPT_FILE="/home/agent/session-prompt.md"
+    if [ -n "${SESSION_CONTEXT}" ]; then
+        {
+            cat "${PROMPT_FILE}"
+            echo ""
+            echo "## Previous Session Context"
+            echo ""
+            echo "You are continuing work from a previous session. Here is where you left off:"
+            echo ""
+            echo "${SESSION_CONTEXT}"
+        } > "${SESSION_PROMPT_FILE}"
+        echo "  Session ${SESSION_NUM}: continuing with $(echo "${SESSION_CONTEXT}" | wc -c) bytes of context"
+    else
+        cp "${PROMPT_FILE}" "${SESSION_PROMPT_FILE}"
+        echo "  Session ${SESSION_NUM}: initial session"
+    fi
+
+    # Run Claude with a per-session turn limit
+    SESSION_RESULT="/home/agent/session-result-${SESSION_NUM}.json"
+    CLAUDE_EXIT=0
+    claude "${CLAUDE_ARGS[@]}" --max-turns "${TURNS_PER_SESSION}" \
+        < "${SESSION_PROMPT_FILE}" > "${SESSION_RESULT}" 2>&1 || CLAUDE_EXIT=$?
+
+    echo "  Session ${SESSION_NUM} finished (exit ${CLAUDE_EXIT}, $(wc -c < "${SESSION_RESULT}" 2>/dev/null || echo 0) bytes)"
+
+    # Append session result to cumulative result for usage tracking
+    cat "${SESSION_RESULT}" >> "${CUMULATIVE_RESULT}"
+
+    # Check if the agent completed its task
+    if [ -f "/home/agent/completion-status.json" ]; then
+        echo "  Task completed in session ${SESSION_NUM}."
+        break
+    fi
+
+    # Non-zero exit without completion means Claude hit the turn limit
+    # or encountered an issue — extract context and continue
+    SESSION_CONTEXT=$(extract_context_summary "${SESSION_RESULT}")
+    if [ -z "${SESSION_CONTEXT}" ]; then
+        echo "  WARNING: Could not extract context summary from session ${SESSION_NUM}. Stopping."
+        break
+    fi
+done
+
+if [ "${SESSION_NUM}" -ge "${MAX_SESSIONS}" ] && [ ! -f "/home/agent/completion-status.json" ]; then
+    echo "  WARNING: Reached max sessions (${MAX_SESSIONS}) without completing task."
+fi
+
+echo "Claude Code finished after ${SESSION_NUM} session(s) (last exit code: ${CLAUDE_EXIT})."
 
 # Show a summary of Claude's output for debugging
-RESULT_SIZE=$(wc -c < "${RESULT_FILE}" 2>/dev/null || echo "0")
+RESULT_SIZE=$(wc -c < "${CUMULATIVE_RESULT}" 2>/dev/null || echo "0")
 echo "  Result file: ${RESULT_SIZE} bytes"
 if [ "${RESULT_SIZE}" -lt 500 ]; then
     echo "  Result content:"
-    cat "${RESULT_FILE}" || true
+    cat "${CUMULATIVE_RESULT}" || true
 elif [ "${CLAUDE_EXIT}" -ne 0 ]; then
     echo "  Last 20 lines of result:"
-    tail -20 "${RESULT_FILE}" || true
+    tail -20 "${CUMULATIVE_RESULT}" || true
+fi
+
+# --- Extract token usage ---
+
+USAGE_SUMMARY=""
+if [ -f "${RESULT_FILE}" ]; then
+    USAGE_SUMMARY=$(python3 -c "
+import json, sys
+
+input_tok = 0
+output_tok = 0
+cache_write = 0
+cache_read = 0
+turns = 0
+
+for line in open('${RESULT_FILE}'):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except:
+        continue
+    if msg.get('type') != 'assistant':
+        continue
+    usage = msg.get('message', {}).get('usage', {})
+    if not usage:
+        continue
+    turns += 1
+    input_tok += usage.get('input_tokens', 0)
+    output_tok += usage.get('output_tokens', 0)
+    cache_write += usage.get('cache_creation_input_tokens', 0)
+    cache_read += usage.get('cache_read_input_tokens', 0)
+
+# Opus pricing: input \$15/MTok, output \$75/MTok, cache_write \$18.75/MTok, cache_read \$1.50/MTok
+i_cost = input_tok * 15 / 1_000_000
+o_cost = output_tok * 75 / 1_000_000
+cw_cost = cache_write * 18.75 / 1_000_000
+cr_cost = cache_read * 1.50 / 1_000_000
+total = i_cost + o_cost + cw_cost + cr_cost
+
+print(f'| Metric | Tokens | Est. Cost |')
+print(f'|---|---:|---:|')
+print(f'| Input | {input_tok:,} | \${i_cost:.2f} |')
+print(f'| Output | {output_tok:,} | \${o_cost:.2f} |')
+print(f'| Cache write | {cache_write:,} | \${cw_cost:.2f} |')
+print(f'| Cache read | {cache_read:,} | \${cr_cost:.2f} |')
+print(f'| **Total** | | **\${total:.2f}** |')
+print(f'| Turns | {turns} | |')
+" 2>/dev/null || true)
+
+    if [ -n "${USAGE_SUMMARY}" ]; then
+        echo "Token usage:"
+        echo "${USAGE_SUMMARY}"
+    fi
 fi
 
 # --- Process result ---
@@ -565,6 +795,11 @@ if [ "${MODE}" = "analysis" ]; then
     ANALYSIS_COMMENT=$(jq -r '.analysis_comment // ""' /home/agent/completion-status.json 2>/dev/null || true)
 
     echo "  Analysis result: ${ANALYSIS_RESULT}"
+
+    # Append usage summary to analysis comment
+    if [ -n "${USAGE_SUMMARY}" ] && [ -n "${ANALYSIS_COMMENT}" ]; then
+        ANALYSIS_COMMENT="${ANALYSIS_COMMENT}\n\n### Token Usage\n${USAGE_SUMMARY}"
+    fi
 
     if [ -n "${ANALYSIS_COMMENT}" ]; then
         echo "Posting analysis comment on ticket..."
@@ -678,6 +913,38 @@ ${COMPLETION_STATUS}"
     TAIGA_COMMENT=$(jq -r '.taiga_comment // ""' /home/agent/completion-status.json 2>/dev/null || true)
     if [ -z "${TAIGA_COMMENT}" ]; then
         TAIGA_COMMENT="**Agent ${AGENT_ID}** completed work.\n\n**Status:** ${COMPLETION_STATUS}\n**Summary:** ${COMPLETION_SUMMARY:-N/A}\n**Branch:** \`${BRANCH_NAME:-N/A}\`"
+    fi
+
+    # Ensure lifecycle markers are present so the orchestrator can derive
+    # the correct mode.  The agent may not have written the expected marker
+    # in completion-status.json, so we inject it when a PR exists.
+    HAS_PR="false"
+    if [ -n "${PR_NUMBER}" ] || [ -n "${EXISTING_PR}" ]; then
+        HAS_PR="true"
+    fi
+    if [ "${HAS_PR}" = "true" ]; then
+        case "${MODE}" in
+            plan)
+                if ! echo "${TAIGA_COMMENT}" | grep -qF '[phase:plan-created]'; then
+                    TAIGA_COMMENT="[phase:plan-created]\n\n${TAIGA_COMMENT}"
+                fi
+                ;;
+            step)
+                if ! echo "${TAIGA_COMMENT}" | grep -qF '[step:'; then
+                    TAIGA_COMMENT="[step:in-progress]\n\n${TAIGA_COMMENT}"
+                fi
+                ;;
+            fix)
+                if ! echo "${TAIGA_COMMENT}" | grep -qF '[fix:applied]'; then
+                    TAIGA_COMMENT="[fix:applied]\n\n${TAIGA_COMMENT}"
+                fi
+                ;;
+        esac
+    fi
+
+    # Append usage summary to Taiga comment
+    if [ -n "${USAGE_SUMMARY}" ]; then
+        TAIGA_COMMENT="${TAIGA_COMMENT}\n\n### Token Usage\n${USAGE_SUMMARY}"
     fi
 
     echo "Posting progress comment on ticket..."

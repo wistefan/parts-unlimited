@@ -33,9 +33,26 @@ Your identity and current task are provided in the task prompt. Always commit un
 
 - You are running in a sandboxed container. Your work directory is the cloned repository.
 - You have internet access for reading documentation and downloading packages.
-- You can install additional tools and dependencies as needed for the project.
+- You have passwordless `sudo` access. Install any tools the project requires
+  (e.g., `sudo apt-get update && sudo apt-get install -y openjdk-17-jdk maven`).
+  Do not let a missing toolchain block your work — install it and continue.
+- Docker is available (`docker` CLI pre-installed, daemon runs as a sidecar).
+  Use it for builds, running test containers, docker-compose, etc.
 - Do not modify files outside the repository working directory.
 - Do not attempt to contact external services other than package registries.
+
+# Context Summary (IMPORTANT)
+
+Your Taiga comment (posted by the bootstrap via `taiga_comment` in completion-status.json)
+is the **only context future agents will receive**.  Every `taiga_comment` you write MUST
+end with a `### Context Summary` section containing:
+
+- What has been accomplished so far (cumulative, not just this session)
+- Key decisions and their rationale
+- Current state of the implementation
+- Any unresolved issues or open questions
+
+This rolling summary replaces the full comment history and saves significant tokens.
 
 # Completion
 

@@ -141,16 +141,33 @@ echo ""
 # --- Step 4: Shared volume directories ---
 
 echo "=== Step 4: Shared volumes ==="
+# Taiga directories — static/media (UID 999) and PostgreSQL (UID 999)
 mkdir -p /var/lib/dev-env/taiga/static
 mkdir -p /var/lib/dev-env/taiga/media
-# Taiga containers run as UID 999 (taiga user)
+mkdir -p /var/lib/dev-env/taiga/db
+mkdir -p /var/lib/dev-env/taiga/rabbitmq
 chown -R 999:999 /var/lib/dev-env/taiga
-echo "Created host directories for Taiga shared volumes."
+
+# RabbitMQ runs as UID 100 (rabbitmq user in alpine image)
+chown -R 100:100 /var/lib/dev-env/taiga/rabbitmq
+
+# Gitea directories — data (UID 1000, git user) and PostgreSQL (UID 1001, bitnami)
+mkdir -p /var/lib/dev-env/gitea/data
+mkdir -p /var/lib/dev-env/gitea/postgresql
+chown -R 1000:1000 /var/lib/dev-env/gitea/data
+chown -R 1001:1001 /var/lib/dev-env/gitea/postgresql
+
+echo "Created host directories for persistent volumes."
 echo ""
 
 # --- Step 5: Deploy Gitea ---
 
 echo "=== Step 5: Gitea ==="
+
+# Create hostPath-backed PVs and PVCs before Helm touches the namespace.
+# These must exist before helm install so the chart binds to them instead
+# of creating its own PVCs via the default StorageClass.
+kubectl apply -f "${PROJECT_DIR}/k8s/gitea/volumes.yaml"
 
 # Add Helm repo
 helm repo add gitea-charts https://dl.gitea.io/charts/ 2>/dev/null || true
@@ -330,20 +347,30 @@ if [ -n "${BUILD_CMD}" ]; then
     ${BUILD_CMD} -t agent-worker:latest "${PROJECT_DIR}/agent"
     echo "  agent-worker:latest built."
 
-    # Import images into k3s containerd if built with Docker.
-    # docker save exports as docker.io/library/<name>:latest, which is
-    # what k3s resolves "name:latest" to, so the import works directly.
+    # Import images into k3s containerd.
+    # setup.sh runs as root so we access containerd directly (no sudo).
     if [ "${BUILD_CMD}" = "docker build" ]; then
-        echo "Importing images into k3s..."
-        ${SAVE_CMD} orchestrator:latest | k3s ctr images import -
-        ${SAVE_CMD} agent-worker:latest | k3s ctr images import -
-        # Verify the images are available
-        if k3s ctr images check | grep -q "agent-worker"; then
-            echo "  Images imported into k3s containerd."
-        else
-            echo "  WARNING: Image import may have failed. Checking..."
-            k3s ctr images list | grep -E "orchestrator|agent-worker" || true
-        fi
+        echo "Importing images into k3s containerd..."
+        for img in orchestrator:latest agent-worker:latest; do
+            docker save "${img}" | k3s ctr images import -
+            # Ensure both short and fully-qualified tags exist so k3s
+            # resolves the image regardless of which form it uses.
+            fq="docker.io/library/${img}"
+            if k3s ctr images ls -q | grep -qF "${fq}"; then
+                k3s ctr images tag "${fq}" "${img}" 2>/dev/null || true
+            elif k3s ctr images ls -q | grep -qF "${img}"; then
+                k3s ctr images tag "${img}" "${fq}" 2>/dev/null || true
+            fi
+        done
+        # Verify
+        for img in orchestrator agent-worker; do
+            if k3s ctr images ls -q | grep -qF "${img}"; then
+                echo "  ${img}: OK"
+            else
+                echo "  ERROR: ${img} not found in k3s after import!"
+                exit 1
+            fi
+        done
     fi
 fi
 echo ""

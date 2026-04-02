@@ -359,6 +359,18 @@ sudo ./scripts/cache-images.sh postgres:12.3 nginx:1.19-alpine
 
 Called automatically by `setup.sh`. Requires `docker` on the host. If docker is not available, images are pulled directly by k3s (standard behavior, subject to Docker Hub rate limits).
 
+### `import-images.sh`
+
+Builds and imports local container images (`orchestrator`, `agent-worker`) into k3s containerd. Ensures both short and fully-qualified tags exist to prevent `ErrImagePull`. Can be run standalone after code changes.
+
+```bash
+# Build and import both images
+sudo ./scripts/import-images.sh
+
+# Only rebuild the agent worker
+sudo ./scripts/import-images.sh agent-worker
+```
+
 ### `wait-for-ready.sh`
 
 Helper that blocks until all pods in a namespace are running and ready.
@@ -438,6 +450,43 @@ The init script creates a Taiga project with:
 **Swimlanes** (for Kanban board visualization):
 - General, Frontend, Backend, Test, Documentation, Operations
 
+## Token Usage Optimization
+
+The agent system includes several optimizations to minimize API token consumption. These are especially important when running multiple concurrent agents on Opus.
+
+### Rolling context summaries
+
+Instead of passing the full Taiga comment history to every agent (which can be 20+ comments), the bootstrap only includes:
+
+1. The **last agent comment** — which contains a cumulative context summary
+2. Any **human comments posted after it** — new input the agent needs to see
+
+Every agent is instructed to end its Taiga comment with a `### Context Summary` section that captures cumulative progress, key decisions, current state, and open issues. This rolling summary replaces the full history and keeps prompt input proportional to the current task, not the ticket's total lifetime.
+
+### CLAUDE.md codebase context
+
+During the **plan phase**, the agent creates a `CLAUDE.md` file in the repository root alongside `IMPLEMENTATION_PLAN.md`. This file contains:
+
+- Project overview, tech stack, and build commands
+- Project structure with key directories and files
+- Coding conventions and patterns
+- Important configuration and entry points
+
+Claude Code automatically loads `CLAUDE.md` at session start. Step and fix agents get full codebase orientation without spending tool calls exploring the repository. The bootstrap also appends `CLAUDE.md` to the `--system-prompt` argument (see below).
+
+### Prompt caching via system prompt
+
+The Claude API caches prompt prefixes across turns within a session. The bootstrap maximizes cache hit ratio by placing all stable context into the system prompt:
+
+- **Mode-specific system prompt** — instructions that don't change between turns
+- **CLAUDE.md content** — pre-read from the repo and appended to the system prompt before the first turn
+
+This means the codebase context enters the cached prefix on turn 1 and stays cached (~90% cheaper) for all subsequent turns. Without this, the agent would read `CLAUDE.md` via a tool call, placing it later in the conversation where it can't be cached as effectively.
+
+### Docker-in-Docker sidecar
+
+Agent pods include a DinD sidecar for running Docker commands (builds, compose, test containers). The sidecar is implemented as a Kubernetes native sidecar (init container with `restartPolicy: Always`) so it starts before the agent and is automatically terminated when the agent exits — no stuck pods, no wasted compute.
+
 ## Agent Security Isolation
 
 Agent workers run in sandboxed Kubernetes containers with multiple layers of isolation:
@@ -446,7 +495,7 @@ Agent workers run in sandboxed Kubernetes containers with multiple layers of iso
 |---|---|---|
 | **Network** | `NetworkPolicy` (`k8s/agents/network-policy.yaml`) | Egress limited to Gitea + Taiga (read/write) and public internet on 80/443 (read-only). All other cluster-internal and LAN traffic denied. No ingress. |
 | **Kubernetes API** | `ServiceAccount` with `automountServiceAccountToken: false` | Agent pods cannot read secrets, configmaps, or interact with the K8s API in any way. |
-| **Container** | `securityContext` on pod and container | Non-root user (UID 1000), no privilege escalation, all Linux capabilities dropped. |
+| **Container** | `securityContext` on pod and container | Non-root user (UID 1000) with passwordless sudo for installing toolchains. DinD sidecar runs privileged (required for Docker-in-Docker) but is ephemeral and subject to the same network policies. |
 | **Filesystem** | `emptyDir` workspace volume | Agent works in ephemeral storage. No hostPath mounts, no access to host filesystem. |
 | **RBAC** | Separate `orchestrator` ServiceAccount | Only the orchestrator can manage Jobs, read secrets, and update state. |
 
@@ -468,6 +517,38 @@ kubectl get pods -A
 ```
 
 ## Troubleshooting
+
+### General issues
+
+If work is not picked up or assigned as expected, inspect the running containers:
+
+```shell
+  kubectl get pods -n agents
+```
+
+The orchestrator is organizing the overall work and interacts with taiga and gitea, thus checking the log of the orchestrator is a good starting point for investigation.
+
+The concrete work executed by the agents can be inspected via:
+
+```shell
+kubectl exec -n agents <POD_NAME> -- tail /home/agent/result.json
+```
+
+### ErrImageNeverPull by the agent
+
+A currently unresolved issue coming up from time to time is the inability of agents to pull their image:
+
+```shell
+kubectl get pods -n agents
+NAME                                        READY   STATUS              RESTARTS   AGE
+agent-general-agent-1-ticket-3-step-8mdrr   1/2     ErrImageNeverPull   0          57s
+orchestrator-858478d589-6kxff               1/1     Running    
+```
+Due to an unresolved naming issuer, the images get removed from the k3s. This can be solved by just copying them back from the host:
+
+```shell
+docker save orchestrator:latest agent-worker:latest | sudo k3s ctr images import -
+```
 
 ### Port conflicts
 
@@ -537,7 +618,7 @@ The orchestrator spawns agents in different modes via the `MODE` environment var
 | Mode | When | What the agent does |
 |---|---|---|
 | `analysis` | Ticket is "ready" and unassigned | Evaluates ticket + repo, posts `[analysis:proceed]` or `[analysis:need-info]` |
-| `plan` | Analysis confirmed "proceed" | Creates `IMPLEMENTATION_PLAN.md`, opens plan PR to work branch |
+| `plan` | Analysis confirmed "proceed" | Creates `CLAUDE.md` (codebase context) and `IMPLEMENTATION_PLAN.md`, opens plan PR to work branch |
 | `step` | Plan PR merged, or previous step PR merged | Reads plan, implements next step, opens step PR, signals `[step:N/M]` or `[step:complete]` |
 | `fix` | Human requests changes on a PR | Addresses review comments on existing PR branch, pushes, re-assigns to human |
 

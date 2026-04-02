@@ -14,6 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     python3 \
     python3-pip \
+    sudo \
+    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Claude Code CLI
@@ -21,8 +23,12 @@ RUN npm install -g @anthropic-ai/claude-code
 
 # Create non-root agent user with UID 1000 (matching the K8s pod securityContext).
 # The node base image ships a 'node' user at UID 1000, so remove it first.
+# Grant passwordless sudo so the agent can install project-specific toolchains
+# (Java, Maven, Docker, Go, etc.) at runtime.  The container is ephemeral and
+# network-isolated, so sudo inside it carries no meaningful security risk.
 RUN userdel -r node 2>/dev/null || true \
-    && useradd -m -s /bin/bash -u 1000 agent
+    && useradd -m -s /bin/bash -u 1000 agent \
+    && echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
 USER agent
 WORKDIR /home/agent
 

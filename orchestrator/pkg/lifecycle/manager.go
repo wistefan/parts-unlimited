@@ -163,24 +163,51 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 					ServiceAccountName:           m.config.ServiceAccount,
 					AutomountServiceAccountToken: &falseVal,
 					RestartPolicy:                corev1.RestartPolicyNever,
-					SecurityContext: &corev1.PodSecurityContext{
-						RunAsNonRoot: boolPtr(true),
-						RunAsUser:    int64Ptr(1000),
-						RunAsGroup:   int64Ptr(1000),
-						FSGroup:      int64Ptr(1000),
+					// DinD runs as a native sidecar (init container with
+					// restartPolicy=Always).  Kubernetes automatically
+					// terminates it when the main "agent" container exits,
+					// so the Job completes cleanly.
+					InitContainers: []corev1.Container{
+						{
+							Name:            "dind",
+							Image:           "docker:dind",
+							ImagePullPolicy: corev1.PullIfNotPresent,
+							RestartPolicy:   func() *corev1.ContainerRestartPolicy { p := corev1.ContainerRestartPolicyAlways; return &p }(),
+							SecurityContext: &corev1.SecurityContext{
+								Privileged: boolPtr(true),
+							},
+							Env: []corev1.EnvVar{
+								{
+									Name:  "DOCKER_TLS_CERTDIR",
+									Value: "", // disable TLS — pod-local communication only
+								},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "docker-sock",
+									MountPath: "/var/run",
+								},
+								{
+									Name:      "docker-storage",
+									MountPath: "/var/lib/docker",
+								},
+							},
+						},
 					},
 					Containers: []corev1.Container{
 						{
 							Name:            "agent",
 							Image:           m.config.ContainerImage,
-							ImagePullPolicy: corev1.PullIfNotPresent,
+							ImagePullPolicy: corev1.PullNever,
 							SecurityContext: &corev1.SecurityContext{
-								AllowPrivilegeEscalation: &falseVal,
-								Capabilities: &corev1.Capabilities{
-									Drop: []corev1.Capability{"ALL"},
-								},
+								RunAsUser:                int64Ptr(1000),
+								RunAsGroup:               int64Ptr(1000),
+								AllowPrivilegeEscalation: boolPtr(true),
 							},
-							Env: m.buildEnvVars(spec),
+							Env: append(m.buildEnvVars(spec), corev1.EnvVar{
+								Name:  "DOCKER_HOST",
+								Value: "unix:///var/run/docker.sock",
+							}),
 							VolumeMounts: []corev1.VolumeMount{
 								{
 									Name:      "workspace",
@@ -194,6 +221,10 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 									Name:      "claude-credentials",
 									MountPath: "/home/agent/.claude-secret",
 									ReadOnly:  true,
+								},
+								{
+									Name:      "docker-sock",
+									MountPath: "/var/run",
 								},
 							},
 						},
@@ -223,6 +254,18 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 										},
 									},
 								},
+							},
+						},
+						{
+							Name: "docker-sock",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+						{
+							Name: "docker-storage",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
 							},
 						},
 					},
@@ -350,6 +393,24 @@ func (m *Manager) ListActiveJobs(ctx context.Context) ([]JobStatus, error) {
 	}
 
 	return result, nil
+}
+
+// HasJobForTicket checks whether any Job (running, succeeded, or failed)
+// exists for the given ticket, regardless of mode.  This prevents the
+// reconciliation loop from spawning duplicate agents when the derived mode
+// does not match the mode of the actually running Job.
+func (m *Manager) HasJobForTicket(ctx context.Context, ticketID int) (bool, error) {
+	ticketLabel := fmt.Sprintf("%s=%d", LabelTicketID, ticketID)
+	roleLabel := fmt.Sprintf("%s=%s", LabelRole, LabelRoleValue)
+	selector := roleLabel + "," + ticketLabel
+
+	jobs, err := m.clientset.BatchV1().Jobs(m.config.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil {
+		return false, fmt.Errorf("listing jobs for ticket %d: %w", ticketID, err)
+	}
+	return len(jobs.Items) > 0, nil
 }
 
 // GetActiveJobNames returns the set of currently tracked active job names.

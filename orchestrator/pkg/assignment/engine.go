@@ -153,6 +153,26 @@ func (e *Engine) AssignAgent(ticketID int, agentID string) {
 	log.Printf("Agent %s assigned to ticket %d", agentID, ticketID)
 }
 
+// RestoreAssignment restores a previously persisted assignment with its
+// original status.  Unlike AssignAgent, this preserves the saved status
+// (e.g. "waiting") so the reconciliation loop handles it correctly after
+// an orchestrator restart.  Only "assigned" agents are added to the busy pool.
+func (e *Engine) RestoreAssignment(a *TicketAssignment) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.assignments[a.TicketID] = &TicketAssignment{
+		TicketID:     a.TicketID,
+		PrimaryAgent: a.PrimaryAgent,
+		DelegatedTo:  a.DelegatedTo,
+		PlanStep:     a.PlanStep,
+		Status:       a.Status,
+	}
+	if a.Status == "assigned" {
+		e.busyAgents[a.PrimaryAgent] = a.TicketID
+	}
+}
+
 // DelegateToSpecialization processes a delegation tag on a ticket.
 // Returns the specialization extracted from the tag, or empty string if not a delegation tag.
 func (e *Engine) DelegateToSpecialization(tag string) string {
@@ -235,6 +255,27 @@ func (e *Engine) CompleteTicket(ticketID int) {
 	delete(e.escalations, ticketID)
 
 	log.Printf("Ticket %d completed", ticketID)
+}
+
+// WaitForPR transitions a ticket's assignment to "waiting" status.  The
+// assignment stays in the map (so reconciliation skips the ticket) but the
+// agent is released from the busy pool and can work on other tickets.
+// Call CompleteTicket when the PR is merged, or ReactivateAssignment when
+// the agent needs to be re-spawned (e.g. for a fix after review).
+func (e *Engine) WaitForPR(ticketID int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	a, exists := e.assignments[ticketID]
+	if !exists {
+		return
+	}
+	delete(e.busyAgents, a.PrimaryAgent)
+	for _, delegated := range a.DelegatedTo {
+		delete(e.busyAgents, delegated)
+	}
+	a.Status = "waiting"
+	log.Printf("Ticket %d waiting for PR", ticketID)
 }
 
 // RecordReassignment increments the no-op reassignment counter for a ticket.
