@@ -503,6 +503,30 @@ type CreateHookRequest struct {
 	Active bool              `json:"active"`
 }
 
+// AddCollaborator grants a user access to a repository. Requires the
+// calling client to have owner or site-admin privileges on the repo;
+// the orchestrator uses the configured Gitea admin credentials, which
+// can add collaborators to any repo in the local Gitea. permission is
+// one of "read", "write", "admin". The call is idempotent — repeating
+// it for a user who is already a collaborator still returns 204.
+func (c *Client) AddCollaborator(owner, repo, username, permission string) error {
+	path := fmt.Sprintf("/api/v1/repos/%s/%s/collaborators/%s", owner, repo, username)
+	payload := map[string]string{"permission": permission}
+
+	resp, err := c.doRequest(http.MethodPut, path, payload)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("add collaborator %s to %s/%s: status %d, body: %s",
+			username, owner, repo, resp.StatusCode, body)
+	}
+	return nil
+}
+
 // CreateRepoWebhook registers a webhook on a repository.
 func (c *Client) CreateRepoWebhook(owner, repo string, hook *CreateHookRequest) error {
 	path := fmt.Sprintf("/api/v1/repos/%s/%s/hooks", owner, repo)

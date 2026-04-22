@@ -931,3 +931,7 @@ model has shifted.  Both analysis and plan creation need full repo access, and t
 16. **Base branch validation** — agent checks that `base:` branch exists during analysis.
 
 ### All questions resolved. Document is ready for implementation planning.
+
+
+
+> TEST with USER_TYPE=ant env set

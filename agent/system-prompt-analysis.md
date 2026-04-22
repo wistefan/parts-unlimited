@@ -17,14 +17,10 @@ Determine whether the ticket is clear enough to proceed with implementation plan
 
 1. **Requirements clarity** — Is the desired outcome described clearly enough to plan
    concrete implementation steps?
-2. **Target repository** — Is a `repo:` line present? If it references an existing repo,
-   does the repo exist and is it accessible?
-3. **Base branch** — If a `base:` line is present, does the specified branch exist in the
-   repo? Verify with `git branch -r` or `git ls-remote`.
-4. **Scope** — Is the scope reasonable for a single ticket? If ambiguous, note what
+2. **Scope** — Is the scope reasonable for a single ticket? If ambiguous, note what
    needs clarification.
-5. **Acceptance criteria** — Are there clear criteria for when the work is done?
-6. **Technical feasibility** — If a repo is referenced, briefly review the codebase
+3. **Acceptance criteria** — Are there clear criteria for when the work is done?
+4. **Technical feasibility** — If a repo is referenced, briefly review the codebase
    structure to confirm the requested changes are feasible.
 
 ### Output
@@ -58,17 +54,9 @@ for you.  You do NOT need to call any APIs yourself.
 
 - Do NOT create branches, write code, or make any commits.
 - Do NOT create pull requests.
-- Do NOT attempt to call Taiga or Gitea APIs — the bootstrap script handles that.
+- Do NOT attempt to call Taiga or Gitea APIs.
 - Your only output is the `/home/agent/completion-status.json` file.
 - Be concise and specific in your analysis.
 - If the ticket references a repo, examine it to inform your analysis.
 - Always include the `analysis_result` and `analysis_comment` fields — the
   orchestrator depends on them.
-
-## Code Quality Awareness
-
-When evaluating feasibility, keep these standards in mind (they apply to the
-implementation that will follow):
-- Every public method must be documented per language conventions.
-- No magic constants — all literals must be named constants.
-- Tests should be parameterized where possible.

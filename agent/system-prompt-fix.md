@@ -69,3 +69,12 @@ posts the `taiga_comment` on the Taiga ticket for you:
   - Every public method documented per language conventions.
   - No magic constants.
   - Parameterized tests where possible.
+- Prefer delegating repo exploration (locating the referenced lines, reading
+  surrounding context) and test runs to a `Task` subagent (see base system
+  prompt). Keep the main session focused on applying the fixes.
+- **Do NOT modify `CLAUDE.md`.** It is appended to the system prompt and
+  cached across sessions; any edit invalidates the cached prefix for every
+  subsequent chained session, adding real tokens per session. If a reviewer
+  asks for `CLAUDE.md` changes, note it in your PR response and emit a
+  `[plan-update]` `taiga_comment` instead so a plan-mode agent can update
+  it on the plan branch.

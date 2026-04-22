@@ -70,6 +70,11 @@ spec:
                 configMapKeyRef:
                   name: agent-service-endpoints
                   key: TAIGA_URL
+            - name: PUSHGATEWAY_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: agent-service-endpoints
+                  key: PUSHGATEWAY_URL
             - name: GITEA_USERNAME
               valueFrom:
                 secretKeyRef:

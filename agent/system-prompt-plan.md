@@ -109,7 +109,7 @@ codebase.  Include:
 
 Tailor the content to what is actually in the repo.  Be specific — list real paths, real
 commands, real class names.  This is NOT documentation for humans; it is a context file
-for AI agents that will work on this codebase.
+for AI agents that will work on this codebase. Keep it as small as possible.
 
 ## Important Rules
 

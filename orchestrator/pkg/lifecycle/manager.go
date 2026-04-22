@@ -14,6 +14,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/wistefan/dev-env/orchestrator/pkg/metrics"
 )
 
 const (
@@ -56,21 +58,21 @@ type AgentJobSpec struct {
 
 // Config holds lifecycle manager configuration.
 type Config struct {
-	Namespace           string
-	ContainerImage      string
-	ServiceAccount      string
-	TaskTimeoutSeconds  int64
-	RetryLimit          int32
-	TTLAfterFinished    int32
-	ResourceRequests    corev1.ResourceList
-	ResourceLimits      corev1.ResourceList
+	Namespace          string
+	ContainerImage     string
+	ServiceAccount     string
+	TaskTimeoutSeconds int64
+	RetryLimit         int32
+	TTLAfterFinished   int32
+	ResourceRequests   corev1.ResourceList
+	ResourceLimits     corev1.ResourceList
 }
 
 // DefaultConfig returns the default lifecycle manager configuration.
 func DefaultConfig() *Config {
 	return &Config{
 		Namespace:          "agents",
-		ContainerImage:     "agent-worker:latest",
+		ContainerImage:     "localhost:5000/agent-worker:latest",
 		ServiceAccount:     "agent-worker",
 		TaskTimeoutSeconds: 3600,
 		RetryLimit:         2,
@@ -89,13 +91,22 @@ type JobStatus struct {
 	StartTime *time.Time
 }
 
+// trackedJob captures the data needed to emit completion metrics for a Job
+// at the moment it first transitions to a terminal state.
+type trackedJob struct {
+	mode           string
+	specialization string
+	startTime      time.Time
+}
+
 // Manager manages agent worker Kubernetes Jobs.
 type Manager struct {
 	clientset kubernetes.Interface
 	config    *Config
 
-	mu       sync.RWMutex
-	activeJobs map[string]string // job name -> agent ID
+	mu         sync.RWMutex
+	activeJobs map[string]string     // job name -> agent ID
+	tracking   map[string]trackedJob // job name -> metrics-tracking data (dedups completion observations)
 }
 
 // NewManager creates a new lifecycle manager.
@@ -107,7 +118,38 @@ func NewManager(clientset kubernetes.Interface, config *Config) *Manager {
 		clientset:  clientset,
 		config:     config,
 		activeJobs: make(map[string]string),
+		tracking:   make(map[string]trackedJob),
 	}
+}
+
+// trackJobCreation records the data needed to emit completion metrics
+// later and increments the jobs-created counter.
+func (m *Manager) trackJobCreation(jobName, mode, specialization string) {
+	m.mu.Lock()
+	m.tracking[jobName] = trackedJob{
+		mode:           mode,
+		specialization: specialization,
+		startTime:      time.Now(),
+	}
+	m.mu.Unlock()
+	metrics.JobsCreated.WithLabelValues(mode, specialization).Inc()
+}
+
+// observeCompletion emits the completion metrics for a Job at most once.
+// Subsequent calls for the same jobName are no-ops. `status` should be one
+// of metrics.JobStatus{Succeeded,Failed,Timeout}.
+func (m *Manager) observeCompletion(jobName, status string) {
+	m.mu.Lock()
+	tj, ok := m.tracking[jobName]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.tracking, jobName)
+	m.mu.Unlock()
+
+	metrics.JobsCompleted.WithLabelValues(tj.mode, tj.specialization, status).Inc()
+	metrics.JobDuration.WithLabelValues(tj.mode, tj.specialization).Observe(time.Since(tj.startTime).Seconds())
 }
 
 // JobName generates a deterministic job name for an agent/ticket/mode combination.
@@ -163,18 +205,36 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 					ServiceAccountName:           m.config.ServiceAccount,
 					AutomountServiceAccountToken: &falseVal,
 					RestartPolicy:                corev1.RestartPolicyNever,
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot: boolPtr(true),
+						RunAsUser:    int64Ptr(1000),
+						RunAsGroup:   int64Ptr(1000),
+						FSGroup:      int64Ptr(1000),
+					},
 					// DinD runs as a native sidecar (init container with
 					// restartPolicy=Always).  Kubernetes automatically
 					// terminates it when the main "agent" container exits,
 					// so the Job completes cleanly.
 					InitContainers: []corev1.Container{
 						{
-							Name:            "dind",
-							Image:           "docker:dind",
+							Name:  "dind",
+							Image: "docker:dind",
+							// docker:dind is a public upstream image and rarely
+							// changes — no need to pull on every pod start.
 							ImagePullPolicy: corev1.PullIfNotPresent,
 							RestartPolicy:   func() *corev1.ContainerRestartPolicy { p := corev1.ContainerRestartPolicyAlways; return &p }(),
 							SecurityContext: &corev1.SecurityContext{
-								Privileged: boolPtr(true),
+								// DinD needs root and privileged mode to manage
+								// iptables/nftables. The pod-level SecurityContext
+								// pins the agent container to UID 1000, so we
+								// override RunAsUser/RunAsNonRoot here to prevent
+								// the "missing rootlesskit" failure that happens
+								// when docker:dind (the non-rootless variant) is
+								// forced to run as a non-root user.
+								Privileged:   boolPtr(true),
+								RunAsUser:    int64Ptr(0),
+								RunAsGroup:   int64Ptr(0),
+								RunAsNonRoot: boolPtr(false),
 							},
 							Env: []corev1.EnvVar{
 								{
@@ -198,7 +258,7 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 						{
 							Name:            "agent",
 							Image:           m.config.ContainerImage,
-							ImagePullPolicy: corev1.PullNever,
+							ImagePullPolicy: corev1.PullAlways,
 							SecurityContext: &corev1.SecurityContext{
 								RunAsUser:                int64Ptr(1000),
 								RunAsGroup:               int64Ptr(1000),
@@ -225,6 +285,14 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 								{
 									Name:      "docker-sock",
 									MountPath: "/var/run",
+								},
+								{
+									// Agent transcripts for `npx claude-spend`.
+									// bootstrap.sh writes a JSONL per run under
+									// <project>/<session>.jsonl; the host directory
+									// is shared across all agents.
+									Name:      "claude-spend-out",
+									MountPath: "/home/agent/claude-spend-out",
 								},
 							},
 						},
@@ -268,6 +336,26 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 								EmptyDir: &corev1.EmptyDirVolumeSource{},
 							},
 						},
+						{
+							// hostPath mirrors the pattern used by Gitea's data
+							// volume. Each agent pod writes two files under
+							// this directory: its run transcript at
+							// `projects/<project>/<session>.jsonl` and an
+							// appended entry at `history.jsonl` (required by
+							// `npx claude-spend` to render prompt labels).
+							// The directory layout deliberately matches what
+							// Claude Spend expects inside `~/.claude/`.
+							Name: "claude-spend-out",
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{
+									Path: "/var/lib/dev-env/claude-spend",
+									Type: func() *corev1.HostPathType {
+										t := corev1.HostPathDirectoryOrCreate
+										return &t
+									}(),
+								},
+							},
+						},
 					},
 				},
 			},
@@ -290,6 +378,12 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 	m.mu.Lock()
 	m.activeJobs[jobName] = spec.AgentID
 	m.mu.Unlock()
+
+	mode := spec.Mode
+	if mode == "" {
+		mode = "step"
+	}
+	m.trackJobCreation(jobName, mode, spec.Specialization)
 
 	log.Printf("Created job %s for agent %s on ticket %d", created.Name, spec.AgentID, spec.TicketID)
 	return created.Name, nil
@@ -324,10 +418,10 @@ func (m *Manager) GetJobStatus(ctx context.Context, jobName string) (*JobStatus,
 	}
 
 	status := &JobStatus{
-		Name:    job.Name,
-		AgentID: job.Labels[LabelAgentID],
+		Name:     job.Name,
+		AgentID:  job.Labels[LabelAgentID],
 		TicketID: job.Labels[LabelTicketID],
-		Active:  job.Status.Active > 0,
+		Active:   job.Status.Active > 0,
 	}
 
 	if job.Status.StartTime != nil {
@@ -335,6 +429,7 @@ func (m *Manager) GetJobStatus(ctx context.Context, jobName string) (*JobStatus,
 		status.StartTime = &t
 	}
 
+	var failureReason string
 	for _, cond := range job.Status.Conditions {
 		switch cond.Type {
 		case batchv1.JobComplete:
@@ -344,7 +439,21 @@ func (m *Manager) GetJobStatus(ctx context.Context, jobName string) (*JobStatus,
 		case batchv1.JobFailed:
 			if cond.Status == corev1.ConditionTrue {
 				status.Failed = true
+				failureReason = cond.Reason
 			}
+		}
+	}
+
+	// Emit completion metrics exactly once per job. "DeadlineExceeded" is
+	// Kubernetes's reason code when ActiveDeadlineSeconds fires, which is
+	// semantically distinct from other failures and worth labeling.
+	if status.Succeeded {
+		m.observeCompletion(jobName, metrics.JobStatusSucceeded)
+	} else if status.Failed {
+		if failureReason == "DeadlineExceeded" {
+			m.observeCompletion(jobName, metrics.JobStatusTimeout)
+		} else {
+			m.observeCompletion(jobName, metrics.JobStatusFailed)
 		}
 	}
 
@@ -365,10 +474,10 @@ func (m *Manager) ListActiveJobs(ctx context.Context) ([]JobStatus, error) {
 	var result []JobStatus
 	for _, job := range jobs.Items {
 		status := JobStatus{
-			Name:    job.Name,
-			AgentID: job.Labels[LabelAgentID],
+			Name:     job.Name,
+			AgentID:  job.Labels[LabelAgentID],
 			TicketID: job.Labels[LabelTicketID],
-			Active:  job.Status.Active > 0,
+			Active:   job.Status.Active > 0,
 		}
 
 		if job.Status.StartTime != nil {
@@ -475,6 +584,15 @@ func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 				},
 			},
 		},
+		corev1.EnvVar{
+			Name: "PUSHGATEWAY_URL",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "agent-service-endpoints"},
+					Key:                  "PUSHGATEWAY_URL",
+				},
+			},
+		},
 	)
 
 	// Optional: if the anthropic-api-key Secret exists, it takes
@@ -494,5 +612,5 @@ func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 	return envVars
 }
 
-func boolPtr(b bool) *bool       { return &b }
-func int64Ptr(i int64) *int64    { return &i }
+func boolPtr(b bool) *bool    { return &b }
+func int64Ptr(i int64) *int64 { return &i }

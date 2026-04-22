@@ -47,6 +47,17 @@ spec:
           port: 80
         - protocol: TCP
           port: 8000
+    # Allow traffic to Pushgateway (namespace: monitoring) for metrics reporting
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+          podSelector:
+            matchLabels:
+              app: pushgateway
+      ports:
+        - protocol: TCP
+          port: 9091
     # Allow outbound HTTPS/HTTP to public internet (package registries, docs)
     - to:
         - ipBlock:

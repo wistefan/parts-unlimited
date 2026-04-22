@@ -72,10 +72,7 @@ kubectl create secret generic anthropic-api-key \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # Or update credentials file (e.g., after re-running 'claude login')
-kubectl create secret generic claude-credentials \
-  --namespace=agents \
-  --from-file=credentials.json=~/.claude/.credentials.json \
-  --dry-run=client -o yaml | kubectl apply -f -
+kubectl create secret generic claude-credentials --namespace=agents --from-file=credentials.json=/home/stefanw/.claude/.credentials.json --dry-run=client -o yaml | kubectl apply -f -
 ```
 
 ### Creating a Ticket

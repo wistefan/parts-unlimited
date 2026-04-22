@@ -41,18 +41,85 @@ Your identity and current task are provided in the task prompt. Always commit un
 - Do not modify files outside the repository working directory.
 - Do not attempt to contact external services other than package registries.
 
+# Delegating to Subagents
+
+The `Task` tool spawns a subagent in an isolated context window. Its tool
+calls and intermediate output do **not** land in your context — only the
+final summary it returns. Use this to keep your main session small, since
+late turns re-read the growing prefix and get exponentially expensive.
+
+**Delegate when the work is high-noise / low-signal:**
+
+- Repo-wide exploration (`find` / `grep` across unknown code, understanding
+  an unfamiliar module).
+- Running the test suite or a build and reporting only the failures.
+- Parsing long logs, large generated files, or multi-file diffs.
+- Any single step expected to produce >2k tokens of tool output that you
+  only need a conclusion from.
+
+**Do NOT delegate when:**
+
+- You need the full content in your context for a subsequent edit
+  (reading one file you are about to modify).
+- The task is a single short tool call (one `grep`, one file read, one
+  `git status`).
+- You are mid-edit and need tight feedback loops.
+
+**How to brief a subagent:**
+
+- State the goal in one sentence, then the exact paths / commands / search
+  terms. Vague prompts produce shallow, generic reports.
+- Specify the output shape: "Report under 200 words. List failing test
+  names and file:line of the first assertion failure. No prose."
+- Never delegate understanding — the subagent does the lookup, you do the
+  synthesis.
+
 # Context Summary (IMPORTANT)
 
-Your Taiga comment (posted by the bootstrap via `taiga_comment` in completion-status.json)
-is the **only context future agents will receive**.  Every `taiga_comment` you write MUST
-end with a `### Context Summary` section containing:
+Two distinct readers consume your `### Context Summary` blocks:
 
-- What has been accomplished so far (cumulative, not just this session)
-- Key decisions and their rationale
-- Current state of the implementation
-- Any unresolved issues or open questions
+1. **Future agents on this ticket** — read the most recent `### Context Summary`
+   inside your final `taiga_comment` (the one in `completion-status.json`).
+2. **The next chained session of this same agent** — sessions are capped at
+   **20 turns** for cost reasons (late turns in a long session re-read a
+   growing prefix and get exponentially expensive). When you hit the limit,
+   the bootstrap looks for the most recent `### Context Summary` block
+   anywhere in your assistant text and prepends it to the next session's
+   prompt. Everything else from your current session is evicted.
 
-This rolling summary replaces the full comment history and saves significant tokens.
+Both readers need the same content, so emit `### Context Summary` blocks in
+three places, in this order of importance:
+
+- **MANDATORY — at turn 15 and turn 18** — your session will end at turn 20
+  and the final turn is usually a tool call with no text, so a summary
+  written later gets lost. Write one at turn 15 as a mid-session checkpoint,
+  and refresh it at turn 18 so the most recent state survives. Do not wait
+  until turn 20.
+- **At every natural milestone** (finished implementing a helper, got a test
+  green, decided on an approach) — cheap insurance against early turn-limit
+  hits mid-tool-call.
+- **In your final `taiga_comment`** — the cumulative summary future agents
+  read when they pick up this ticket.
+
+Each `### Context Summary` block must contain:
+
+- **Prior steps (reference only):** one line per merged step PR for this
+  ticket, in the form `- Step N: <title> — PR #X (merged)`. Do NOT re-narrate
+  their content — the PR diffs on the work branch are the source of truth.
+  Skip this field for mid-session checkpoints; include it only in the final
+  `taiga_comment` summary. This is load-bearing: on long-running tickets,
+  every prior narrated step compounds into every following step's prompt,
+  so reference form only.
+- **Done this session:** what was accomplished in the current agent
+  invocation — files edited, tests run, decisions made, commits pushed.
+- **State:** current branch, open PR if any, working-directory cleanliness.
+- **Next:** the concrete next action — a follow-up agent should be able to
+  resume by reading this line alone.
+- **Pitfalls:** approaches tried that did not work, so the next session
+  avoids them.
+
+The block must start exactly with the literal `### Context Summary` heading
+(case-sensitive) so the bootstrap's extractor can find it.
 
 # Completion
 

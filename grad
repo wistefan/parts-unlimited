@@ -1,0 +1,147 @@
+logger=settings t=2026-04-20T12:15:18.281383476Z level=info msg="Starting Grafana" version=13.0.0 commit=e9de482b branch=release-13.0.0 compiled=2026-04-14T06:37:31Z
+logger=settings t=2026-04-20T12:15:18.281614633Z level=info msg="Unified migration configs enforced" storage_type=unified target=[all]
+logger=settings t=2026-04-20T12:15:18.281620559Z level=info msg="Enforcing mode 5 for resource in unified storage" resource=playlists.playlist.grafana.app
+logger=settings t=2026-04-20T12:15:18.281622659Z level=info msg="Enforcing mode 5 for resource in unified storage" resource=folders.folder.grafana.app
+logger=settings t=2026-04-20T12:15:18.281624012Z level=info msg="Enforcing mode 5 for resource in unified storage" resource=dashboards.dashboard.grafana.app
+logger=settings t=2026-04-20T12:15:18.281660034Z level=info msg="Config loaded from" file=/usr/share/grafana/conf/defaults.ini
+logger=settings t=2026-04-20T12:15:18.281661691Z level=info msg="Config loaded from" file=/etc/grafana/grafana.ini
+logger=settings t=2026-04-20T12:15:18.281663203Z level=info msg="Config overridden from command line" arg="default.paths.data=/var/lib/grafana"
+logger=settings t=2026-04-20T12:15:18.281664478Z level=info msg="Config overridden from command line" arg="default.paths.logs=/var/log/grafana"
+logger=settings t=2026-04-20T12:15:18.281665794Z level=info msg="Config overridden from command line" arg="default.paths.plugins=/var/lib/grafana/plugins"
+logger=settings t=2026-04-20T12:15:18.281666952Z level=info msg="Config overridden from command line" arg="default.paths.provisioning=/etc/grafana/provisioning"
+logger=settings t=2026-04-20T12:15:18.281668318Z level=info msg="Config overridden from command line" arg="default.log.mode=console"
+logger=settings t=2026-04-20T12:15:18.281669829Z level=info msg="Config overridden from Environment variable" var="GF_PATHS_DATA=/var/lib/grafana"
+logger=settings t=2026-04-20T12:15:18.281671007Z level=info msg="Config overridden from Environment variable" var="GF_PATHS_LOGS=/var/log/grafana"
+logger=settings t=2026-04-20T12:15:18.281672269Z level=info msg="Config overridden from Environment variable" var="GF_PATHS_PLUGINS=/var/lib/grafana/plugins"
+logger=settings t=2026-04-20T12:15:18.281673491Z level=info msg="Config overridden from Environment variable" var="GF_PATHS_PROVISIONING=/etc/grafana/provisioning"
+logger=settings t=2026-04-20T12:15:18.281674669Z level=info msg="Config overridden from Environment variable" var="GF_SECURITY_ADMIN_USER=admin"
+logger=settings t=2026-04-20T12:15:18.281677057Z level=info msg="Config overridden from Environment variable" var="GF_SECURITY_ADMIN_PASSWORD=*********"
+logger=settings t=2026-04-20T12:15:18.281678488Z level=info msg="Config overridden from Environment variable" var="GF_USERS_ALLOW_SIGN_UP=false"
+logger=settings t=2026-04-20T12:15:18.281679665Z level=info msg="Config overridden from Environment variable" var="GF_AUTH_ANONYMOUS_ENABLED=true"
+logger=settings t=2026-04-20T12:15:18.281680845Z level=info msg="Config overridden from Environment variable" var="GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer"
+logger=settings t=2026-04-20T12:15:18.281682135Z level=info msg="Config overridden from Environment variable" var="GF_PATHS_HOME=/usr/share/grafana"
+logger=settings t=2026-04-20T12:15:18.281683275Z level=info msg="Config overridden from Environment variable" var="GF_PATHS_CONFIG=/etc/grafana/grafana.ini"
+logger=settings t=2026-04-20T12:15:18.281684524Z level=info msg=Target target=[all]
+logger=settings t=2026-04-20T12:15:18.281686901Z level=info msg="Path Home" path=/usr/share/grafana
+logger=settings t=2026-04-20T12:15:18.281688128Z level=info msg="Path Data" path=/var/lib/grafana
+logger=settings t=2026-04-20T12:15:18.281689366Z level=info msg="Path Logs" path=/var/log/grafana
+logger=settings t=2026-04-20T12:15:18.281690481Z level=info msg="Path Plugins" path="[/var/lib/grafana/plugins /usr/share/grafana/data/plugins-bundled]"
+logger=settings t=2026-04-20T12:15:18.28169237Z level=info msg="Path Provisioning" path=/etc/grafana/provisioning
+logger=settings t=2026-04-20T12:15:18.281693722Z level=info msg="App mode production"
+logger=featuremgmt t=2026-04-20T12:15:18.28198009Z level=info msg=FeatureToggles alertRuleRestore=true alertingBulkActionsInUI=true alertingImportYAMLUI=true alertingListViewV2=true alertingListViewV2PreviewToggle=true alertingMigrationUI=true alertingNavigationV2=true alertingNotificationsStepMode=true alertingQueryAndExpressionsStepMode=true alertingRulePermanentlyDelete=true alertingRuleRecoverDeleted=true alertingRuleVersionHistoryRestore=true alertingSaveStateCompressed=true alertingUIOptimizeReducer=true alertingUIUseBackendFilters=true alertingUIUseFullyCompatBackendFilters=true alertingUseNewSimplifiedRoutingHashAlgorithm=true annotationPermissionUpdate=true awsAsyncQueryCaching=true awsDatasourcesTempCredentials=true azureMonitorEnableUserAuth=true azureMonitorPrometheusExemplars=true azureResourcePickerUpdates=true cloudWatchCrossAccountQuerying=true cloudWatchNewLabelParsing=true cloudWatchRoundUpEndTime=true dashboardDefaultLayoutSelector=true dashboardNewLayouts=true dashboardScene=true dashgpt=true enableSCIM=true externalVizSuggestions=true feedbackButton=true grafanaAdvisor=true grafanaAssistantInProfilesDrilldown=true grafanaconThemes=true improvedExternalSessionHandling=true improvedExternalSessionHandlingSAML=true influxdbBackendMigration=true logsPanelControls=true lokiLabelNamesQueryApi=true lokiQuerySplitting=true multiPropsVariables=true newLogsPanel=true newPanelPadding=true newTimeRangeZoomShortcuts=true newUnconfiguredPanel=true newVizSuggestions=true onlyStoreActionSets=true preventPanelChromeOverflow=true prometheusAzureOverrideAudience=true prometheusTypeMigration=true provisioning=true provisioningFolderMetadata=true publicDashboardsScene=true rememberUserOrgForSso=true renderAuthJWT=true restoreDashboards=true restrictedPluginApis=true sharingDashboardImage=true splashScreen=true timeRangePan=true useSessionStorageForRedirection=true
+logger=sqlstore t=2026-04-20T12:15:18.282003765Z level=info msg="Connecting to DB" dbtype=sqlite3
+logger=sqlstore t=2026-04-20T12:15:18.282005865Z level=info msg="Using SQLite driver" driver=modernc.org/sqlite
+logger=migrator t=2026-04-20T12:15:18.282476074Z level=info msg="Locking database"
+logger=migrator t=2026-04-20T12:15:18.282481748Z level=info msg="Starting DB migrations"
+logger=migrator t=2026-04-20T12:15:18.35135996Z level=info msg="migrations completed" performed=0 skipped=709 duration=1.290424ms
+logger=migrator t=2026-04-20T12:15:18.351795717Z level=info msg="Unlocking database"
+logger=secrets t=2026-04-20T12:15:18.355456595Z level=info msg="Envelope encryption state" currentprovider=secretKey.v1
+logger=plugin.angulardetectorsprovider.dynamic t=2026-04-20T12:15:18.478444298Z level=info msg="Restored cache from database" duration=193.56µs
+logger=accesscontrol.service t=2026-04-20T12:15:18.47877419Z level=info msg="Starting migration to remove deprecated permissions" migration=removeDeprecatedPermissions
+logger=accesscontrol.service t=2026-04-20T12:15:18.478921556Z level=info msg="Completed migration to remove deprecated permissions" migration=removeDeprecatedPermissions totalRemoved=0 duration=147.542µs
+logger=plugin.store t=2026-04-20T12:15:18.478960066Z level=info msg="Loading plugins..."
+logger=plugins.registration t=2026-04-20T12:15:18.575389968Z level=info msg="Plugin registered" pluginId=grafana-exploretraces-app
+logger=plugins.registration t=2026-04-20T12:15:18.589575276Z level=info msg="Plugin registered" pluginId=grafana-lokiexplore-app
+logger=plugins.registration t=2026-04-20T12:15:18.656921475Z level=info msg="Plugin registered" pluginId=grafana-metricsdrilldown-app
+logger=plugins.registration t=2026-04-20T12:15:18.673470058Z level=info msg="Plugin registered" pluginId=grafana-pyroscope-app
+logger=plugins.registration t=2026-04-20T12:15:18.795309639Z level=info msg="Plugin registered" pluginId=elasticsearch
+logger=plugin.store t=2026-04-20T12:15:18.795333682Z level=info msg="Plugins loaded" count=56 duration=316.373805ms
+logger=authz-grpc-server t=2026-04-20T12:15:18.795472212Z level=info msg="cache ttl is 0, using noop cache"
+logger=authz-grpc-server t=2026-04-20T12:15:18.795483016Z level=info msg="cache ttl is 0, using noop cache"
+logger=authz-grpc-server t=2026-04-20T12:15:18.795485487Z level=info msg="cache ttl is 0, using noop cache"
+logger=authz-grpc-server t=2026-04-20T12:15:18.795487457Z level=info msg="cache ttl is 0, using noop cache"
+logger=authz-grpc-server t=2026-04-20T12:15:18.795489411Z level=info msg="cache ttl is 0, using noop cache"
+logger=secret-migrator t=2026-04-20T12:15:18.795677745Z level=info msg="Locking database"
+logger=secret-migrator t=2026-04-20T12:15:18.79568417Z level=info msg="Starting DB migrations"
+logger=secret-migrator t=2026-04-20T12:15:18.796288499Z level=info msg="migrations completed" performed=0 skipped=33 duration=31.877µs
+logger=secret-migrator t=2026-04-20T12:15:18.796412942Z level=info msg="Unlocking database"
+logger=resource-db t=2026-04-20T12:15:18.796779149Z level=info msg="Using database section" db_type=sqlite3
+logger=resource-db t=2026-04-20T12:15:18.796815978Z level=info msg="Initializing Resource DB" db_type=sqlite3 open_conn=0 in_use_conn=0 idle_conn=0 max_open_conn=0
+logger=resource-migrator t=2026-04-20T12:15:18.797109201Z level=info msg="Locking database"
+logger=resource-migrator t=2026-04-20T12:15:18.797117615Z level=info msg="Starting DB migrations"
+logger=resource-migrator t=2026-04-20T12:15:18.799489591Z level=info msg="migrations completed" performed=0 skipped=43 duration=41.878µs
+logger=resource-migrator t=2026-04-20T12:15:18.799624845Z level=info msg="Unlocking database"
+t=2026-04-20T12:15:18.801243464Z level=info caller=logger.go:214 time=2026-04-20T12:15:18.80123192Z msg="Using channel notifier" logger=sql-resource-server
+logger=bleve-backend namespace=default group=advisor.grafana.app resource=checktypes size=5 reason=init t=2026-04-20T12:15:18.801977422Z level=info msg="Building index using memory"
+logger=bleve-backend namespace=default group=advisor.grafana.app resource=checktypes size=5 reason=init t=2026-04-20T12:15:18.804099805Z level=info msg="Finished building index" elapsed=2.102096ms listRV=1776175960420995
+logger=bleve-backend namespace=default group=advisor.grafana.app resource=checktypes size=5 reason=init t=2026-04-20T12:15:18.804116129Z level=info msg="Storing index in cache" key="{Namespace:default Group:advisor.grafana.app Resource:checktypes}" expiration=2026-04-20T12:25:18.804115337Z
+logger=resource-search t=2026-04-20T12:15:18.804176243Z level=info msg="search index initialized" duration_secs=0 total_docs=5
+logger=storage.unified.migrations t=2026-04-20T12:15:18.805562918Z level=info msg="Running migrations for unified storage"
+logger=storage.unified.migrations t=2026-04-20T12:15:18.805590904Z level=info msg="Migration is disabled in config, skipping" migration=shorturls
+logger=storage.unified.migrations t=2026-04-20T12:15:18.805593157Z level=info msg="Migration is disabled in config, skipping" migration=datasource
+logger=storage.unified.migrations t=2026-04-20T12:15:18.805594668Z level=info msg="Migration is disabled in config, skipping" migration=stars
+logger=unifiedstorage-migrator t=2026-04-20T12:15:18.805604187Z level=info msg="Locking database"
+logger=unifiedstorage-migrator t=2026-04-20T12:15:18.805607376Z level=info msg="Starting DB migrations"
+logger=unifiedstorage-migrator t=2026-04-20T12:15:18.805719345Z level=info msg="migrations completed" performed=0 skipped=3 duration=6.793µs
+logger=unifiedstorage-migrator t=2026-04-20T12:15:18.805789526Z level=info msg="Unlocking database"
+logger=storage.unified.migrations t=2026-04-20T12:15:18.805795939Z level=info msg="Unified storage migrations completed successfully"
+logger=annotations t=2026-04-20T12:15:18.806057246Z level=info msg="Starting annotation dashboard_uid migration in background"
+logger=annotations t=2026-04-20T12:15:18.806066677Z level=info msg="Starting batched dashboard_uid migration for annotations (newest first)" batchSize=5000
+logger=annotations t=2026-04-20T12:15:18.806382262Z level=info msg="Completed dashboard_uid migration for annotations" totalUpdated=0
+logger=annotations t=2026-04-20T12:15:18.806387932Z level=info msg="Annotation dashboard_uid migration completed successfully"
+logger=storage.unified.migrations t=2026-04-20T12:15:18.807227942Z level=info msg="Resolved storage mode from migration log" resource=folders.folder.grafana.app mode=unified
+logger=live.push_http t=2026-04-20T12:15:18.85045837Z level=info msg="Live Push Gateway initialization"
+logger=ngalert.notifier t=2026-04-20T12:15:18.851413928Z level=info component=alertmanager orgID=1 msg="template definitions loaded" mimir=0 grafana=0 total=0 maxTemplateOutput=10485760
+logger=ngalert.notifier component=alertmanager orgID=1 t=2026-04-20T12:15:18.852384365Z level=info msg="Applying new configuration to Alertmanager" configHash="{16778549912962373901 16454292769479786371 11334157631281353376 13684829433332818750 9889444224312429563 10278876130067529486 13274274624283075277 5144611013662998819}"
+logger=ngalert.notifier t=2026-04-20T12:15:18.852397313Z level=info component=alertmanager orgID=1 msg="template definitions loaded" mimir=0 grafana=0 total=0 maxTemplateOutput=10485760
+logger=ngalert.writer t=2026-04-20T12:15:18.864207861Z level=info msg="Setting up remote write using data sources" timeout=30s default_datasource_uid=
+logger=ngalert t=2026-04-20T12:15:18.864245585Z level=info msg="Using protobuf-based alert instance store"
+logger=ngalert.state.manager.persist t=2026-04-20T12:15:18.864252804Z level=info msg="Using sync rule state persister (compressed)"
+logger=query_data t=2026-04-20T12:15:18.864737425Z level=info msg="Query Service initialization"
+logger=annotation.app t=2026-04-20T12:15:18.881229141Z level=info msg="Starting annotation cleanup loop" interval=24h0m0s retention=2160h0m0s
+logger=infra.usagestats.collector t=2026-04-20T12:15:18.881964106Z level=info msg="registering usage stat providers" usageStatsProvidersLen=2
+logger=backgroundsvcs.managerAdapter t=2026-04-20T12:15:18.954619253Z level=info msg=starting module=tracing
+logger=backgroundsvcs.managerAdapter t=2026-04-20T12:15:18.954703643Z level=info msg=starting module=grafana-apiserver
+logger=grafana-apiserver t=2026-04-20T12:15:19.377325626Z level=info msg="Adding GroupVersion dashboard.grafana.app v2 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.377507528Z level=info msg="Adding GroupVersion dashboard.grafana.app v2beta1 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.377651791Z level=info msg="Adding GroupVersion dashboard.grafana.app v2alpha1 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.377872714Z level=info msg="Adding GroupVersion dashboard.grafana.app v0alpha1 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.377993441Z level=info msg="Adding GroupVersion dashboard.grafana.app v1 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.378121819Z level=info msg="Adding GroupVersion dashboard.grafana.app v1beta1 to ResourceManager"
+t=2026-04-20T12:15:19.378162536Z level=info caller=logger.go:214 time=2026-04-20T12:15:19.378158534Z msg="Zanzana is not enabled; skipping folder propagation hooks"
+t=2026-04-20T12:15:19.378171284Z level=info caller=logger.go:214 time=2026-04-20T12:15:19.378169918Z msg="Zanzana is not enabled; skipping folder propagation hooks"
+logger=grafana-apiserver t=2026-04-20T12:15:19.378506476Z level=info msg="Adding GroupVersion folder.grafana.app v1 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.378685747Z level=info msg="Adding GroupVersion folder.grafana.app v1beta1 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.378952029Z level=info msg="Adding GroupVersion userstorage.grafana.app v0alpha1 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.379386556Z level=info msg="Adding GroupVersion collections.grafana.app v1alpha1 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.379476605Z level=info msg="Adding GroupVersion features.grafana.app v0alpha1 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.379699309Z level=info msg="Adding GroupVersion preferences.grafana.app v1alpha1 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.381009781Z level=info msg="Adding GroupVersion provisioning.grafana.app v0alpha1 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.381797317Z level=info msg="Adding GroupVersion provisioning.grafana.app v1beta1 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.450336899Z level=info msg="Adding GroupVersion playlist.grafana.app v1 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.451250008Z level=info msg="Adding GroupVersion playlist.grafana.app v0alpha1 to ResourceManager"
+t=2026-04-20T12:15:19.451374989Z level=info caller=logger.go:214 time=2026-04-20T12:15:19.451358915Z msg="Installed APIs for app" app=playlist
+logger=grafana-apiserver t=2026-04-20T12:15:19.453313102Z level=info msg="Adding GroupVersion plugins.grafana.app v0alpha1 to ResourceManager"
+t=2026-04-20T12:15:19.453413822Z level=info caller=logger.go:214 time=2026-04-20T12:15:19.45340235Z msg="Installed APIs for app" app=plugins
+logger=grafana-apiserver t=2026-04-20T12:15:19.45474742Z level=info msg="Adding GroupVersion example.grafana.app v1alpha1 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.455390463Z level=info msg="Adding GroupVersion example.grafana.app v0alpha1 to ResourceManager"
+t=2026-04-20T12:15:19.455516451Z level=info caller=logger.go:214 time=2026-04-20T12:15:19.455506619Z msg="Installed APIs for app" app=example
+t=2026-04-20T12:15:19.455640898Z level=warn caller=logger.go:224 time=2026-04-20T12:15:19.45563327Z msg="skipped registering status sub-resource that does not support dual writing" resource=alertrules.rules.alerting.grafana.app version=v0alpha1 storagePath=alertrules/status
+t=2026-04-20T12:15:19.455669771Z level=warn caller=logger.go:224 time=2026-04-20T12:15:19.455663829Z msg="skipped registering status sub-resource that does not support dual writing" resource=recordingrules.rules.alerting.grafana.app version=v0alpha1 storagePath=recordingrules/status
+logger=grafana-apiserver t=2026-04-20T12:15:19.457592266Z level=info msg="Adding GroupVersion rules.alerting.grafana.app v0alpha1 to ResourceManager"
+t=2026-04-20T12:15:19.457702919Z level=info caller=logger.go:214 time=2026-04-20T12:15:19.457690436Z msg="Installed APIs for app" app=alerting
+logger=grafana-apiserver t=2026-04-20T12:15:19.459784436Z level=info msg="Adding GroupVersion notifications.alerting.grafana.app v1beta1 to ResourceManager"
+logger=grafana-apiserver t=2026-04-20T12:15:19.460827328Z level=info msg="Adding GroupVersion notifications.alerting.grafana.app v0alpha1 to ResourceManager"
+t=2026-04-20T12:15:19.460938769Z level=info caller=logger.go:214 time=2026-04-20T12:15:19.460930584Z msg="Installed APIs for app" app=alerting-notifications
+logger=grafana-apiserver t=2026-04-20T12:15:19.461916548Z level=info msg="Adding GroupVersion advisor.grafana.app v0alpha1 to ResourceManager"
+t=2026-04-20T12:15:19.461982248Z level=info caller=logger.go:214 time=2026-04-20T12:15:19.461976901Z msg="Installed APIs for app" app=advisor
+t=2026-04-20T12:15:20.349574856Z level=info caller=logger.go:214 time=2026-04-20T12:15:20.349541539Z msg="App initialized" app=alerting-notifications
+t=2026-04-20T12:15:20.350341539Z level=info caller=logger.go:214 time=2026-04-20T12:15:20.350329359Z msg="App initialized" app=playlist
+t=2026-04-20T12:15:20.350399252Z level=info caller=logger.go:214 time=2026-04-20T12:15:20.350394032Z msg="App initialized" app=example
+t=2026-04-20T12:15:20.350481145Z level=info caller=logger.go:214 time=2026-04-20T12:15:20.350471427Z msg="App initialized" app=alerting
+t=2026-04-20T12:15:20.350519075Z level=info caller=logger.go:214 time=2026-04-20T12:15:20.350514526Z msg="App initialized" app=advisor
+t=2026-04-20T12:15:20.353206782Z level=info caller=logger.go:214 time=2026-04-20T12:15:20.353180231Z msg="App initialized" app=plugins
+logger=backgroundsvcs.managerAdapter t=2026-04-20T12:15:20.353291988Z level=info msg=starting module=plugins.store
+logger=backgroundsvcs.managerAdapter t=2026-04-20T12:15:20.353373197Z level=info msg=starting module=plugin.backgroundinstaller
+logger=plugin.backgroundinstaller t=2026-04-20T12:15:20.353381497Z level=info msg="Plugins installed" plugins=[]
+logger=plugin.backgroundinstaller t=2026-04-20T12:15:20.353399966Z level=info msg="Installing plugins" plugins="[{ID:grafana-metricsdrilldown-app Version: URL:} {ID:elasticsearch Version: URL:} {ID:grafana-lokiexplore-app Version: URL:} {ID:grafana-pyroscope-app Version: URL:} {ID:grafana-exploretraces-app Version: URL:}]"
+t=2026-04-20T12:15:20.355520513Z level=info caller=logger.go:214 time=2026-04-20T12:15:20.355497055Z msg="start concurrent job driver" logger=concurrent-job-driver num_drivers=3 num_drivers=3
+t=2026-04-20T12:15:20.355588146Z level=info caller=logger.go:214 time=2026-04-20T12:15:20.355574405Z msg="starting job cleanup controller" logger=job-cleanup-controller cleanup_interval=1m30s expiry=30s
+t=2026-04-20T12:15:20.357166994Z level=info caller=logger.go:214 time=2026-04-20T12:15:20.357149503Z msg="Starting RepositoryController" logger=provisioning-repository-controller
+t=2026-04-20T12:15:20.362870056Z level=info caller=logger.go:214 time=2026-04-20T12:15:20.362853361Z msg="start job driver" logger=concurrent-job-driver num_drivers=3 driver_id=0
+t=2026-04-20T12:15:20.363684546Z level=info caller=logger.go:214 time=2026-04-20T12:15:20.363674562Z msg="start job driver" logger=concurrent-job-driver num_drivers=3 driver_id=1
+t=2026-04-20T12:15:20.364443534Z level=info caller=logger.go:214 time=2026-04-20T12:15:20.364435841Z msg="start job driver" logger=concurrent-job-driver num_drivers=3 driver_id=2
+logger=backgroundsvcs.managerAdapter t=2026-04-20T12:15:20.365151485Z level=info msg=starting module=provisioning
+logger=provisioning t=2026-04-20T12:15:20.365946209Z level=error msg="Failed to provision data sources" error="Datasource provisioning error: data source not found"
+logger=provisioning t=2026-04-20T12:15:20.365955411Z level=error msg="Failed to provision data sources" error="Datasource provisioning error: data source not found"
+Error: ✗ invalid service state: Failed, expected: Terminated, failure: invalid service state: Failed, expected: Running, failure: not healthy, 0 terminated, 1 failed: [starting module provisioning: invalid service state: Failed, expected: Running, failure: Datasource provisioning error: data source not found]

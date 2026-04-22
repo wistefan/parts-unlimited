@@ -200,10 +200,31 @@ type HistoryEntry struct {
 // GetComments retrieves comment history for a user story.
 // Results are sorted newest-first by created_at so callers can iterate
 // from index 0 to find the most recent lifecycle marker.
+//
+// Taiga paginates history endpoints at 30 entries per page by default.
+// For long-running tickets that means the oldest lifecycle markers
+// (e.g. `[step:N/M]` on a ticket with many silent-failure comments)
+// would silently fall off, and determineMode would misclassify the
+// ticket as new. Sending `x-disable-pagination: True` makes Taiga
+// return the full list in one response.
 func (c *Client) GetComments(storyID int) ([]HistoryEntry, error) {
 	path := fmt.Sprintf("/api/v1/history/userstory/%d?type=comment", storyID)
 
-	resp, err := c.doRequest(http.MethodGet, path, nil, true)
+	req, err := http.NewRequest(http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("x-disable-pagination", "True")
+
+	c.mu.RLock()
+	token := c.authToken
+	c.mu.RUnlock()
+	if token == "" {
+		return nil, fmt.Errorf("not authenticated: call Authenticate first")
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

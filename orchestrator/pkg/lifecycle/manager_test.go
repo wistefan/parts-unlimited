@@ -102,11 +102,17 @@ func TestCreateJob(t *testing.T) {
 
 	// Check container
 	container := podSpec.Containers[0]
-	if container.Image != "agent-worker:latest" {
-		t.Errorf("expected image 'agent-worker:latest', got %s", container.Image)
+	if container.Image != "localhost:5000/agent-worker:latest" {
+		t.Errorf("expected image 'localhost:5000/agent-worker:latest', got %s", container.Image)
 	}
-	if *container.SecurityContext.AllowPrivilegeEscalation != false {
-		t.Error("expected AllowPrivilegeEscalation=false")
+	// AllowPrivilegeEscalation is intentionally true: the agent image grants
+	// the agent user passwordless sudo so it can install project-specific
+	// toolchains at runtime (see agent/Dockerfile). The container is still
+	// pinned to non-root startup via the pod-level SecurityContext and is
+	// network-isolated by NetworkPolicy, so escalation inside the pod carries
+	// no cross-pod blast radius.
+	if *container.SecurityContext.AllowPrivilegeEscalation != true {
+		t.Error("expected AllowPrivilegeEscalation=true (required for sudo-based toolchain install)")
 	}
 
 	// Check service account

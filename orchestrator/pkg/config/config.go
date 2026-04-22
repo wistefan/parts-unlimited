@@ -95,7 +95,7 @@ func DefaultConfig() *Config {
 			TaskTimeoutSeconds:  3600,
 			RetryLimit:          2,
 			EscalationThreshold: 2,
-			ContainerImage:      "agent-worker:latest",
+			ContainerImage:      "localhost:5000/agent-worker:latest",
 		},
 		Notifications: NotificationsConfig{
 			DashboardPort: 8080,

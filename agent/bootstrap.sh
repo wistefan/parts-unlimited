@@ -59,7 +59,7 @@ fi
 
 MODE="${MODE:-step}"
 PLAN_STEP="${PLAN_STEP:-}"
-ALLOWED_TOOLS="${ALLOWED_TOOLS:-Read Edit Write Glob Grep Bash}"
+ALLOWED_TOOLS="${ALLOWED_TOOLS:-Read Edit Write Glob Grep Bash Task}"
 HUMAN_USERNAME="${HUMAN_USERNAME:-}"
 HUMAN_TAIGA_ID="${HUMAN_TAIGA_ID:-}"
 PR_NUMBER="${PR_NUMBER:-}"
@@ -72,6 +72,38 @@ PR_REPO="${PR_REPO:-}"
 request_human_input() {
     local comment="$1"
     local version
+
+    # Include the canonical repo so the orchestrator (which keeps no
+    # local state) can pin the next agent on this ticket to the same
+    # fork. Safe when REPO_OWNER/REPO_NAME aren't resolved yet (very
+    # early failures) — the line is just omitted.
+    if [ -n "${REPO_OWNER:-}" ] && [ -n "${REPO_NAME:-}" ]; then
+        comment="${comment}\n\n**Repo:** \`${REPO_OWNER}/${REPO_NAME}\`"
+    fi
+
+    # Dedupe: if the most recent agent comment already carries the same
+    # signal (same first line — e.g. another silent-failure notice with
+    # the same branch/mode/exit), the orchestrator has already been told
+    # and will already have reassigned to the human. Posting the same
+    # text again would just spam the ticket. Exit silently so the Job
+    # still completes cleanly and the orchestrator's reconcile loop
+    # won't try to respawn a human-assigned ticket.
+    # x-disable-pagination: Taiga's history endpoint paginates at 30
+    # entries by default; on long-running tickets the most recent
+    # agent comment can fall off the first page and dedupe would miss.
+    local latest_agent_comment
+    latest_agent_comment=$(curl -s -H "${TAIGA_AUTH_HEADER}" -H "x-disable-pagination: True" \
+        "${TAIGA_URL}/api/v1/history/userstory/${TICKET_ID}" 2>/dev/null \
+        | jq -r '[.[] | select(.comment != null and .comment != "" and .delete_comment_date == null and (.user.username // "" | contains("-agent-")))] | sort_by(.created_at) | last | .comment // ""' 2>/dev/null || true)
+    local first_line
+    first_line=$(printf '%b' "${comment}" | head -n1)
+    if [ -n "${first_line}" ] && [ -n "${latest_agent_comment}" ] \
+            && printf '%s' "${latest_agent_comment}" | head -n1 | grep -qF "${first_line}"; then
+        echo "  Same notice already posted by an agent — skipping duplicate comment."
+        echo ""
+        echo "=== Agent Worker Complete (awaiting human input, deduped) ==="
+        exit 0
+    fi
 
     # Fetch current ticket version
     version=$(curl -s -H "${TAIGA_AUTH_HEADER}" \
@@ -164,7 +196,10 @@ echo "  Tags:    ${TICKET_TAGS:-none}"
 # This gives full context in a fraction of the tokens.
 
 echo "Fetching ticket comments..."
-ALL_COMMENTS=$(curl -sf -H "${TAIGA_AUTH_HEADER}" \
+# x-disable-pagination: Taiga paginates at 30 by default; without this
+# the "last agent comment" and context-summary logic below would miss
+# entries on long-running tickets.
+ALL_COMMENTS=$(curl -sf -H "${TAIGA_AUTH_HEADER}" -H "x-disable-pagination: True" \
     "${TAIGA_URL}/api/v1/history/userstory/${TICKET_ID}" \
     | jq -r '[.[] | select(.comment != null and .comment != "" and .delete_comment_date == null) | {user: .user.username, comment: .comment, date: .created_at}]')
 COMMENT_COUNT=$(echo "${ALL_COMMENTS}" | jq 'length')
@@ -350,6 +385,41 @@ BASE_BRANCH=$(extract_base_branch "${TICKET_DESCRIPTION}")
 BASE_BRANCH="${BASE_BRANCH:-main}"
 echo "Base branch: ${BASE_BRANCH}"
 
+# --- Refresh base branch from upstream (migrated repos only) ---
+#
+# When a repo is imported into Gitea from an external URL (e.g. GitHub),
+# the Gitea copy is a point-in-time snapshot. Later tickets clone that
+# stale copy, and PRs cut from its `main` conflict with the real upstream
+# `main` when they eventually merge back. To prevent that, fetch the
+# upstream ${BASE_BRANCH} and force-overwrite the Gitea copy before any
+# work-branch bookkeeping runs. Existing work/step branches are not
+# touched — they continue to live in Gitea only. Greenfield or Gitea-
+# native repos have no `original_url` and are skipped.
+#
+# Full-overwrite semantics (reset --hard + push --force) are intentional:
+# the Gitea copy is a working mirror of upstream, not a source of truth.
+REPO_METADATA=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+    "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}" 2>/dev/null || true)
+UPSTREAM_URL=$(echo "${REPO_METADATA}" | jq -r '.original_url // ""' 2>/dev/null || true)
+
+if [ -n "${UPSTREAM_URL}" ] && [ "${UPSTREAM_URL}" != "null" ]; then
+    echo "Refreshing ${BASE_BRANCH} from upstream ${UPSTREAM_URL}..."
+    git remote add upstream "${UPSTREAM_URL}" 2>/dev/null \
+        || git remote set-url upstream "${UPSTREAM_URL}"
+    if git fetch upstream "${BASE_BRANCH}" 2>/dev/null; then
+        git checkout -B "${BASE_BRANCH}" "upstream/${BASE_BRANCH}"
+        if git push origin "${BASE_BRANCH}" --force 2>/dev/null; then
+            echo "  Gitea ${BASE_BRANCH} overwritten to upstream HEAD."
+        else
+            echo "  WARNING: Could not force-push refreshed ${BASE_BRANCH} to Gitea — continuing with local refresh only."
+        fi
+    else
+        echo "  WARNING: Could not fetch ${BASE_BRANCH} from upstream ${UPSTREAM_URL} — using existing Gitea copy."
+    fi
+else
+    echo "No upstream URL on Gitea repo — greenfield or Gitea-native, skipping refresh."
+fi
+
 # --- Determine branch ---
 
 BRANCH_PREFIX="ticket-${TICKET_ID}"
@@ -367,11 +437,25 @@ case "${MODE}" in
         BRANCH_NAME=""
         ;;
     step|*)
-        if [ -n "${PLAN_STEP}" ]; then
-            BRANCH_NAME="${BRANCH_PREFIX}/step-${PLAN_STEP}"
-        else
-            BRANCH_NAME="${BRANCH_PREFIX}/work"
+        # Step agents always work on a step branch so the resulting PR
+        # targets the integration work branch (never `main`). If the
+        # orchestrator did not provide PLAN_STEP, derive the next step
+        # number by scanning existing `ticket-X/step-N` branches on the
+        # remote — the new branch is `max(N)+1`, or `step-1` when none
+        # exist yet. Working directly on the work branch would cause a
+        # work → BASE_BRANCH PR, which this repo never wants.
+        if [ -z "${PLAN_STEP}" ]; then
+            MAX_EXISTING_STEP=$(git ls-remote --heads origin "${BRANCH_PREFIX}/step-*" 2>/dev/null \
+                | sed -n "s#.*refs/heads/${BRANCH_PREFIX}/step-\([0-9][0-9]*\)\$#\1#p" \
+                | sort -n | tail -1 || true)
+            if [ -z "${MAX_EXISTING_STEP}" ]; then
+                PLAN_STEP=1
+            else
+                PLAN_STEP=$((MAX_EXISTING_STEP + 1))
+            fi
+            echo "Derived PLAN_STEP=${PLAN_STEP} from existing step branches."
         fi
+        BRANCH_NAME="${BRANCH_PREFIX}/step-${PLAN_STEP}"
         ;;
 esac
 
@@ -499,6 +583,23 @@ If this was the last step:
         ;;
 esac
 
+# The ticket description is load-bearing for analysis (evaluating the ask)
+# and plan (drafting steps). For step and fix modes, IMPLEMENTATION_PLAN.md
+# (or the PR diff) already encapsulates the work, so the description is
+# redundant — and on chained sessions it gets re-ingested uncached every
+# time, costing real tokens on long-running tickets. Omit it in those modes.
+case "${MODE}" in
+    analysis|plan)
+        DESCRIPTION_SECTION="## Ticket Description
+
+${TICKET_DESCRIPTION}
+"
+        ;;
+    *)
+        DESCRIPTION_SECTION=""
+        ;;
+esac
+
 cat > "${PROMPT_FILE}" <<PROMPT_EOF
 # Task Assignment
 
@@ -512,10 +613,7 @@ cat > "${PROMPT_FILE}" <<PROMPT_EOF
 - **Subject:** ${TICKET_SUBJECT}
 $([ -n "${PLAN_STEP}" ] && echo "- **Plan Step:** ${PLAN_STEP}" || true)
 
-## Ticket Description
-
-${TICKET_DESCRIPTION}
-
+${DESCRIPTION_SECTION}
 ## Ticket Comments (last agent context + new human input)
 
 $(echo "${COMMENTS}" | jq -r '.[] | "**\(.user)** (\(.date)):\n\(.comment)\n"' 2>/dev/null || echo "No comments.")
@@ -609,18 +707,25 @@ fi
 #
 # The task is done when the agent writes completion-status.json.
 
-TURNS_PER_SESSION="${TURNS_PER_SESSION:-50}"
-MAX_SESSIONS="${MAX_SESSIONS:-20}"
+TURNS_PER_SESSION="${TURNS_PER_SESSION:-20}"
+MAX_SESSIONS="${MAX_SESSIONS:-50}"
 
 # extract_context_summary <result_file>
-# Pulls the last assistant text block from stream-json output.  The agent
-# is instructed to end with a "### Context Summary" section; if present we
-# use that, otherwise we take the last 2000 chars of assistant text.
+# Returns the most recent "### Context Summary" block found anywhere in
+# the session's assistant text. Scans newest-first so a periodic summary
+# at turn 30 is preferred over a stale one at turn 5. Returns empty when
+# no summary exists — callers (see continue_session below) then fall
+# back to a Claude-generated summary built from a session digest.
+#
+# Why scan all turns instead of just the last assistant message:
+#   When max-turns hits mid-tool-call, the final assistant message is
+#   often a tool_use envelope with no text — so the summary written
+#   minutes earlier would be lost. Scanning the whole stream recovers it.
 extract_context_summary() {
     python3 -c "
 import json, sys
 
-last_text = ''
+assistant_texts = []
 for line in open('$1'):
     line = line.strip()
     if not line:
@@ -632,47 +737,222 @@ for line in open('$1'):
     if msg.get('type') != 'assistant':
         continue
     for block in msg.get('message', {}).get('content', []):
-        if block.get('type') == 'text':
-            last_text = block['text']
+        if block.get('type') == 'text' and block.get('text'):
+            assistant_texts.append(block['text'])
 
-# Prefer the Context Summary section if present
-idx = last_text.rfind('### Context Summary')
-if idx >= 0:
-    print(last_text[idx:])
-elif last_text:
-    print(last_text[-2000:])
+for text in reversed(assistant_texts):
+    idx = text.rfind('### Context Summary')
+    if idx >= 0:
+        print(text[idx:])
+        break
 " 2>/dev/null || true
+}
+
+# generate_context_summary <session_result_file>
+# Fallback used when the agent did not emit a "### Context Summary" block
+# anywhere in the session (typically because Claude hit --max-turns mid-
+# tool-call). Builds a programmatic digest of the session via
+# summarize-session.py and pipes it to a fresh `claude -p` call that is
+# instructed to output ONLY the summary block, then prints the result on
+# stdout. Returns empty on any failure — callers tolerate that and the
+# next session falls back to the original task prompt.
+#
+# Cost: ~1-3K tokens per max-turn cutoff. Worth it because otherwise the
+# next session has no real context and re-explores from scratch.
+SUMMARIZER_SYSTEM_PROMPT='You are summarizing a Claude Code agent session that ran out of turns mid-task. The user message you receive is a turn-by-turn digest of that session.
+
+Output ONLY a Markdown block beginning with "### Context Summary" containing:
+
+- **Done this session:** what was accomplished in this session only (file edits, tests run, decisions made, commits pushed). Do NOT narrate prior-step work — that belongs elsewhere.
+- **State:** the current state of the working directory and any branches/PRs.
+- **Next:** the concrete next action the follow-up session should take so it can resume from this line alone.
+- **Pitfalls:** anything tried that did not work, so the next session avoids it.
+
+Keep the whole block under ~400 words. Do not include any other text, no preamble, no closing remarks.'
+
+generate_context_summary() {
+    local session_result="$1"
+    [ -f "${session_result}" ] || return 0
+
+    local digest
+    digest=$(python3 /home/agent/summarize-session.py "${session_result}" 2>/dev/null) || return 0
+    [ -n "${digest}" ] || return 0
+
+    # 1 turn is enough — the summarizer just transforms the digest.
+    # Strip stream-json wrapper by using `--output-format text`.
+    local summary
+    summary=$(printf '%s\n' "${digest}" | claude -p \
+        --max-turns 1 \
+        --system-prompt "${SUMMARIZER_SYSTEM_PROMPT}" \
+        --output-format text 2>/dev/null) || return 0
+
+    # Only return text if it actually looks like a Context Summary block
+    # — otherwise we'd just be polluting the next session's prompt.
+    if printf '%s' "${summary}" | grep -q '### Context Summary'; then
+        printf '%s' "${summary}"
+    fi
 }
 
 echo "  Claude args: ${CLAUDE_ARGS[*]}"
 echo "  Prompt size: $(wc -c < "${PROMPT_FILE}") bytes"
 echo "  Session chaining: ${TURNS_PER_SESSION} turns/session, max ${MAX_SESSIONS} sessions"
 
+# push_metrics_to_pushgateway <result_file>
+# Parses the cumulative stream-json result and pushes Prometheus metrics to
+# the Pushgateway. No-op when PUSHGATEWAY_URL is unset (disables metrics
+# locally and in tests). Safe to call repeatedly during the run — the
+# Pushgateway replaces the group for the same label set, so the latest push
+# always reflects the most recent state.
+push_metrics_to_pushgateway() {
+    local result_file="$1"
+    if [ -z "${PUSHGATEWAY_URL:-}" ]; then
+        return 0
+    fi
+    local metrics_file="/tmp/agent-metrics.prom"
+    local duration=$((SECONDS - CLAUDE_START_SECONDS))
+
+    if ! python3 /home/agent/parse-usage.py "${result_file}" \
+            --format prometheus --duration "${duration}" \
+            > "${metrics_file}" 2>/dev/null; then
+        return 0
+    fi
+
+    # Pushgateway grouping path: job name first, then key/value pairs of
+    # identity labels. Labels with empty values would break the URL, so
+    # each optional label is appended only when set.
+    local url="${PUSHGATEWAY_URL}/metrics/job/agent-worker"
+    url="${url}/ticket_id/${TICKET_ID}"
+    url="${url}/agent_id/${AGENT_ID}"
+    url="${url}/mode/${MODE}"
+    url="${url}/specialization/${AGENT_SPECIALIZATION}"
+    if [ -n "${PLAN_STEP:-}" ]; then
+        url="${url}/plan_step/${PLAN_STEP}"
+    fi
+    if [ -n "${REPO_NAME:-}" ]; then
+        url="${url}/repo/${REPO_NAME}"
+    fi
+
+    if ! curl -sf -X POST --data-binary "@${metrics_file}" "${url}" > /dev/null 2>&1; then
+        echo "WARNING: Failed to push metrics to ${PUSHGATEWAY_URL}"
+    fi
+    rm -f "${metrics_file}"
+}
+
 CLAUDE_EXIT=0
 SESSION_NUM=0
 CUMULATIVE_RESULT="${RESULT_FILE}"
 SESSION_CONTEXT=""
+CLAUDE_START_SECONDS=${SECONDS}
+CLAUDE_START_EPOCH=$(date -u +%s)
 > "${CUMULATIVE_RESULT}"  # initialize empty
+
+# is_rate_limited <file>
+# Returns 0 (match) when the Claude CLI output indicates a rate-limit,
+# quota, overload, or billing failure — conditions where retrying later
+# is the correct response. These signatures come from the Anthropic API
+# error envelopes and Claude Code CLI error text, not from any arbitrary
+# occurrence of "rate" or "429" in the agent's own work.
+is_rate_limited() {
+    local file="$1"
+    [ -f "${file}" ] || return 1
+    grep -qiE '"(rate_limit_error|overloaded_error)"|"status":[[:space:]]*429|Claude AI usage limit reached|You.?ve hit your limit|credit balance is too low|anthropic-ratelimit-' "${file}"
+}
+
+# extract_failure_reason <result_file>
+# Distills a short, human-readable line describing why the Claude CLI
+# produced nothing useful. Scans stream-json for `{type:result,is_error}`
+# or `{type:error}` envelopes, falls back to raw non-JSON lines, and
+# finally to the tail of the file. Empty file → a fixed message citing
+# CLAUDE_EXIT. Used by the silent-failure guard so humans see the actual
+# reason rather than an opaque "Status: unknown".
+extract_failure_reason() {
+    local file="$1"
+    if [ ! -s "${file}" ]; then
+        echo "Claude CLI produced no output (exit ${CLAUDE_EXIT})"
+        return
+    fi
+    python3 - "${file}" <<'PY'
+import json, sys
+path = sys.argv[1]
+err = None
+for line in open(path):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        m = json.loads(line)
+    except Exception:
+        err = line[:400]
+        break
+    if m.get('type') == 'result' and m.get('is_error'):
+        err = (m.get('result') or m.get('error') or 'unknown error')[:400]
+        break
+    if m.get('type') == 'error':
+        err = str(m.get('message') or m.get('error') or m)[:400]
+        break
+if not err:
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 2000))
+            err = f.read().decode('utf-8', 'replace').strip()[-400:]
+    except Exception:
+        err = ''
+print(err or 'no diagnostic available')
+PY
+}
 
 while [ "${SESSION_NUM}" -lt "${MAX_SESSIONS}" ]; do
     SESSION_NUM=$((SESSION_NUM + 1))
 
-    # Build per-session prompt: original task + context from previous session
+    # Build per-session prompt.
+    #
+    # Session 1 uses the full task prompt (ticket context + plan + mode
+    # instructions). Session 2+ uses a SLIM continuation prompt instead of
+    # re-embedding the full task prompt alongside SESSION_CONTEXT.
+    #
+    # The previous behavior — `cat PROMPT_FILE + SESSION_CONTEXT` — double-
+    # represented prior work: every chained session paid the full ticket
+    # description + comments + plan uncached, *and* the context summary on
+    # top. On long-running tickets that repeats tens of kilobytes of stale
+    # context across every chained session.
+    #
+    # The slim prompt keeps the load-bearing items only: ticket header,
+    # mode-specific completion instructions (the agent needs to know the
+    # completion-status.json shape), and the context summary. IMPLEMENTATION_PLAN.md
+    # is a workspace file the agent can Read on demand.
     SESSION_PROMPT_FILE="/home/agent/session-prompt.md"
     if [ -n "${SESSION_CONTEXT}" ]; then
-        {
-            cat "${PROMPT_FILE}"
-            echo ""
-            echo "## Previous Session Context"
-            echo ""
-            echo "You are continuing work from a previous session. Here is where you left off:"
-            echo ""
-            echo "${SESSION_CONTEXT}"
-        } > "${SESSION_PROMPT_FILE}"
-        echo "  Session ${SESSION_NUM}: continuing with $(echo "${SESSION_CONTEXT}" | wc -c) bytes of context"
+        cat > "${SESSION_PROMPT_FILE}" <<SLIM_EOF
+# Task Continuation
+
+## Agent Identity
+- **Agent:** ${AGENT_ID}
+- **Mode:** ${MODE}
+
+## Ticket
+- **ID:** ${TICKET_ID}
+- **Subject:** ${TICKET_SUBJECT}
+$([ -n "${PLAN_STEP}" ] && echo "- **Plan Step:** ${PLAN_STEP}" || true)
+
+## Continuing From Previous Session
+
+You are continuing work from a previous chained session. Resume from the
+state below — do not re-read the full ticket description or re-explore the
+codebase from scratch. \`IMPLEMENTATION_PLAN.md\` is in the workspace root
+if you need to re-check the current step.
+
+${SESSION_CONTEXT}
+
+## Completion Instructions
+
+${MODE_INSTRUCTIONS}
+SLIM_EOF
+        echo "  Session ${SESSION_NUM}: continuing with $(wc -c < "${SESSION_PROMPT_FILE}") bytes (slim prompt)"
     else
         cp "${PROMPT_FILE}" "${SESSION_PROMPT_FILE}"
-        echo "  Session ${SESSION_NUM}: initial session"
+        echo "  Session ${SESSION_NUM}: initial session ($(wc -c < "${SESSION_PROMPT_FILE}") bytes)"
     fi
 
     # Run Claude with a per-session turn limit
@@ -686,6 +966,11 @@ while [ "${SESSION_NUM}" -lt "${MAX_SESSIONS}" ]; do
     # Append session result to cumulative result for usage tracking
     cat "${SESSION_RESULT}" >> "${CUMULATIVE_RESULT}"
 
+    # Push metrics after every session so the Pushgateway always holds the
+    # latest state — if the pod is killed before the task completes, the
+    # partial usage is still captured.
+    push_metrics_to_pushgateway "${CUMULATIVE_RESULT}"
+
     # Check if the agent completed its task
     if [ -f "/home/agent/completion-status.json" ]; then
         echo "  Task completed in session ${SESSION_NUM}."
@@ -693,12 +978,19 @@ while [ "${SESSION_NUM}" -lt "${MAX_SESSIONS}" ]; do
     fi
 
     # Non-zero exit without completion means Claude hit the turn limit
-    # or encountered an issue — extract context and continue
+    # or encountered an issue — derive a compact summary so the next
+    # session can continue from a real checkpoint instead of restarting.
     SESSION_CONTEXT=$(extract_context_summary "${SESSION_RESULT}")
     if [ -z "${SESSION_CONTEXT}" ]; then
-        echo "  WARNING: Could not extract context summary from session ${SESSION_NUM}. Stopping."
+        echo "  No '### Context Summary' block in session ${SESSION_NUM} —"
+        echo "  invoking summarizer to compress the transcript before the next session."
+        SESSION_CONTEXT=$(generate_context_summary "${SESSION_RESULT}")
+    fi
+    if [ -z "${SESSION_CONTEXT}" ]; then
+        echo "  WARNING: Summarizer produced no output. Stopping session loop."
         break
     fi
+    echo "  Session ${SESSION_NUM}: extracted context ($(echo "${SESSION_CONTEXT}" | wc -c) bytes)"
 done
 
 if [ "${SESSION_NUM}" -ge "${MAX_SESSIONS}" ] && [ ! -f "/home/agent/completion-status.json" ]; then
@@ -718,59 +1010,94 @@ elif [ "${CLAUDE_EXIT}" -ne 0 ]; then
     tail -20 "${CUMULATIVE_RESULT}" || true
 fi
 
-# --- Extract token usage ---
+# --- Extract token usage + push final metrics ---
 
 USAGE_SUMMARY=""
 if [ -f "${RESULT_FILE}" ]; then
-    USAGE_SUMMARY=$(python3 -c "
-import json, sys
-
-input_tok = 0
-output_tok = 0
-cache_write = 0
-cache_read = 0
-turns = 0
-
-for line in open('${RESULT_FILE}'):
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        msg = json.loads(line)
-    except:
-        continue
-    if msg.get('type') != 'assistant':
-        continue
-    usage = msg.get('message', {}).get('usage', {})
-    if not usage:
-        continue
-    turns += 1
-    input_tok += usage.get('input_tokens', 0)
-    output_tok += usage.get('output_tokens', 0)
-    cache_write += usage.get('cache_creation_input_tokens', 0)
-    cache_read += usage.get('cache_read_input_tokens', 0)
-
-# Opus pricing: input \$15/MTok, output \$75/MTok, cache_write \$18.75/MTok, cache_read \$1.50/MTok
-i_cost = input_tok * 15 / 1_000_000
-o_cost = output_tok * 75 / 1_000_000
-cw_cost = cache_write * 18.75 / 1_000_000
-cr_cost = cache_read * 1.50 / 1_000_000
-total = i_cost + o_cost + cw_cost + cr_cost
-
-print(f'| Metric | Tokens | Est. Cost |')
-print(f'|---|---:|---:|')
-print(f'| Input | {input_tok:,} | \${i_cost:.2f} |')
-print(f'| Output | {output_tok:,} | \${o_cost:.2f} |')
-print(f'| Cache write | {cache_write:,} | \${cw_cost:.2f} |')
-print(f'| Cache read | {cache_read:,} | \${cr_cost:.2f} |')
-print(f'| **Total** | | **\${total:.2f}** |')
-print(f'| Turns | {turns} | |')
-" 2>/dev/null || true)
+    USAGE_SUMMARY=$(python3 /home/agent/parse-usage.py "${RESULT_FILE}" \
+        --format markdown 2>/dev/null || true)
 
     if [ -n "${USAGE_SUMMARY}" ]; then
         echo "Token usage:"
         echo "${USAGE_SUMMARY}"
     fi
+
+    # Final push — includes the completed duration now that the loop exited.
+    push_metrics_to_pushgateway "${RESULT_FILE}"
+fi
+
+# --- Export transcript for Claude Spend ---
+#
+# The orchestrator mounts /var/lib/dev-env/claude-spend from the host at
+# /home/agent/claude-spend-out, mirroring what `npx claude-spend` expects
+# to find in `~/.claude/`. Two files are produced per run:
+#
+#   * projects/<project>/<session>.jsonl — the transcript (user/assistant
+#     events with synthetic timestamps)
+#   * history.jsonl                       — a flat, cross-project index
+#     that maps sessionId → friendly label; claude-spend uses it as the
+#     display prompt for each session in its UI
+#
+# Session filenames are unique per agent/ticket/mode/timestamp so parallel
+# agents never collide.
+CLAUDE_SPEND_OUT_DIR="/home/agent/claude-spend-out"
+if [ -f "${RESULT_FILE}" ] && [ -d "${CLAUDE_SPEND_OUT_DIR}" ]; then
+    CS_PROJECT="${REPO_NAME:-parts-unlimited-agents}"
+    CS_SESSION="${AGENT_ID}-ticket-${TICKET_ID}-${MODE}-$(date -u +%Y%m%dT%H%M%SZ)"
+    CS_PATH="${CLAUDE_SPEND_OUT_DIR}/projects/${CS_PROJECT}/${CS_SESSION}.jsonl"
+    if python3 /home/agent/export-claude-spend.py \
+            "${RESULT_FILE}" "${CS_PATH}" \
+            --start-epoch "${CLAUDE_START_EPOCH:-$(date -u +%s)}" 2>&1; then
+        # Append a history.jsonl entry so the Claude Spend UI shows a
+        # meaningful label for the run (otherwise it falls back to the
+        # first raw user prompt, which for agents is a very long
+        # system-prompt/task blob).
+        #
+        # `sessionId` must exactly equal the transcript filename minus
+        # `.jsonl` — claude-spend uses it as the key. jq safely escapes
+        # the label so special characters in TICKET_SUBJECT don't break
+        # the JSONL.
+        CS_HISTORY_FILE="${CLAUDE_SPEND_OUT_DIR}/history.jsonl"
+        # Build "[step 2]" / "[plan]" / "[fix]" / "[analysis]" — never
+        # "[step step 2]" (PLAN_STEP only applies in step mode anyway).
+        if [ "${MODE}" = "step" ] && [ -n "${PLAN_STEP:-}" ]; then
+            CS_MODE_LABEL="step ${PLAN_STEP}"
+        else
+            CS_MODE_LABEL="${MODE}"
+        fi
+        CS_DISPLAY="[${CS_MODE_LABEL}] Ticket #${TICKET_ID}: ${TICKET_SUBJECT:-<no subject>}"
+        if ! jq -cn \
+                --arg sid "${CS_SESSION}" \
+                --arg display "${CS_DISPLAY}" \
+                '{sessionId: $sid, display: $display}' \
+                >> "${CS_HISTORY_FILE}"; then
+            echo "WARNING: Failed to append Claude Spend history entry."
+        fi
+    else
+        echo "WARNING: Failed to export transcript for Claude Spend."
+    fi
+fi
+
+
+# --- Rate-limit short-circuit ---
+#
+# When Claude hits rate limits, quota exhaustion, model overload, or
+# billing errors, the agent has done no real work and must not leave any
+# trace (Taiga comment, git push, PR) — those side effects would confuse
+# the orchestrator into thinking work happened. Exit cleanly so the K8s
+# Job completes; after its TTLSecondsAfterFinished elapses the
+# orchestrator's reconcile loop will re-spawn the agent, by which time
+# the limit has usually cleared.
+#
+# Skip this when completion-status.json exists: the agent successfully
+# finished its task before any transient API errors, so normal
+# post-processing should run.
+if [ ! -f "/home/agent/completion-status.json" ] && is_rate_limited "${RESULT_FILE}"; then
+    echo "Claude hit a rate-limit / quota / overload condition — no work to post."
+    echo "  Skipping Taiga comment, git push, and PR creation."
+    echo "  Exiting 0 so the Job completes cleanly; the orchestrator will reschedule"
+    echo "  via reconciliation once the K8s Job TTL expires."
+    exit 0
 fi
 
 # --- Process result ---
@@ -795,6 +1122,13 @@ if [ "${MODE}" = "analysis" ]; then
     ANALYSIS_COMMENT=$(jq -r '.analysis_comment // ""' /home/agent/completion-status.json 2>/dev/null || true)
 
     echo "  Analysis result: ${ANALYSIS_RESULT}"
+
+    # Record the canonical repo in the comment. This is the orchestrator's
+    # only source of truth for which fork a ticket belongs to (it holds
+    # no local state), so every agent comment embeds it.
+    if [ -n "${ANALYSIS_COMMENT}" ] && [ -n "${REPO_OWNER:-}" ] && [ -n "${REPO_NAME:-}" ]; then
+        ANALYSIS_COMMENT="${ANALYSIS_COMMENT}\n\n**Repo:** \`${REPO_OWNER}/${REPO_NAME}\`"
+    fi
 
     # Append usage summary to analysis comment
     if [ -n "${USAGE_SUMMARY}" ] && [ -n "${ANALYSIS_COMMENT}" ]; then
@@ -829,6 +1163,51 @@ else
         request_human_input "**Agent ${AGENT_ID}** is blocked and needs human input.\n\n**Reason:** ${BLOCKED_REASON}"
     fi
 
+    # --- Silent-failure guard ---
+    #
+    # If the agent produced no new commits (and no uncommitted changes),
+    # the Claude CLI session almost certainly failed silently (auth
+    # error, crash, unrecognised rate-limit variant, etc.). Creating an
+    # empty PR or posting a `[step:in-progress]` comment in that case is
+    # dishonest and has produced a stream of no-op PRs and misleading
+    # ticket history. Surface the underlying failure and hand off.
+    HAS_NEW_WORK="false"
+    if [ -n "${BRANCH_NAME}" ]; then
+        if [ -n "$(git status --porcelain)" ]; then
+            HAS_NEW_WORK="true"
+        elif [ "${MODE}" = "fix" ]; then
+            # Fix mode works on an existing PR branch; new work shows up
+            # as local commits not yet pushed to that same remote branch.
+            LOCAL_HEAD=$(git rev-parse HEAD)
+            REMOTE_HEAD=$(git rev-parse "origin/${BRANCH_NAME}" 2>/dev/null || echo "")
+            if [ -n "${REMOTE_HEAD}" ] && [ "${LOCAL_HEAD}" != "${REMOTE_HEAD}" ]; then
+                HAS_NEW_WORK="true"
+            fi
+        else
+            # Plan/step branches are cut from WORK_BRANCH — any real work
+            # shows up as commits ahead of it.
+            COMMITS_AHEAD=$(git rev-list --count "origin/${WORK_BRANCH}..HEAD" 2>/dev/null || echo 0)
+            if [ "${COMMITS_AHEAD}" != "0" ]; then
+                HAS_NEW_WORK="true"
+            fi
+        fi
+    fi
+
+    if [ "${HAS_NEW_WORK}" = "false" ]; then
+        FAILURE_REASON=$(extract_failure_reason "${CUMULATIVE_RESULT}")
+        echo "Agent produced no new commits — treating as silent failure."
+        echo "  Claude exit:  ${CLAUDE_EXIT}"
+        echo "  Diagnostic:   ${FAILURE_REASON}"
+        request_human_input "**Agent \`${AGENT_ID}\`** produced no commits on ticket #${TICKET_ID} (branch \`${BRANCH_NAME:-N/A}\`, mode \`${MODE}\`).
+
+Claude CLI exit: \`${CLAUDE_EXIT}\`
+
+**Diagnostic:**
+\`\`\`
+${FAILURE_REASON}
+\`\`\`"
+    fi
+
     # Push changes
     if [ -n "${BRANCH_NAME}" ] && [ -n "$(git status --porcelain)" ]; then
         echo "Pushing changes..."
@@ -851,8 +1230,10 @@ ${COMPLETION_SUMMARY:-Work in progress}"
         fi
     fi
 
-    # Create or update PR (skip for fix mode — PR already exists)
-    if [ -n "${BRANCH_NAME}" ] && [ "${MODE}" != "fix" ]; then
+    # Create or update PR (skip for fix mode — PR already exists; also
+    # skip when the agent ended up on the work branch itself, since
+    # work → BASE_BRANCH is a separate human-driven step).
+    if [ -n "${BRANCH_NAME}" ] && [ "${MODE}" != "fix" ] && [ "${BRANCH_NAME}" != "${WORK_BRANCH}" ]; then
         echo "Checking for existing PR..."
         EXISTING_PR=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
             "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}/pulls?state=open&head=${BRANCH_NAME}" \
@@ -874,12 +1255,11 @@ ${COMPLETION_STATUS}"
             echo "  PR #${EXISTING_PR} already exists, updated with latest push."
         else
             echo "Creating PR..."
-            # Plan/step PRs target the work branch; only the work branch itself targets the base branch.
-            if [ "${BRANCH_NAME}" = "${WORK_BRANCH}" ]; then
-                PR_BASE="${BASE_BRANCH}"
-            else
-                PR_BASE="${WORK_BRANCH}"
-            fi
+            # All agent-created PRs target the integration work branch.
+            # The work → BASE_BRANCH PR is only opened manually (by a human)
+            # once every step PR has been merged, so the agent never
+            # produces a PR targeting BASE_BRANCH directly.
+            PR_BASE="${WORK_BRANCH}"
 
             PR_TITLE="Ticket #${TICKET_ID}"
             if [ "${MODE}" = "plan" ]; then
@@ -940,6 +1320,13 @@ ${COMPLETION_STATUS}"
                 fi
                 ;;
         esac
+    fi
+
+    # Record the canonical repo in the comment. This is the orchestrator's
+    # only source of truth for which fork a ticket belongs to (it holds
+    # no local state), so every agent comment embeds it.
+    if [ -n "${REPO_OWNER:-}" ] && [ -n "${REPO_NAME:-}" ]; then
+        TAIGA_COMMENT="${TAIGA_COMMENT}\n\n**Repo:** \`${REPO_OWNER}/${REPO_NAME}\`"
     fi
 
     # Append usage summary to Taiga comment

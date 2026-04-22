@@ -102,10 +102,20 @@ func (m *Manager) createAgentLocked(specialization string) (*AgentIdentity, erro
 
 	log.Printf("Creating agent identity: %s", id)
 
-	// Create Gitea user
-	giteaUser, err := m.giteaClient.CreateUser(id, m.defaultPasswd, email)
+	// Create Gitea user. Gitea's storage persists independently of the
+	// orchestrator state ConfigMap, so after a state wipe the user may still
+	// exist. Reuse it in that case to keep agent creation idempotent.
+	giteaUser, err := m.giteaClient.GetUser(id)
 	if err != nil {
-		return nil, fmt.Errorf("creating Gitea user %s: %w", id, err)
+		return nil, fmt.Errorf("looking up Gitea user %s: %w", id, err)
+	}
+	if giteaUser == nil {
+		giteaUser, err = m.giteaClient.CreateUser(id, m.defaultPasswd, email)
+		if err != nil {
+			return nil, fmt.Errorf("creating Gitea user %s: %w", id, err)
+		}
+	} else {
+		log.Printf("Reusing existing Gitea user: %s (id=%d)", id, giteaUser.ID)
 	}
 
 	// Create Taiga user and project membership via Django ORM.

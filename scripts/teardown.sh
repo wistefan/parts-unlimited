@@ -46,9 +46,17 @@ kubectl delete pv taiga-static-pv taiga-media-pv taiga-db-pv taiga-rabbitmq-pv -
 echo "Removing agent resources..."
 kubectl delete -f "$(dirname "$0")/../k8s/agents/" --ignore-not-found=true 2>/dev/null || true
 
+# Remove monitoring
+echo "Removing monitoring..."
+kubectl delete -f "$(dirname "$0")/../k8s/monitoring/" --ignore-not-found=true 2>/dev/null || true
+
+# Remove local registry
+echo "Removing local registry..."
+kubectl delete -f "$(dirname "$0")/../k8s/registry/" --ignore-not-found=true 2>/dev/null || true
+
 # Remove namespaces
 echo "Removing namespaces..."
-kubectl delete namespace gitea taiga agents --ignore-not-found=true 2>/dev/null || true
+kubectl delete namespace gitea taiga agents monitoring registry --ignore-not-found=true 2>/dev/null || true
 
 echo "Kubernetes resources removed."
 

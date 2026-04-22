@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/wistefan/dev-env/orchestrator/pkg/gitea"
+	"github.com/wistefan/dev-env/orchestrator/pkg/metrics"
 )
 
 // ReviewResult holds the output from a Claude Code review.
@@ -55,6 +56,11 @@ func NewService(giteaClient *gitea.Client, config *Config) *Service {
 // ReviewPR fetches a PR diff, invokes Claude to review it, and posts the review on Gitea.
 func (s *Service) ReviewPR(ctx context.Context, owner, repo string, prNumber int) (*ReviewResult, error) {
 	log.Printf("Reviewing PR #%d on %s/%s", prNumber, owner, repo)
+
+	// Count every invocation, including no-diff skips, so the rate panel in
+	// Grafana reflects actual orchestrator activity rather than post-filter
+	// work. Labeled as "{owner}/{repo}" to keep cardinality low.
+	metrics.ReviewInvocations.WithLabelValues(fmt.Sprintf("%s/%s", owner, repo)).Inc()
 
 	// Get the PR details
 	pr, err := s.giteaClient.GetPullRequest(owner, repo, prNumber)

@@ -1,0 +1,116 @@
+Name:             agent-general-agent-3-ticket-10-fix-lzwh7
+Namespace:        agents
+Priority:         0
+Service Account:  agent-worker
+Node:             tuxedo-os/192.168.2.224
+Start Time:       Mon, 20 Apr 2026 14:41:08 +0200
+Labels:           agent-id=general-agent-3
+                  batch.kubernetes.io/controller-uid=7f05662b-0dcc-4a92-bacc-d903c983146a
+                  batch.kubernetes.io/job-name=agent-general-agent-3-ticket-10-fix
+                  controller-uid=7f05662b-0dcc-4a92-bacc-d903c983146a
+                  job-name=agent-general-agent-3-ticket-10-fix
+                  role=agent-worker
+                  ticket-id=10
+Annotations:      <none>
+Status:           Running
+IP:               10.42.0.11
+IPs:
+  IP:           10.42.0.11
+Controlled By:  Job/agent-general-agent-3-ticket-10-fix
+Init Containers:
+  dind:
+    Container ID:   containerd://14ecca0d7ffd78f429495981e077efe574ac3e9f758f81ed939e2ad8db607053
+    Image:          docker:dind
+    Image ID:       docker.io/library/docker@sha256:a6dd5322747a95cd8e3207bd8d415a8fd20ec34e9c00f06dc019cbd912013489
+    Port:           <none>
+    Host Port:      <none>
+    State:          Running
+      Started:      Mon, 20 Apr 2026 14:41:09 +0200
+    Ready:          True
+    Restart Count:  0
+    Environment:
+      DOCKER_TLS_CERTDIR:  
+    Mounts:
+      /var/lib/docker from docker-storage (rw)
+      /var/run from docker-sock (rw)
+Containers:
+  agent:
+    Container ID:   containerd://0c8a87bd00e69ddc42444b1f4fa0c50fc1b65d423a7ba49a657d86ec3f7eece0
+    Image:          localhost:5000/agent-worker:latest
+    Image ID:       localhost:5000/agent-worker@sha256:3a5f1fce522704e4d6b923e19fb6c8a6d444d250a0721302322d7f7dba52f8b0
+    Port:           <none>
+    Host Port:      <none>
+    State:          Running
+      Started:      Mon, 20 Apr 2026 14:41:10 +0200
+    Ready:          True
+    Restart Count:  0
+    Environment:
+      TICKET_ID:             10
+      AGENT_ID:              general-agent-3
+      AGENT_SPECIALIZATION:  general
+      MODE:                  fix
+      PLAN_STEP:             
+      REPO_OWNER:            general-agent-2
+      REPO_NAME:             fdsc-dashboard
+      GITEA_USERNAME:        general-agent-3
+      GITEA_PASSWORD:        agent-password
+      TAIGA_USERNAME:        general-agent-3
+      TAIGA_PASSWORD:        agent-password
+      HUMAN_USERNAME:        wistefan
+      HUMAN_TAIGA_ID:        6
+      TAIGA_PROJECT_ID:      1
+      PR_NUMBER:             9
+      PR_REPO:               general-agent-2/fdsc-dashboard
+      GITEA_URL:             <set to the key 'GITEA_URL' of config map 'agent-service-endpoints'>        Optional: false
+      TAIGA_URL:             <set to the key 'TAIGA_URL' of config map 'agent-service-endpoints'>        Optional: false
+      PUSHGATEWAY_URL:       <set to the key 'PUSHGATEWAY_URL' of config map 'agent-service-endpoints'>  Optional: false
+      ANTHROPIC_API_KEY:     <set to the key 'api-key' in secret 'anthropic-api-key'>                    Optional: true
+      DOCKER_HOST:           unix:///var/run/docker.sock
+    Mounts:
+      /home/agent/.claude from claude-home (rw)
+      /home/agent/.claude-secret from claude-credentials (ro)
+      /home/agent/workspace from workspace (rw)
+      /var/run from docker-sock (rw)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True 
+  Initialized                 True 
+  Ready                       True 
+  ContainersReady             True 
+  PodScheduled                True 
+Volumes:
+  workspace:
+    Type:       EmptyDir (a temporary directory that shares a pod's lifetime)
+    Medium:     
+    SizeLimit:  <unset>
+  claude-home:
+    Type:       EmptyDir (a temporary directory that shares a pod's lifetime)
+    Medium:     
+    SizeLimit:  <unset>
+  claude-credentials:
+    Type:        Secret (a volume populated by a Secret)
+    SecretName:  claude-credentials
+    Optional:    false
+  docker-sock:
+    Type:       EmptyDir (a temporary directory that shares a pod's lifetime)
+    Medium:     
+    SizeLimit:  <unset>
+  docker-storage:
+    Type:        EmptyDir (a temporary directory that shares a pod's lifetime)
+    Medium:      
+    SizeLimit:   <unset>
+QoS Class:       BestEffort
+Node-Selectors:  <none>
+Tolerations:     node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                 node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+Events:
+  Type    Reason     Age   From               Message
+  ----    ------     ----  ----               -------
+  Normal  Scheduled  63s   default-scheduler  Successfully assigned agents/agent-general-agent-3-ticket-10-fix-lzwh7 to tuxedo-os
+  Normal  Pulled     63s   kubelet            Container image "docker:dind" already present on machine
+  Normal  Created    63s   kubelet            Created container: dind
+  Normal  Started    63s   kubelet            Started container dind
+  Normal  Pulling    62s   kubelet            Pulling image "localhost:5000/agent-worker:latest"
+  Normal  Pulled     62s   kubelet            Successfully pulled image "localhost:5000/agent-worker:latest" in 159ms (159ms including waiting). Image size: 872449311 bytes.
+  Normal  Created    62s   kubelet            Created container: agent
+  Normal  Started    62s   kubelet            Started container agent

@@ -16,6 +16,7 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # Configurable via environment
 GITEA_PORT="${GITEA_PORT:-3001}"
 TAIGA_PORT="${TAIGA_PORT:-9000}"
+REGISTRY_PORT="${REGISTRY_PORT:-5000}"
 TAIGA_SECRET_KEY="${TAIGA_SECRET_KEY:-$(python3 -c "import secrets; print(secrets.token_hex(32))")}"
 HUMAN_USERNAME="${HUMAN_USERNAME:-wistefan}"
 HUMAN_PASSWORD="${HUMAN_PASSWORD:-password}"
@@ -128,19 +129,65 @@ metadata:
 data:
   GITEA_URL: "http://gitea-http.gitea.svc.cluster.local:${GITEA_PORT}"
   TAIGA_URL: "http://taiga-gateway.taiga.svc.cluster.local:${TAIGA_PORT}"
+  PUSHGATEWAY_URL: "http://pushgateway.monitoring.svc.cluster.local:9091"
 ENDPOINTS
 echo ""
 
-# --- Step 3: Cache external container images ---
+# --- Step 3: Local container registry ---
 
-echo "=== Step 3: Image Cache ==="
+echo "=== Step 3: Local Registry ==="
+
+# Configure k3s containerd to use HTTP for the local registry.
+# This file is read on k3s (re)start; we only restart if the config changed.
+REGISTRIES_YAML="/etc/rancher/k3s/registries.yaml"
+DESIRED_REGISTRIES="mirrors:
+  \"localhost:${REGISTRY_PORT}\":
+    endpoint:
+      - \"http://localhost:${REGISTRY_PORT}\"
+"
+
+if [ ! -f "${REGISTRIES_YAML}" ] || [ "$(cat "${REGISTRIES_YAML}")" != "${DESIRED_REGISTRIES}" ]; then
+    echo "  Configuring k3s containerd mirror for localhost:${REGISTRY_PORT}..."
+    printf '%s' "${DESIRED_REGISTRIES}" > "${REGISTRIES_YAML}"
+    echo "  Restarting k3s to apply registry config..."
+    systemctl restart k3s
+    echo "  Waiting for k3s node..."
+    kubectl wait --for=condition=Ready node --all --timeout=120s
+fi
+
+# Deploy registry
+kubectl apply -f "${PROJECT_DIR}/k8s/registry/registry.yaml"
+echo "  Waiting for registry pod..."
+kubectl wait --for=condition=Ready pod -l app=registry -n registry --timeout=120s 2>/dev/null || true
+echo "  Registry available at localhost:${REGISTRY_PORT}."
+echo ""
+
+# --- Step 4: Cache external container images ---
+
+echo "=== Step 4: Image Cache ==="
 echo "Pre-pulling external images to avoid Docker Hub rate limits..."
 bash "${SCRIPT_DIR}/cache-images.sh"
 echo ""
 
-# --- Step 4: Shared volume directories ---
+# --- Step 5: Monitoring stack ---
 
-echo "=== Step 4: Shared volumes ==="
+echo "=== Step 5: Monitoring ==="
+
+kubectl apply -f "${PROJECT_DIR}/k8s/monitoring/prometheus.yaml"
+kubectl apply -f "${PROJECT_DIR}/k8s/monitoring/pushgateway.yaml"
+kubectl apply -f "${PROJECT_DIR}/k8s/monitoring/grafana.yaml"
+kubectl apply -f "${PROJECT_DIR}/k8s/monitoring/grafana-dashboards.yaml"
+
+echo "  Waiting for monitoring pods..."
+kubectl wait --for=condition=Ready pod -l app=prometheus -n monitoring --timeout=120s 2>/dev/null || true
+kubectl wait --for=condition=Ready pod -l app=pushgateway -n monitoring --timeout=120s 2>/dev/null || true
+kubectl wait --for=condition=Ready pod -l app=grafana -n monitoring --timeout=120s 2>/dev/null || true
+echo "  Grafana available at localhost:3000 (admin/password)."
+echo ""
+
+# --- Step 6: Shared volume directories ---
+
+echo "=== Step 6: Shared volumes ==="
 # Taiga directories — static/media (UID 999) and PostgreSQL (UID 999)
 mkdir -p /var/lib/dev-env/taiga/static
 mkdir -p /var/lib/dev-env/taiga/media
@@ -153,16 +200,23 @@ chown -R 100:100 /var/lib/dev-env/taiga/rabbitmq
 
 # Gitea directories — data (UID 1000, git user) and PostgreSQL (UID 1001, bitnami)
 mkdir -p /var/lib/dev-env/gitea/data
+mkdir -p /var/lib/dev-env/agents/data
 mkdir -p /var/lib/dev-env/gitea/postgresql
 chown -R 1000:1000 /var/lib/dev-env/gitea/data
 chown -R 1001:1001 /var/lib/dev-env/gitea/postgresql
 
+# Claude Spend transcripts — written by agent pods running as UID 1000.
+# Each agent drops a JSONL per run; `npx claude-spend` on the host reads
+# the accumulated directory. Layout: <project>/<session>.jsonl.
+mkdir -p /var/lib/dev-env/claude-spend/projects
+chown -R 1000:1000 /var/lib/dev-env/claude-spend
+
 echo "Created host directories for persistent volumes."
 echo ""
 
-# --- Step 5: Deploy Gitea ---
+# --- Step 7: Deploy Gitea ---
 
-echo "=== Step 5: Gitea ==="
+echo "=== Step 7: Gitea ==="
 
 # Create hostPath-backed PVs and PVCs before Helm touches the namespace.
 # These must exist before helm install so the chart binds to them instead
@@ -196,9 +250,9 @@ echo "Waiting for Gitea pods..."
 bash "${SCRIPT_DIR}/wait-for-ready.sh" gitea 300
 echo ""
 
-# --- Step 6: Deploy Taiga ---
+# --- Step 8: Deploy Taiga ---
 
-echo "=== Step 6: Taiga ==="
+echo "=== Step 8: Taiga ==="
 
 # Generate and inject the secret key
 TAIGA_SECRET_YAML="${PROJECT_DIR}/k8s/taiga/secret.yaml"
@@ -226,9 +280,9 @@ echo "Waiting for all Taiga pods..."
 bash "${SCRIPT_DIR}/wait-for-ready.sh" taiga 600
 echo ""
 
-# --- Step 7: Initialize services ---
+# --- Step 9: Initialize services ---
 
-echo "=== Step 7: Initialization ==="
+echo "=== Step 9: Initialization ==="
 
 echo "--- Initializing Gitea ---"
 GITEA_URL="http://localhost:${GITEA_PORT}" \
@@ -246,15 +300,15 @@ TAIGA_URL="http://localhost:${TAIGA_PORT}" \
     bash "${SCRIPT_DIR}/init-taiga.sh"
 echo ""
 
-# --- Step 8: Agent policies ---
+# --- Step 10: Agent policies ---
 
-echo "=== Step 8: Agent policies ==="
+echo "=== Step 10: Agent policies ==="
 kubectl apply -f "${PROJECT_DIR}/k8s/agents/policies.yaml"
 echo ""
 
-# --- Step 9: Anthropic API key ---
+# --- Step 11: Anthropic API key ---
 
-echo "=== Step 9: Claude Credentials ==="
+echo "=== Step 11: Claude Credentials ==="
 CLAUDE_CREDENTIALS="${REAL_HOME}/.claude/.credentials.json"
 
 # Two credential mechanisms are supported. If ANTHROPIC_API_KEY is set, it is
@@ -296,9 +350,9 @@ if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ ! -f "${CLAUDE_CREDENTIALS}" ]; then
 fi
 echo ""
 
-# --- Step 10: CI/CD Runner (optional) ---
+# --- Step 12: CI/CD Runner (optional) ---
 
-echo "=== Step 10: CI/CD Runner ==="
+echo "=== Step 12: CI/CD Runner ==="
 # The act-runner needs a registration token from Gitea.
 # Generate one via the Gitea API and create the secret.
 echo "Generating Gitea Actions runner registration token..."
@@ -320,64 +374,32 @@ else
 fi
 echo ""
 
-# --- Step 11: Build container images ---
+# --- Step 13: Build container images ---
 
-echo "=== Step 11: Container Images ==="
+echo "=== Step 13: Container Images ==="
 
-# Check for Docker or nerdctl (k3s ships with nerdctl-compatible ctr)
-if command -v docker &>/dev/null; then
-    BUILD_CMD="docker build"
-    SAVE_CMD="docker save"
-elif command -v nerdctl &>/dev/null; then
-    BUILD_CMD="nerdctl build"
-    SAVE_CMD="nerdctl save"
-else
-    echo "  WARNING: Neither docker nor nerdctl found."
+REGISTRY="localhost:${REGISTRY_PORT}"
+
+if ! command -v docker &>/dev/null; then
+    echo "  WARNING: Docker not found."
     echo "  Container images must be built manually."
     echo "  See README for build instructions."
-    BUILD_CMD=""
-fi
+else
+    echo "Building and pushing orchestrator image..."
+    docker build -t "${REGISTRY}/orchestrator:latest" "${PROJECT_DIR}/orchestrator" --quiet
+    docker push "${REGISTRY}/orchestrator:latest"
+    echo "  orchestrator: OK"
 
-if [ -n "${BUILD_CMD}" ]; then
-    echo "Building orchestrator image..."
-    ${BUILD_CMD} -t orchestrator:latest "${PROJECT_DIR}/orchestrator"
-    echo "  orchestrator:latest built."
-
-    echo "Building agent-worker image..."
-    ${BUILD_CMD} -t agent-worker:latest "${PROJECT_DIR}/agent"
-    echo "  agent-worker:latest built."
-
-    # Import images into k3s containerd.
-    # setup.sh runs as root so we access containerd directly (no sudo).
-    if [ "${BUILD_CMD}" = "docker build" ]; then
-        echo "Importing images into k3s containerd..."
-        for img in orchestrator:latest agent-worker:latest; do
-            docker save "${img}" | k3s ctr images import -
-            # Ensure both short and fully-qualified tags exist so k3s
-            # resolves the image regardless of which form it uses.
-            fq="docker.io/library/${img}"
-            if k3s ctr images ls -q | grep -qF "${fq}"; then
-                k3s ctr images tag "${fq}" "${img}" 2>/dev/null || true
-            elif k3s ctr images ls -q | grep -qF "${img}"; then
-                k3s ctr images tag "${img}" "${fq}" 2>/dev/null || true
-            fi
-        done
-        # Verify
-        for img in orchestrator agent-worker; do
-            if k3s ctr images ls -q | grep -qF "${img}"; then
-                echo "  ${img}: OK"
-            else
-                echo "  ERROR: ${img} not found in k3s after import!"
-                exit 1
-            fi
-        done
-    fi
+    echo "Building and pushing agent-worker image..."
+    docker build -t "${REGISTRY}/agent-worker:latest" "${PROJECT_DIR}/agent" --quiet
+    docker push "${REGISTRY}/agent-worker:latest"
+    echo "  agent-worker: OK"
 fi
 echo ""
 
-# --- Step 12: Deploy orchestrator ---
+# --- Step 14: Deploy orchestrator ---
 
-echo "=== Step 12: Orchestrator ==="
+echo "=== Step 14: Orchestrator ==="
 apply_manifest "${PROJECT_DIR}/k8s/agents/orchestrator.yaml"
 # Force a rollout to pick up new image (idempotent on first deploy)
 kubectl rollout restart deployment/orchestrator -n agents 2>/dev/null || true
@@ -386,9 +408,9 @@ kubectl rollout status deployment/orchestrator -n agents --timeout=120s 2>/dev/n
 echo "  Orchestrator deployed."
 echo ""
 
-# --- Step 13: Verify ---
+# --- Step 15: Verify ---
 
-echo "=== Step 13: Verification ==="
+echo "=== Step 15: Verification ==="
 GITEA_URL="http://localhost:${GITEA_PORT}" \
     TAIGA_URL="http://localhost:${TAIGA_PORT}" \
     HUMAN_USERNAME="${HUMAN_USERNAME}" \
@@ -405,6 +427,10 @@ echo ""
 echo "  Taiga:  http://localhost:${TAIGA_PORT}"
 echo "    Admin: admin / password"
 echo "    Human: ${HUMAN_USERNAME} / ${HUMAN_PASSWORD} (superuser)"
+echo ""
+echo "  Grafana: http://localhost:3000"
+echo "    Admin: admin / password"
+echo "    Anonymous viewer access enabled"
 echo ""
 echo "  kubectl: export KUBECONFIG=/etc/rancher/k3s/k3s.yaml"
 echo "=========================================="

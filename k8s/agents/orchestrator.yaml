@@ -26,7 +26,7 @@ data:
       taskTimeoutSeconds: 3600
       retryLimit: 2
       escalationThreshold: 2
-      containerImage: "agent-worker:latest"
+      containerImage: "localhost:5000/agent-worker:latest"
     notifications:
       webhookUrl: ""
       dashboardPort: 8080
@@ -58,8 +58,12 @@ spec:
       serviceAccountName: orchestrator
       containers:
         - name: orchestrator
-          image: orchestrator:latest
-          imagePullPolicy: Never
+          image: localhost:5000/orchestrator:latest
+          # Always pull so `./scripts/import-images.sh orchestrator` followed
+          # by `kubectl rollout restart` actually picks up the new image.
+          # With IfNotPresent the kubelet kept serving the previously-cached
+          # `:latest` digest indefinitely.
+          imagePullPolicy: Always
           args:
             - "--config=/etc/orchestrator/config.yaml"
           ports:

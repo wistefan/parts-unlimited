@@ -95,3 +95,12 @@ posts the `taiga_comment` on the Taiga ticket for you.
 - The `[step:N/M]` or `[step:complete]` marker in the `taiga_comment` field is critical —
   the orchestrator reads it to determine whether to re-spawn you for the next step or
   transition the ticket to "ready for test".
+- Prefer delegating exploration, test runs, and log parsing to a `Task`
+  subagent (see base system prompt). Keep the main session focused on
+  the actual edits.
+- **Do NOT modify `CLAUDE.md`.** It is appended to the system prompt and
+  cached across sessions; any edit invalidates the cached prefix for every
+  subsequent chained session (and every later step of this ticket), adding
+  real tokens per session. If the plan requires `CLAUDE.md` changes, skip
+  them and emit a `[plan-update]` `taiga_comment` instead so a plan-mode
+  agent can update it on the plan branch.

@@ -27,6 +27,9 @@ DEFAULT_IMAGES=(
     "nginx:1.19-alpine"
     "gitea/act_runner:latest"
     "docker:dind"
+    "prom/prometheus:latest"
+    "prom/pushgateway:latest"
+    "grafana/grafana:latest"
 )
 
 # Use arguments if provided, otherwise the default list.

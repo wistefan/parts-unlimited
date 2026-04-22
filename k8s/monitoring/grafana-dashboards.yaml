@@ -1,0 +1,294 @@
+## Grafana dashboards provisioned for agent token usage analysis.
+##
+## Three dashboards are mounted into /var/lib/grafana/dashboards and picked
+## up by the file-provisioning provider configured in grafana.yaml:
+##   - tokens.json  — overall token usage and cost attribution
+##   - cache.json   — prompt-cache effectiveness across modes and sessions
+##   - tools.json   — tool-call frequency and post-call token cost
+##
+## Dashboards reference the "Prometheus" datasource by UID (set explicitly in
+## the datasource config) so that provisioning stays deterministic.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: monitoring
+data:
+  tokens.json: |
+    {
+      "uid": "tokens-overview",
+      "title": "Token Usage Overview",
+      "tags": ["agents", "tokens"],
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "30s",
+      "time": {"from": "now-24h", "to": "now"},
+      "panels": [
+        {
+          "id": 1,
+          "type": "timeseries",
+          "title": "Total tokens by mode",
+          "gridPos": {"h": 10, "w": 12, "x": 0, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"unit": "short"}},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (mode) (agent_tokens_input_total + agent_tokens_output_total + agent_tokens_cache_write_total + agent_tokens_cache_read_total)",
+              "legendFormat": "{{mode}}"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "type": "timeseries",
+          "title": "Tokens by type (stacked)",
+          "gridPos": {"h": 10, "w": 12, "x": 12, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"unit": "short", "custom": {"stacking": {"mode": "normal"}}}},
+          "targets": [
+            {"refId": "A", "expr": "sum(agent_tokens_input_total)",       "legendFormat": "input"},
+            {"refId": "B", "expr": "sum(agent_tokens_output_total)",      "legendFormat": "output"},
+            {"refId": "C", "expr": "sum(agent_tokens_cache_write_total)", "legendFormat": "cache write"},
+            {"refId": "D", "expr": "sum(agent_tokens_cache_read_total)",  "legendFormat": "cache read"}
+          ]
+        },
+        {
+          "id": 3,
+          "type": "table",
+          "title": "Top tickets by total tokens",
+          "gridPos": {"h": 10, "w": 12, "x": 0, "y": 10},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "options": {"showHeader": true},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "topk(10, sum by (ticket_id) (agent_tokens_input_total + agent_tokens_output_total + agent_tokens_cache_write_total + agent_tokens_cache_read_total))",
+              "format": "table",
+              "instant": true
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "bargauge",
+          "title": "Tokens per step (this ticket)",
+          "gridPos": {"h": 10, "w": 12, "x": 12, "y": 10},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"unit": "short"}},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (plan_step) (agent_tokens_input_total{ticket_id=~\"$ticket\"} + agent_tokens_output_total{ticket_id=~\"$ticket\"})",
+              "legendFormat": "step {{plan_step}}",
+              "instant": true
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "type": "stat",
+          "title": "Orchestrator queue depth",
+          "gridPos": {"h": 5, "w": 6, "x": 0, "y": 20},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"unit": "short"}},
+          "targets": [{"refId": "A", "expr": "orchestrator_queue_depth"}]
+        },
+        {
+          "id": 6,
+          "type": "stat",
+          "title": "Jobs completed (last 24h)",
+          "gridPos": {"h": 5, "w": 6, "x": 6, "y": 20},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"unit": "short"}},
+          "targets": [{"refId": "A", "expr": "sum(increase(orchestrator_jobs_completed_total[24h]))"}]
+        }
+      ],
+      "templating": {
+        "list": [
+          {
+            "name": "ticket",
+            "type": "query",
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "query": "label_values(agent_tokens_input_total, ticket_id)",
+            "refresh": 1,
+            "includeAll": true,
+            "multi": false
+          }
+        ]
+      }
+    }
+  cache.json: |
+    {
+      "uid": "cache-efficiency",
+      "title": "Cache Efficiency",
+      "tags": ["agents", "cache"],
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "30s",
+      "time": {"from": "now-24h", "to": "now"},
+      "panels": [
+        {
+          "id": 1,
+          "type": "stat",
+          "title": "Overall cache hit ratio",
+          "gridPos": {"h": 5, "w": 8, "x": 0, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"unit": "percentunit", "max": 1, "min": 0}},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(agent_tokens_cache_read_total) / (sum(agent_tokens_cache_read_total) + sum(agent_tokens_input_total))"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "type": "bargauge",
+          "title": "Average cache hit ratio by mode",
+          "gridPos": {"h": 5, "w": 16, "x": 8, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"unit": "percentunit", "max": 1, "min": 0}},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "avg by (mode) (agent_session_cache_hit_ratio)",
+              "legendFormat": "{{mode}}"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "type": "timeseries",
+          "title": "Per-turn cache hit ratio (selected ticket)",
+          "gridPos": {"h": 10, "w": 24, "x": 0, "y": 5},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"unit": "percentunit", "max": 1, "min": 0}},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "agent_turn_cache_hit_ratio{ticket_id=~\"$ticket\"}",
+              "legendFormat": "s{{session}}/t{{turn}}"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "timeseries",
+          "title": "Cache write tokens by session number",
+          "gridPos": {"h": 10, "w": 12, "x": 0, "y": 15},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"unit": "short"}},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "avg by (session) (agent_session_tokens_cache_write)",
+              "legendFormat": "session {{session}}"
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "type": "table",
+          "title": "Tickets with worst cache hit ratio",
+          "gridPos": {"h": 10, "w": 12, "x": 12, "y": 15},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "bottomk(10, sum(agent_tokens_cache_read_total) by (ticket_id) / (sum(agent_tokens_cache_read_total) by (ticket_id) + sum(agent_tokens_input_total) by (ticket_id)))",
+              "format": "table",
+              "instant": true
+            }
+          ]
+        }
+      ],
+      "templating": {
+        "list": [
+          {
+            "name": "ticket",
+            "type": "query",
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "query": "label_values(agent_turn_cache_hit_ratio, ticket_id)",
+            "refresh": 1,
+            "includeAll": true,
+            "multi": false
+          }
+        ]
+      }
+    }
+  tools.json: |
+    {
+      "uid": "tools-attribution",
+      "title": "Tool Usage & Attribution",
+      "tags": ["agents", "tools"],
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "30s",
+      "time": {"from": "now-24h", "to": "now"},
+      "panels": [
+        {
+          "id": 1,
+          "type": "piechart",
+          "title": "Tool call frequency",
+          "gridPos": {"h": 10, "w": 12, "x": 0, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "options": {"legend": {"displayMode": "table", "placement": "right"}},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (tool) (agent_tool_calls_total)",
+              "legendFormat": "{{tool}}",
+              "instant": true
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "type": "barchart",
+          "title": "Average tokens after tool call, by tool",
+          "gridPos": {"h": 10, "w": 12, "x": 12, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"unit": "short"}},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "avg by (tool) (agent_tool_tokens_after)",
+              "legendFormat": "{{tool}}",
+              "instant": true
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "type": "table",
+          "title": "Top Bash-heavy tickets",
+          "gridPos": {"h": 10, "w": 12, "x": 0, "y": 10},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "topk(5, sum by (ticket_id) (agent_tool_calls_total{tool=\"Bash\"}))",
+              "format": "table",
+              "instant": true
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "heatmap",
+          "title": "Tool calls per mode",
+          "gridPos": {"h": 10, "w": 12, "x": 12, "y": 10},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (mode, tool) (agent_tool_calls_total)",
+              "legendFormat": "{{mode}}/{{tool}}",
+              "instant": true
+            }
+          ]
+        }
+      ]
+    }

@@ -33,7 +33,7 @@ agents:
   escalationThreshold: 2
 
   # Docker image for agent worker containers
-  containerImage: "agent-worker:latest"
+  containerImage: "localhost:5000/agent-worker:latest"
 
   # Per-specialization tool restrictions.
   # Omitted specializations use the default allowed tools (all).
@@ -57,3 +57,9 @@ kubernetes:
 
   # ServiceAccount for agent worker pods (zero K8s API permissions)
   agentServiceAccount: "agent-worker"
+
+# Monitoring is infrastructure-controlled: PUSHGATEWAY_URL is injected into
+# agent pods from the `agent-service-endpoints` ConfigMap created by
+# scripts/setup.sh. To disable metrics push, remove that key from the
+# ConfigMap — bootstrap.sh no-ops cleanly when the env var is unset. The
+# orchestrator always exposes /metrics on port 8080.

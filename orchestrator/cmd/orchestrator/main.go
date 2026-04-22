@@ -12,11 +12,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
@@ -25,6 +27,7 @@ import (
 	"github.com/wistefan/dev-env/orchestrator/pkg/gitea"
 	"github.com/wistefan/dev-env/orchestrator/pkg/identity"
 	"github.com/wistefan/dev-env/orchestrator/pkg/lifecycle"
+	"github.com/wistefan/dev-env/orchestrator/pkg/metrics"
 	"github.com/wistefan/dev-env/orchestrator/pkg/notifications"
 	"github.com/wistefan/dev-env/orchestrator/pkg/review"
 	"github.com/wistefan/dev-env/orchestrator/pkg/state"
@@ -135,10 +138,15 @@ func main() {
 		log.Printf("WARNING: Initial reconciliation failed: %v", err)
 	}
 
+	// Queue depth is read from the assignment engine at scrape time so
+	// metrics never drift from the live queue state.
+	metrics.RegisterQueueDepth(orch.assignEngine.QueueLength)
+
 	// Start HTTP server
 	mux := http.NewServeMux()
 	mux.Handle("/webhooks/taiga", orch.webhookHandler)
 	mux.Handle("/webhooks/gitea", orch.giteaWebhookHandler)
+	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ok")
@@ -470,8 +478,30 @@ func (o *orchestrator) registerGiteaWebhookHandlers() {
 			return nil
 		}
 
+		prNum := event.PullRequest.Number
+		// Per-PR marker lets us dedupe redelivered webhooks without
+		// touching unrelated rejection comments on the same ticket (a
+		// human could close multiple PRs against one ticket).
+		rejectionMarker := fmt.Sprintf("[pr-rejected:%d]", prNum)
+
+		// Dedupe: Gitea redelivers pull_request:closed on retries, and a
+		// human may also close/reopen/close. Without this guard every
+		// delivery posts another "awaiting human guidance" comment and
+		// re-reassigns the ticket.
+		if comments, err := o.taigaClient.GetComments(ticketID); err == nil {
+			for _, c := range comments {
+				if strings.Contains(c.Comment, rejectionMarker) {
+					log.Printf("Gitea: PR #%d close for ticket #%d already escalated — skipping duplicate webhook",
+						prNum, ticketID)
+					return nil
+				}
+			}
+		} else {
+			log.Printf("WARNING: could not fetch comments for ticket %d (dedupe check): %v", ticketID, err)
+		}
+
 		log.Printf("Gitea: PR #%d rejected (closed without merge) on %s for ticket #%d — escalating",
-			event.PullRequest.Number, event.Repository.FullName, ticketID)
+			prNum, event.Repository.FullName, ticketID)
 
 		// Post escalation comment on Taiga ticket
 		story, err := o.taigaClient.GetUserStory(ticketID)
@@ -479,8 +509,8 @@ func (o *orchestrator) registerGiteaWebhookHandlers() {
 			log.Printf("WARNING: could not fetch ticket %d for escalation: %v", ticketID, err)
 			return nil
 		}
-		comment := fmt.Sprintf("**PR #%d was rejected** (closed without merge) by %s.\n\nTicket paused — awaiting human guidance.",
-			event.PullRequest.Number, event.Sender.Login)
+		comment := fmt.Sprintf("%s\n\n**PR #%d was rejected** (closed without merge) by %s.\n\nTicket paused — awaiting human guidance.",
+			rejectionMarker, prNum, event.Sender.Login)
 		_, err = o.taigaClient.UpdateUserStory(ticketID, &taiga.UserStoryUpdate{
 			Comment:    comment,
 			AssignedTo: &o.humanTaigaID,
@@ -555,7 +585,7 @@ func (o *orchestrator) registerGiteaWebhookHandlers() {
 			TaigaUsername:  agent.ID,
 			TaigaPassword:  agent.Password,
 			HumanUsername:  o.cfg.Taiga.HumanUsername,
-			HumanTaigaID:  o.humanTaigaID,
+			HumanTaigaID:   o.humanTaigaID,
 			TaigaProjectID: o.projectID,
 		}
 
@@ -933,11 +963,139 @@ func (o *orchestrator) isAssignedToHuman(data *webhooks.UserStoryData) bool {
 	return false
 }
 
+// ticketAssignedToHuman fetches the ticket from Taiga and reports
+// whether it is currently assigned to the configured human user (as
+// primary assignee or watcher). Returns false on fetch errors — we
+// fail open so a transient Taiga hiccup doesn't stall work. Agents
+// set the human as assignee when they block on input (see
+// `request_human_input`), so this is the orchestrator's signal to
+// stay out of the way: no spawns, no comments, no assignments until
+// the human releases the ticket.
+func (o *orchestrator) ticketAssignedToHuman(ticketID int) bool {
+	if o.humanTaigaID == 0 {
+		return false
+	}
+	story, err := o.taigaClient.GetUserStory(ticketID)
+	if err != nil {
+		log.Printf("WARNING: could not fetch ticket %d to check assignee: %v", ticketID, err)
+		return false
+	}
+	if story.AssignedTo != nil && *story.AssignedTo == o.humanTaigaID {
+		return true
+	}
+	for _, uid := range story.AssignedUsers {
+		if uid == o.humanTaigaID {
+			return true
+		}
+	}
+	return false
+}
+
+// repoMarkerRE parses the repo line every agent embeds in its Taiga
+// comment. Tolerates the common variants agents have emitted:
+//
+//	**Repo:** `owner/name`
+//	**Repo:** owner/name
+//	Repo: owner/name
+//
+// This is the orchestrator's only source of truth for which fork a
+// ticket lives on — it keeps no local state.
+var repoMarkerRE = regexp.MustCompile("(?:\\*\\*)?Repo:(?:\\*\\*)?[\\s`]*([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)")
+
+// findRepoForTicket returns the canonical Gitea owner/name for a ticket
+// by scanning its Taiga comment history for a `**Repo:** owner/name`
+// marker. Every agent comment carries the marker forward, so the most
+// recent agent comment is sufficient — no need to walk all the way
+// back to the first one. Returns ("", "") when no marker exists yet
+// (first-agent case): the agent then resolves the repo itself from the
+// ticket description.
+func (o *orchestrator) findRepoForTicket(ticketID int) (owner, name string) {
+	comments, err := o.taigaClient.GetComments(ticketID)
+	if err != nil {
+		log.Printf("WARNING: could not fetch comments for ticket %d to resolve repo: %v", ticketID, err)
+		return "", ""
+	}
+	// GetComments returns newest-first; the first match is the latest
+	// agent comment. Non-agent comments (human replies, orchestrator-
+	// posted escalations) won't contain the marker and are skipped.
+	for _, c := range comments {
+		if m := repoMarkerRE.FindStringSubmatch(c.Comment); len(m) == 3 {
+			return m[1], m[2]
+		}
+	}
+	return "", ""
+}
+
+// pinRepoToTicket sets spec.RepoOwner/RepoName from a prior PR on the
+// ticket (if any) and grants the spawning agent write access when they
+// don't already own the repo. First-agent case (no prior PR) is a
+// no-op: spec remains empty and the agent falls back to bootstrap's
+// description-based repo resolution.
+func (o *orchestrator) pinRepoToTicket(ticketID int, agentID string, spec *lifecycle.AgentJobSpec) {
+	owner, name := o.findRepoForTicket(ticketID)
+	if owner == "" {
+		return
+	}
+	spec.RepoOwner = owner
+	spec.RepoName = name
+	if owner == agentID {
+		return
+	}
+	if err := o.giteaClient.AddCollaborator(owner, name, agentID, "write"); err != nil {
+		log.Printf("WARNING: ticket #%d: could not grant agent %s write access to %s/%s: %v",
+			ticketID, agentID, owner, name, err)
+	}
+}
+
+// findLastAgentForTicket returns the Taiga/Gitea username of the most
+// recent agent that commented on this ticket, derived from Taiga
+// comment history (the orchestrator keeps no local state). Continuing
+// with the same agent on each iteration keeps branch ownership, the
+// pushed IMPLEMENTATION_PLAN.md, and any CLAUDE.md context coherent;
+// switching agents mid-ticket loses all of that and the new agent
+// often re-does early steps. Returns "" when no agent has commented
+// yet (first-agent case).
+func (o *orchestrator) findLastAgentForTicket(ticketID int) string {
+	comments, err := o.taigaClient.GetComments(ticketID)
+	if err != nil {
+		return ""
+	}
+	for _, c := range comments {
+		if strings.Contains(c.User.Username, "-agent-") {
+			return c.User.Username
+		}
+	}
+	return ""
+}
+
+// pickAgentForTicket returns the agent identity to use when spawning
+// the next Job for a ticket. Prefers the last agent that commented on
+// the ticket so follow-up work lands on the same fork/branch/plan
+// context. Falls back to any free general agent when the previous
+// agent is unknown to the identity manager or already busy with
+// another ticket. Purely Taiga-backed — no orchestrator state needed.
+func (o *orchestrator) pickAgentForTicket(ticketID int) (*identity.AgentIdentity, error) {
+	if prev := o.findLastAgentForTicket(ticketID); prev != "" {
+		if a := o.identityMgr.GetAgent(prev); a != nil {
+			if !o.assignEngine.GetBusyAgents()[prev] {
+				log.Printf("Ticket #%d: continuing with previous agent %s", ticketID, prev)
+				return a, nil
+			}
+			log.Printf("Ticket #%d: previous agent %s is busy; picking a fresh one", ticketID, prev)
+		}
+	}
+	return o.identityMgr.GetOrCreateAgent("general", o.assignEngine.GetBusyAgents())
+}
+
 // spawnAgentForTicket creates (or reuses) an agent and spawns a Job for the given
 // ticket and mode.  Unlike respawnAgent, this does not require an existing assignment.
 // Used by Gitea webhook handlers where the assignment was already cleared.
 func (o *orchestrator) spawnAgentForTicket(ticketID int, mode string) {
-	agent, err := o.identityMgr.GetOrCreateAgent("general", o.assignEngine.GetBusyAgents())
+	if o.ticketAssignedToHuman(ticketID) {
+		log.Printf("Ticket #%d: assigned to human, skipping %s spawn", ticketID, mode)
+		return
+	}
+	agent, err := o.pickAgentForTicket(ticketID)
 	if err != nil {
 		log.Printf("ERROR: could not get agent for ticket %d: %v", ticketID, err)
 		return
@@ -956,9 +1114,10 @@ func (o *orchestrator) spawnAgentForTicket(ticketID int, mode string) {
 		TaigaUsername:  agent.ID,
 		TaigaPassword:  agent.Password,
 		HumanUsername:  o.cfg.Taiga.HumanUsername,
-		HumanTaigaID:  o.humanTaigaID,
+		HumanTaigaID:   o.humanTaigaID,
 		TaigaProjectID: o.projectID,
 	}
+	o.pinRepoToTicket(ticketID, agent.ID, spec)
 
 	jobName, err := o.lifecycleMgr.CreateJob(context.Background(), spec)
 	if err != nil {
@@ -970,28 +1129,25 @@ func (o *orchestrator) spawnAgentForTicket(ticketID int, mode string) {
 	o.saveState(context.Background())
 }
 
-// respawnAgent re-spawns the assigned agent for a ticket with the given mode.
-// Used when the orchestrator needs to advance the lifecycle (e.g. after analysis
-// confirms proceed, or after a PR merge triggers the next step).
+// respawnAgent re-spawns the appropriate agent for a ticket with the
+// given mode. The agent is derived from Taiga comment history (via
+// pickAgentForTicket) rather than in-memory assignment state so that
+// the orchestrator stays stateless and survives restarts without
+// losing track of which agent owns which ticket.
 func (o *orchestrator) respawnAgent(ticketID int, mode string) {
-	existing := o.assignEngine.GetAssignment(ticketID)
-	if existing == nil {
-		log.Printf("Ticket #%d: no existing assignment, spawning fresh agent in %s mode", ticketID, mode)
-		o.spawnAgentForTicket(ticketID, mode)
+	if o.ticketAssignedToHuman(ticketID) {
+		log.Printf("Ticket #%d: assigned to human, skipping %s respawn", ticketID, mode)
+		return
+	}
+	agent, err := o.pickAgentForTicket(ticketID)
+	if err != nil {
+		log.Printf("ERROR: Could not get agent for ticket %d: %v", ticketID, err)
 		return
 	}
 
-	agent := o.identityMgr.GetAgent(existing.PrimaryAgent)
-	if agent == nil {
-		log.Printf("Ticket #%d: agent %s not found, creating new", ticketID, existing.PrimaryAgent)
-		var err error
-		agent, err = o.identityMgr.GetOrCreateAgent("general", o.assignEngine.GetBusyAgents())
-		if err != nil {
-			log.Printf("ERROR: Could not get agent for ticket %d: %v", ticketID, err)
-			return
-		}
-	}
-
+	// Keep the engine's in-memory assignment in sync when the Taiga-
+	// derived agent differs from whatever was previously cached.
+	o.assignEngine.AssignAgent(ticketID, agent.ID)
 	o.assignTicketInTaiga(ticketID, agent.TaigaUserID)
 
 	spec := &lifecycle.AgentJobSpec{
@@ -1004,9 +1160,10 @@ func (o *orchestrator) respawnAgent(ticketID int, mode string) {
 		TaigaUsername:  agent.ID,
 		TaigaPassword:  agent.Password,
 		HumanUsername:  o.cfg.Taiga.HumanUsername,
-		HumanTaigaID:  o.humanTaigaID,
+		HumanTaigaID:   o.humanTaigaID,
 		TaigaProjectID: o.projectID,
 	}
+	o.pinRepoToTicket(ticketID, agent.ID, spec)
 
 	jobName, err := o.lifecycleMgr.CreateJob(context.Background(), spec)
 	if err != nil {
@@ -1127,8 +1284,15 @@ func (o *orchestrator) determineModeFromPRState(ticketID int) string {
 }
 
 // spawnFixAgent creates a fix agent for a specific PR on a ticket.
+// The agent is resolved from Taiga comment history so the agent that
+// authored the PR is the one asked to fix it — they already have the
+// workspace/plan context and own the branch.
 func (o *orchestrator) spawnFixAgent(ticketID int, repoFullName, repoOwner, repoName string, prNumber int) {
-	agent, err := o.identityMgr.GetOrCreateAgent("general", o.assignEngine.GetBusyAgents())
+	if o.ticketAssignedToHuman(ticketID) {
+		log.Printf("Ticket #%d: assigned to human, skipping fix spawn", ticketID)
+		return
+	}
+	agent, err := o.pickAgentForTicket(ticketID)
 	if err != nil {
 		log.Printf("ERROR: could not get agent for fix on ticket %d: %v", ticketID, err)
 		return
@@ -1145,13 +1309,21 @@ func (o *orchestrator) spawnFixAgent(ticketID int, repoFullName, repoOwner, repo
 		PRRepo:         repoFullName,
 		RepoOwner:      repoOwner,
 		RepoName:       repoName,
-		GiteaUsername:   agent.ID,
-		GiteaPassword:   agent.Password,
-		TaigaUsername:   agent.ID,
-		TaigaPassword:   agent.Password,
-		HumanUsername:   o.cfg.Taiga.HumanUsername,
+		GiteaUsername:  agent.ID,
+		GiteaPassword:  agent.Password,
+		TaigaUsername:  agent.ID,
+		TaigaPassword:  agent.Password,
+		HumanUsername:  o.cfg.Taiga.HumanUsername,
 		HumanTaigaID:   o.humanTaigaID,
 		TaigaProjectID: o.projectID,
+	}
+	// Fix agents operate on the PR's existing repo. Grant write access
+	// when the agent isn't the owner so the fix branch can be pushed.
+	if repoOwner != "" && repoOwner != agent.ID {
+		if err := o.giteaClient.AddCollaborator(repoOwner, repoName, agent.ID, "write"); err != nil {
+			log.Printf("WARNING: ticket #%d: could not grant fix agent %s write access to %s/%s: %v",
+				ticketID, agent.ID, repoOwner, repoName, err)
+		}
 	}
 	jobName, err := o.lifecycleMgr.CreateJob(context.Background(), spec)
 	if err != nil {
@@ -1276,6 +1448,10 @@ func (o *orchestrator) processQueue() {
 // The ticket stays in "ready" status — it only moves to "in-progress" after the
 // analysis agent confirms it can proceed (via a Taiga comment).
 func (o *orchestrator) assignTicket(ticketID int) error {
+	if o.ticketAssignedToHuman(ticketID) {
+		log.Printf("Ticket #%d: assigned to human, dropping from queue", ticketID)
+		return nil
+	}
 	// Get or create an agent
 	agent, err := o.identityMgr.GetOrCreateAgent("general", o.assignEngine.GetBusyAgents())
 	if err != nil {
@@ -1304,7 +1480,7 @@ func (o *orchestrator) assignTicket(ticketID int) error {
 		TaigaUsername:  agent.ID,
 		TaigaPassword:  agent.Password,
 		HumanUsername:  o.cfg.Taiga.HumanUsername,
-		HumanTaigaID:  o.humanTaigaID,
+		HumanTaigaID:   o.humanTaigaID,
 		TaigaProjectID: o.projectID,
 	}
 
@@ -1323,6 +1499,10 @@ func (o *orchestrator) assignTicket(ticketID int) error {
 
 // handleDelegation creates a specialized agent for delegated work.
 func (o *orchestrator) handleDelegation(ticketID int, specialization string) {
+	if o.ticketAssignedToHuman(ticketID) {
+		log.Printf("Ticket #%d: assigned to human, skipping delegation to %s", ticketID, specialization)
+		return
+	}
 	agent, err := o.identityMgr.GetOrCreateAgent(specialization, o.assignEngine.GetBusyAgents())
 	if err != nil {
 		log.Printf("ERROR: Could not create %s agent for ticket %d: %v", specialization, ticketID, err)
@@ -1335,12 +1515,12 @@ func (o *orchestrator) handleDelegation(ticketID int, specialization string) {
 		AgentID:        agent.ID,
 		Specialization: specialization,
 		TicketID:       ticketID,
-		GiteaUsername:   agent.ID,
-		GiteaPassword:   agent.Password,
-		TaigaUsername:   agent.ID,
-		TaigaPassword:   agent.Password,
+		GiteaUsername:  agent.ID,
+		GiteaPassword:  agent.Password,
+		TaigaUsername:  agent.ID,
+		TaigaPassword:  agent.Password,
 		HumanUsername:  o.cfg.Taiga.HumanUsername,
-		HumanTaigaID:  o.humanTaigaID,
+		HumanTaigaID:   o.humanTaigaID,
 		TaigaProjectID: o.projectID,
 	}
 
@@ -1388,6 +1568,13 @@ func (o *orchestrator) reconcile(ctx context.Context) error {
 		if story.Status != o.readyStatusID && story.Status != o.inProgressID {
 			log.Printf("Reconcile: ticket #%d is not in ready/in-progress status, clearing assignment", ticketID)
 			o.assignEngine.CompleteTicket(ticketID)
+			continue
+		}
+
+		// Never touch tickets the human currently owns — they're blocked
+		// on human input, and any spawn / respawn / comment would both
+		// be unwanted and spam the ticket history.
+		if o.humanTaigaID > 0 && story.AssignedTo != nil && *story.AssignedTo == o.humanTaigaID {
 			continue
 		}
 

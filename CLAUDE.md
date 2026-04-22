@@ -16,13 +16,15 @@ go test ./...                                      # Run all tests
 go test ./pkg/assignment                           # Test single package
 go test -run TestAssignmentEngine ./pkg/assignment # Run single test
 go vet ./...                                       # Static analysis
-docker build -t orchestrator:latest .              # Build container
+docker build -t localhost:5000/orchestrator:latest . # Build container
+docker push localhost:5000/orchestrator:latest       # Push to local registry
 ```
 
 ### Agent Worker
 ```bash
 cd agent
-docker build -t agent-worker:latest .    # Build container
+docker build -t localhost:5000/agent-worker:latest . # Build container
+docker push localhost:5000/agent-worker:latest        # Push to local registry
 bash agent/test-bootstrap.sh             # Unit tests for bootstrap.sh
 ```
 
@@ -32,8 +34,8 @@ sudo ./scripts/setup.sh                  # Deploy everything (idempotent)
 ./scripts/verify.sh                      # Health checks
 sudo ./scripts/teardown.sh               # Remove services, keep k3s
 sudo ./scripts/teardown.sh --full        # Complete reset including k3s
-sudo ./scripts/import-images.sh          # Rebuild & import both images to k3s
-sudo ./scripts/import-images.sh agent-worker  # Rebuild single image
+./scripts/import-images.sh               # Build & push both images to local registry
+./scripts/import-images.sh agent-worker  # Build & push single image
 ```
 
 ### Viewing Logs
@@ -70,6 +72,7 @@ The entry point is `cmd/orchestrator/main.go` (~1600 lines) which wires everythi
 | `pkg/plan` | Markdown plan parsing, step tracking, release notes |
 | `pkg/notifications` | Webhook + desktop notification dispatch |
 | `pkg/config` | YAML config loading with defaults |
+| `pkg/metrics` | Prometheus metric definitions + /metrics handler registration |
 
 ### Ticket Lifecycle & Agent Modes
 
@@ -104,8 +107,45 @@ Fix agents are spawned when a human requests changes on any PR.
 In-cluster service URLs:
 - Gitea: `http://gitea-http.gitea.svc.cluster.local:3001`
 - Taiga: `http://taiga-gateway.taiga.svc.cluster.local:9000`
+- Pushgateway: `http://pushgateway.monitoring.svc.cluster.local:9091` (injected into agent pods as `PUSHGATEWAY_URL`)
+- Prometheus: `http://prometheus.monitoring.svc.cluster.local:9090`
 
-External URLs: Gitea at `http://localhost:3001`, Taiga at `http://localhost:9000`
+External URLs: Gitea at `http://localhost:3001`, Taiga at `http://localhost:9000`, Grafana at `http://localhost:3000` (admin/password), Prometheus at `http://localhost:9090`.
+
+## Observability
+
+Token usage and job metrics flow through a Prometheus stack:
+
+- Agent pods push per-turn, per-session, per-tool, and job-level gauges to the Pushgateway at the end of every session via `agent/parse-usage.py` (run from `bootstrap.sh`).
+- The orchestrator exposes `/metrics` on port 8080 with job create/complete counters, job-duration histograms, a queue-depth gauge, and review-invocation counters.
+- Three provisioned Grafana dashboards (under `k8s/monitoring/grafana-dashboards.yaml`) cover: Token Usage Overview, Cache Efficiency, and Tool Usage & Attribution.
+
+Dashboards, scrape config, and pushgateway network access are deployed by `./scripts/setup.sh` (step 5 — "Monitoring"). Disable metrics push per-run by unsetting `PUSHGATEWAY_URL` in the agent environment.
+
+### Claude Spend integration
+
+Every agent pod writes two files into the host path `/var/lib/dev-env/claude-spend/`, mirroring exactly what `npx claude-spend` looks for under `~/.claude/`:
+
+- `projects/<repo>/<agent>-ticket-<id>-<mode>-<ts>.jsonl` — the per-run transcript (user/assistant events with synthetic timestamps).
+- `history.jsonl` — a flat, append-only index mapping each `sessionId` (= the transcript filename without `.jsonl`) to a `display` label of the form `[<mode>[ step N]] Ticket #<id>: <subject>`. Without this, claude-spend falls back to the first raw user prompt, which for agents is a long system-prompt blob and not useful as a label.
+
+Both files accumulate across runs — nothing is ever deleted — and Claude Spend runs on the host, outside the cluster.
+
+To analyze them:
+
+```bash
+# One-time: point claude-spend's expected paths at the agents' hostPath dir.
+# Back up an existing ~/.claude/projects or ~/.claude/history.jsonl first
+# if you also use Claude Code locally.
+mkdir -p ~/.claude
+ln -sfn /var/lib/dev-env/claude-spend/projects     ~/.claude/projects
+ln -sfn /var/lib/dev-env/claude-spend/history.jsonl ~/.claude/history.jsonl
+
+# Serve the UI (no installation needed).
+npx claude-spend
+```
+
+The transcript generator lives in `agent/export-claude-spend.py`; it is invoked by `bootstrap.sh` after each Claude invocation and adds synthetic per-line timestamps, which is the only field Claude Spend's parser requires on top of raw stream-json. The `history.jsonl` line is appended in `bootstrap.sh` itself via `jq` (concurrent agents append safely — JSONL lines are well below `PIPE_BUF`).
 
 ## Agent Security Model
 
@@ -119,6 +159,6 @@ Agent containers run non-root (UID 1000), have no K8s API access (`automountServ
 
 ## Common Troubleshooting
 
-**ErrImageNeverPull**: Re-import images with `docker save orchestrator:latest agent-worker:latest | sudo k3s ctr images import -`
+**ErrImagePull / registry unavailable**: Ensure the local registry pod is running (`kubectl get pod -n registry`). Re-push images with `./scripts/import-images.sh`
 
 **Port conflicts**: Use `GITEA_PORT=3002 TAIGA_PORT=9001 sudo -E ./scripts/setup.sh`
