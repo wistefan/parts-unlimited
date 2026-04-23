@@ -76,7 +76,18 @@ extract_repo_ref() {
     local raw
     raw=$(echo "${desc}" | grep -oP '(?i)(?:repo|gitea)\s*:\s*\K.*' | head -1 || true)
     [ -z "${raw}" ] && return
-    raw=$(echo "${raw}" | sed -E 's/^\s+//;s/\s+$//')
+    raw=$(printf '%s' "${raw}" | python3 -c '
+import sys, unicodedata
+s = sys.stdin.read()
+def strippable(c):
+    return c.isspace() or unicodedata.category(c) == "Cf"
+i, j = 0, len(s)
+while i < j and strippable(s[i]):
+    i += 1
+while j > i and strippable(s[j - 1]):
+    j -= 1
+sys.stdout.write(s[i:j])
+')
     if echo "${raw}" | grep -qP '^\[.*\]\(.*\)'; then
         raw=$(echo "${raw}" | sed -E 's/^\[([^]]*)\]\(([^)]*)\).*/\2/')
     fi
@@ -115,6 +126,21 @@ assert_eq "repo: case insensitive" "claude/my-project" "${RESULT}"
 
 RESULT=$(extract_repo_ref "repo: owner/name # this is a comment")
 assert_eq "repo: value with trailing comment" "owner/name" "${RESULT}"
+
+# Invisible unicode codepoints (rich-text paste) — these arrive via Taiga's
+# WYSIWYG editor and used to break the URL detection, routing REPO_REF to
+# the owner/name branch which mangled it into REPO_OWNER=" https:" etc.
+NBSP=$(printf '\xc2\xa0')
+ZWSP=$(printf '\xe2\x80\x8b')
+BOM=$(printf '\xef\xbb\xbf')
+RESULT=$(extract_repo_ref "repo:${NBSP}https://github.com/org/repo")
+assert_eq "repo: URL with leading NBSP" "https://github.com/org/repo" "${RESULT}"
+RESULT=$(extract_repo_ref "repo:${ZWSP}https://github.com/org/repo")
+assert_eq "repo: URL with leading ZWSP" "https://github.com/org/repo" "${RESULT}"
+RESULT=$(extract_repo_ref "repo:${BOM}https://github.com/org/repo")
+assert_eq "repo: URL with leading BOM" "https://github.com/org/repo" "${RESULT}"
+RESULT=$(extract_repo_ref "repo: https://github.com/org/repo${ZWSP}")
+assert_eq "repo: URL with trailing ZWSP" "https://github.com/org/repo" "${RESULT}"
 
 # Test that URL is detected as remote (not split into owner/name)
 RESULT=$(extract_repo_ref "repo: https://github.com/FIWARE/data-space-connector")

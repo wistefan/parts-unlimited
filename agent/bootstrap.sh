@@ -233,8 +233,26 @@ extract_repo_ref() {
     raw=$(echo "${desc}" | grep -oP '(?i)(?:repo|gitea)\s*:\s*\K.*' | head -1 || true)
     [ -z "${raw}" ] && return
 
-    # Strip leading/trailing whitespace
-    raw=$(echo "${raw}" | sed -E 's/^\s+//;s/\s+$//')
+    # Strip leading/trailing whitespace AND invisible unicode codepoints
+    # that sed `\s` does NOT handle but can easily arrive via rich-text
+    # copy-paste into Taiga: U+00A0 NBSP, U+200B-U+200F (zero-width family),
+    # U+FEFF BOM. Leaving these intact makes later anchors like `^https?://`
+    # silently fail and the code routes to the owner/name branch with
+    # garbled output (observed: REPO_OWNER=" https:" / REPO_NAME="").
+    raw=$(printf '%s' "${raw}" | python3 -c '
+import sys, unicodedata
+s = sys.stdin.read()
+def strippable(c):
+    # Stdlib whitespace PLUS the Cf (format) unicode category, which is
+    # where the zero-width / bidi-control / BOM codepoints live.
+    return c.isspace() or unicodedata.category(c) == "Cf"
+i, j = 0, len(s)
+while i < j and strippable(s[i]):
+    i += 1
+while j > i and strippable(s[j - 1]):
+    j -= 1
+sys.stdout.write(s[i:j])
+')
 
     # Strip markdown link syntax: [text](url) → url
     if echo "${raw}" | grep -qP '^\[.*\]\(.*\)'; then
