@@ -219,6 +219,96 @@ assert_contains "PR body has Taiga URL" "localhost:9000" "${PR_BODY}"
 
 echo ""
 
+# --- Test: implementation-plan slicing ---
+echo "Plan slicing:"
+
+# Mirrors the python3 invocation in bootstrap.sh that trims the plan down to
+# the current step before embedding it in a step-mode task prompt.
+slice_plan_for_step() {
+    local step="$1"
+    local plan="$2"
+    PLAN_STEP_NUM="${step}" python3 -c '
+import os, re, sys
+raw = sys.stdin.read()
+step = os.environ["PLAN_STEP_NUM"]
+parts = re.split(r"(?m)^(### Step \d+[^\n]*)$", raw)
+out = [parts[0].rstrip() + "\n"] if parts and parts[0].strip() else []
+found = False
+for i in range(1, len(parts), 2):
+    heading = parts[i]
+    body = parts[i + 1] if i + 1 < len(parts) else ""
+    m = re.match(r"### Step (\d+)", heading)
+    if m and m.group(1) == step:
+        out.append(heading + body.rstrip() + "\n")
+        found = True
+        break
+if not found:
+    sys.stdout.write(raw)
+else:
+    sys.stdout.write("".join(out))
+    sys.stdout.write(
+        "\n_Note: only step " + step + " is shown; "
+        "read IMPLEMENTATION_PLAN.md in the workspace root for prior/later "
+        "steps if needed._\n"
+    )
+' <<< "${plan}"
+}
+
+PLAN='# Implementation Plan: Test
+
+## Overview
+Some overview.
+
+## Steps
+
+### Step 1: First
+First body.
+
+### Step 2: Second
+Second body line 1.
+Second body line 2.
+
+### Step 3: Third
+Third body.'
+
+SLICED=$(slice_plan_for_step "2" "${PLAN}")
+assert_contains "slice step 2 keeps preamble" "Some overview" "${SLICED}"
+assert_contains "slice step 2 keeps step 2 heading" "### Step 2: Second" "${SLICED}"
+assert_contains "slice step 2 keeps step 2 body" "Second body line 2" "${SLICED}"
+if echo "${SLICED}" | grep -q "### Step 1:"; then
+    echo "  [FAIL] slice step 2 excludes step 1 heading"
+    FAIL=$((FAIL + 1))
+else
+    echo "  [PASS] slice step 2 excludes step 1 heading"
+    PASS=$((PASS + 1))
+fi
+if echo "${SLICED}" | grep -q "### Step 3:"; then
+    echo "  [FAIL] slice step 2 excludes step 3 heading"
+    FAIL=$((FAIL + 1))
+else
+    echo "  [PASS] slice step 2 excludes step 3 heading"
+    PASS=$((PASS + 1))
+fi
+assert_contains "slice step 2 has note" "only step 2 is shown" "${SLICED}"
+
+SLICED=$(slice_plan_for_step "1" "${PLAN}")
+assert_contains "slice step 1 keeps step 1 body" "First body" "${SLICED}"
+if echo "${SLICED}" | grep -q "### Step 2:"; then
+    echo "  [FAIL] slice step 1 excludes step 2 heading"
+    FAIL=$((FAIL + 1))
+else
+    echo "  [PASS] slice step 1 excludes step 2 heading"
+    PASS=$((PASS + 1))
+fi
+
+# Unknown step number falls back to the full plan rather than emitting
+# an empty prompt section.
+SLICED=$(slice_plan_for_step "99" "${PLAN}")
+assert_contains "slice unknown step falls back to full plan" "### Step 1: First" "${SLICED}"
+assert_contains "slice unknown step has step 3" "### Step 3: Third" "${SLICED}"
+
+echo ""
+
 # --- Results ---
 echo "---"
 echo "Results: ${PASS} passed, ${FAIL} failed"

@@ -494,6 +494,48 @@ for plan_file in IMPLEMENTATION_PLAN.md implementation_plan.md PLAN.md plan.md; 
     fi
 done
 
+# For step mode, embed ONLY the current step (plus the plan preamble) in
+# the task prompt. The full plan lives in IMPLEMENTATION_PLAN.md in the
+# workspace, which the agent can Read on demand — there is no reason to pay
+# ~N × (other_steps_tokens) cache reads across every turn of session 1.
+#
+# Format contract: the plan uses `### Step N: Title` headings (see
+# system-prompt-step.md). Preamble = everything before the first such
+# heading; per-step bodies run from their heading until the next `### Step`
+# heading or EOF.
+if [ "${MODE}" = "step" ] && [ -n "${PLAN_STEP}" ] && [ -n "${PLAN_CONTENT}" ]; then
+    PLAN_CONTENT=$(PLAN_STEP_NUM="${PLAN_STEP}" python3 -c '
+import os, re, sys
+raw = sys.stdin.read()
+step = os.environ["PLAN_STEP_NUM"]
+# Split keeping the step headings as delimiters. With a capturing group,
+# re.split yields: [preamble, heading1, body1, heading2, body2, ...].
+parts = re.split(r"(?m)^(### Step \d+[^\n]*)$", raw)
+out = [parts[0].rstrip() + "\n"] if parts and parts[0].strip() else []
+found = False
+for i in range(1, len(parts), 2):
+    heading = parts[i]
+    body = parts[i + 1] if i + 1 < len(parts) else ""
+    m = re.match(r"### Step (\d+)", heading)
+    if m and m.group(1) == step:
+        out.append(heading + body.rstrip() + "\n")
+        found = True
+        break
+if not found:
+    # Fall back to full plan if the step heading is missing — better than
+    # feeding the agent an empty plan section.
+    sys.stdout.write(raw)
+else:
+    sys.stdout.write("".join(out))
+    sys.stdout.write(
+        "\n_Note: only step " + step + " is shown; "
+        "read IMPLEMENTATION_PLAN.md in the workspace root for prior/later "
+        "steps if needed._\n"
+    )
+' <<< "${PLAN_CONTENT}")
+    echo "  Sliced plan to step ${PLAN_STEP} only ($(printf '%s' "${PLAN_CONTENT}" | wc -c) bytes)"
+fi
+
 # --- Build task prompt ---
 
 echo "Building task prompt..."
@@ -632,15 +674,36 @@ PROMPT_EOF
 
 echo "  Prompt written to ${PROMPT_FILE}"
 
-# --- Load system prompt template (mode-specific) ---
+# --- Load system prompt template (base + mode-specific) ---
+#
+# Always load the base system-prompt.md first — it carries cross-mode
+# guidance (subagent delegation, `### Context Summary` format and mandatory
+# emission cadence, code-quality rules). Then append the mode-specific file
+# so the mode's prescriptive rules sit on top.
+#
+# Rationale: with the previous `if/elif` the mode-specific file REPLACED the
+# base, so step/plan/fix agents never received the Context Summary guidance
+# that the chain-sessions design depends on — resulting in the fallback
+# summarizer (a second `claude -p` call) firing on every max-turns hit.
 
 SYSTEM_PROMPT=""
+if [ -f "/home/agent/system-prompt.md" ]; then
+    SYSTEM_PROMPT=$(cat /home/agent/system-prompt.md)
+fi
 SYSTEM_PROMPT_FILE="/home/agent/system-prompt-${MODE}.md"
 if [ -f "${SYSTEM_PROMPT_FILE}" ]; then
-    SYSTEM_PROMPT=$(cat "${SYSTEM_PROMPT_FILE}")
-    echo "  Using mode-specific system prompt: ${SYSTEM_PROMPT_FILE}"
-elif [ -f "/home/agent/system-prompt.md" ]; then
-    SYSTEM_PROMPT=$(cat /home/agent/system-prompt.md)
+    if [ -n "${SYSTEM_PROMPT}" ]; then
+        SYSTEM_PROMPT="${SYSTEM_PROMPT}
+
+# Mode-Specific Instructions: ${MODE}
+
+$(cat "${SYSTEM_PROMPT_FILE}")"
+        echo "  Using base + mode-specific system prompt: ${SYSTEM_PROMPT_FILE}"
+    else
+        SYSTEM_PROMPT=$(cat "${SYSTEM_PROMPT_FILE}")
+        echo "  Using mode-specific system prompt only (no base): ${SYSTEM_PROMPT_FILE}"
+    fi
+elif [ -n "${SYSTEM_PROMPT}" ]; then
     echo "  Using default system prompt"
 fi
 
@@ -944,6 +1007,21 @@ codebase from scratch. \`IMPLEMENTATION_PLAN.md\` is in the workspace root
 if you need to re-check the current step.
 
 ${SESSION_CONTEXT}
+
+## Do NOT Re-orient
+
+You are in the SAME workspace with the SAME branch checked out as the prior
+session left it. The **State** line above already reflects current branch and
+working-directory cleanliness.
+
+Do NOT run \`git status\`, \`git log\`, \`git branch\`, \`git diff\`, \`ls\`, or
+similar state-probing commands as your first action — the summary is
+authoritative. Do NOT re-read files you already examined; trust the summary.
+Go directly to the action described in **Next**.
+
+Re-orienting burns ~5 turns × ~30K cached-context-tokens ≈ 150K tokens per
+chained session and is the single largest waste in chained runs. Only probe
+state if the summary is ambiguous AND the action requires disambiguation.
 
 ## Completion Instructions
 
