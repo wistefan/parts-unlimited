@@ -74,52 +74,32 @@ late turns re-read the growing prefix and get exponentially expensive.
 - Never delegate understanding — the subagent does the lookup, you do the
   synthesis.
 
-# Context Summary (IMPORTANT)
+# Context Summary in the final taiga_comment
 
-Two distinct readers consume your `### Context Summary` blocks:
+When you finish the task and write `/home/agent/completion-status.json`, the
+`taiga_comment` field must end with a `### Context Summary` block. This is
+read by the NEXT agent that picks up this ticket (later step, fix agent,
+etc.) to resume without re-exploring everything.
 
-1. **Future agents on this ticket** — read the most recent `### Context Summary`
-   inside your final `taiga_comment` (the one in `completion-status.json`).
-2. **The next chained session of this same agent** — sessions are capped at
-   **20 turns** for cost reasons (late turns in a long session re-read a
-   growing prefix and get exponentially expensive). When you hit the limit,
-   the bootstrap looks for the most recent `### Context Summary` block
-   anywhere in your assistant text and prepends it to the next session's
-   prompt. Everything else from your current session is evicted.
-
-Both readers need the same content, so emit `### Context Summary` blocks in
-three places, in this order of importance:
-
-- **MANDATORY — at turn 15 and turn 18** — your session will end at turn 20
-  and the final turn is usually a tool call with no text, so a summary
-  written later gets lost. Write one at turn 15 as a mid-session checkpoint,
-  and refresh it at turn 18 so the most recent state survives. Do not wait
-  until turn 20.
-- **At every natural milestone** (finished implementing a helper, got a test
-  green, decided on an approach) — cheap insurance against early turn-limit
-  hits mid-tool-call.
-- **In your final `taiga_comment`** — the cumulative summary future agents
-  read when they pick up this ticket.
-
-Each `### Context Summary` block must contain:
+The block contains:
 
 - **Prior steps (reference only):** one line per merged step PR for this
-  ticket, in the form `- Step N: <title> — PR #X (merged)`. Do NOT re-narrate
-  their content — the PR diffs on the work branch are the source of truth.
-  Skip this field for mid-session checkpoints; include it only in the final
-  `taiga_comment` summary. This is load-bearing: on long-running tickets,
-  every prior narrated step compounds into every following step's prompt,
-  so reference form only.
-- **Done this session:** what was accomplished in the current agent
-  invocation — files edited, tests run, decisions made, commits pushed.
+  ticket: `- Step N: <title> — PR #X (merged)`. Do NOT narrate their
+  content — the PR diffs on the work branch are the source of truth.
+- **Done this session:** what this agent invocation accomplished — files
+  edited, tests run, decisions made, commits pushed.
 - **State:** current branch, open PR if any, working-directory cleanliness.
-- **Next:** the concrete next action — a follow-up agent should be able to
-  resume by reading this line alone.
-- **Pitfalls:** approaches tried that did not work, so the next session
-  avoids them.
+- **Next:** the concrete next action; a follow-up agent should resume from
+  this line alone.
+- **Pitfalls:** approaches tried that did not work.
 
-The block must start exactly with the literal `### Context Summary` heading
-(case-sensitive) so the bootstrap's extractor can find it.
+The block must start with the literal `### Context Summary` heading
+(case-sensitive).
+
+_Note: within a single agent invocation, the bootstrap generates its own
+programmatic Context Summary for chained sessions from the tool trace —
+you do NOT need to emit intermediate summaries. The one described above
+is only for the final taiga_comment._
 
 # Completion
 

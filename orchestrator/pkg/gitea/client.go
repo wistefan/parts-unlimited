@@ -175,6 +175,40 @@ func (c *Client) ListPullRequests(owner, repo, state string) ([]PullRequest, err
 	return prs, nil
 }
 
+// ticketBranchPrefixFmt is the head-branch prefix every orchestrator-managed
+// PR carries, regardless of mode (plan / step-N / fix). ListPullRequestsForTicket
+// filters on this prefix as a cheap, drift-proof way to associate PRs with
+// tickets without a separately maintained mapping.
+const ticketBranchPrefixFmt = "ticket-%d/"
+
+// ListPullRequestsForTicket returns every pull request on the repository
+// whose head branch is prefixed with `ticket-{ticketID}/`, across all
+// states (open, closed, merged). It is the Gitea-derived replacement for
+// the legacy prMappings table: callers who need to know "what PRs exist
+// for this ticket" should use this instead of maintaining their own map.
+//
+// The result is NOT sorted; callers that care about chronology should
+// order by PullRequest.Number.
+func (c *Client) ListPullRequestsForTicket(owner, repo string, ticketID int) ([]PullRequest, error) {
+	all, err := c.ListPullRequests(owner, repo, "all")
+	if err != nil {
+		return nil, err
+	}
+	prefix := fmt.Sprintf(ticketBranchPrefixFmt, ticketID)
+	var matches []PullRequest
+	for _, pr := range all {
+		if pr.Head.Ref == "" {
+			continue
+		}
+		// Exact-prefix match — a stray branch literally named `ticket-10`
+		// should not look like a ticket-10 PR; only `ticket-10/...` does.
+		if len(pr.Head.Ref) >= len(prefix) && pr.Head.Ref[:len(prefix)] == prefix {
+			matches = append(matches, pr)
+		}
+	}
+	return matches, nil
+}
+
 // GetPullRequest retrieves a single pull request.
 func (c *Client) GetPullRequest(owner, repo string, number int) (*PullRequest, error) {
 	path := fmt.Sprintf("/api/v1/repos/%s/%s/pulls/%d", owner, repo, number)

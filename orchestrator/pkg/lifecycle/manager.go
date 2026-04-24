@@ -504,6 +504,85 @@ func (m *Manager) ListActiveJobs(ctx context.Context) ([]JobStatus, error) {
 	return result, nil
 }
 
+// ReapFinishedJobs deletes every agent-worker Job whose status is
+// Succeeded or Failed. Returns the number of Jobs deleted.
+//
+// Kubernetes has its own TTLSecondsAfterFinished GC (300s by default),
+// but that delay is too long for the reconcile loop: a completed
+// analysis Job must be cleaned up quickly so the reconciler can spawn
+// the follow-up plan/onestep Job on the same ticket without tripping
+// the HasJobForTicket guard. In authoritative mode the reconciler
+// calls this at the start of every pass.
+//
+// Deletion errors on individual jobs are logged at caller level; this
+// method aggregates them into a single returned error if any occurred,
+// but still processes the remaining jobs so a transient API error on
+// one Job does not block cleanup of the others.
+func (m *Manager) ReapFinishedJobs(ctx context.Context) (int, error) {
+	jobs, err := m.ListActiveJobs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	var firstErr error
+	for _, j := range jobs {
+		if !j.Succeeded && !j.Failed {
+			continue
+		}
+		if err := m.DeleteJob(ctx, j.Name); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("deleting job %s: %w", j.Name, err)
+			}
+			continue
+		}
+		count++
+	}
+	return count, firstErr
+}
+
+// ActiveJobCount returns the number of agent-worker Jobs currently
+// considered active (Status.Active > 0). This is the Kubernetes-native
+// replacement for the in-memory busyAgents counter the assignment
+// engine used to maintain; the stateless reconciler calls it each pass
+// to enforce the maxConcurrency cap.
+//
+// Counted per Job, not per ticket: if for any reason two Jobs exist for
+// one ticket, both count against the cap. That is the conservative
+// choice for a concurrency cap and matches the old "busy pool" semantics.
+func (m *Manager) ActiveJobCount(ctx context.Context) (int, error) {
+	jobs, err := m.ListActiveJobs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, j := range jobs {
+		if j.Active {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// ListActiveAgents returns the set of agent IDs that currently own an
+// active Job. The reconciler passes this set to identity.GetOrCreateAgent
+// so the identity manager does not hand out the same agent to two
+// concurrent tickets. Derived from K8s Job labels — the authoritative
+// source — so it survives orchestrator restarts without any persisted
+// "busy pool" state.
+func (m *Manager) ListActiveAgents(ctx context.Context) (map[string]bool, error) {
+	jobs, err := m.ListActiveJobs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	busy := make(map[string]bool)
+	for _, j := range jobs {
+		if j.Active && j.AgentID != "" {
+			busy[j.AgentID] = true
+		}
+	}
+	return busy, nil
+}
+
 // HasJobForTicket checks whether any Job (running, succeeded, or failed)
 // exists for the given ticket, regardless of mode.  This prevents the
 // reconciliation loop from spawning duplicate agents when the derived mode

@@ -23,11 +23,67 @@ Determine whether the ticket is clear enough to proceed with implementation plan
 4. **Technical feasibility** — If a repo is referenced, briefly review the codebase
    structure to confirm the requested changes are feasible.
 
+### One-Step Tickets
+
+If the ticket is tagged **`one-step`** (look for it in the "Tags" line of the task
+prompt), the human is asking for a lightweight, single-PR implementation — no plan
+phase, no multi-step breakdown.  Evaluate whether that is realistic.
+
+#### Bar for agreeing (`onestep-proceed`)
+
+A ticket is a valid one-step task only if it meets **ALL** of these:
+
+- **≤ ~5 files edited.**  If you can already name 6+ files that will need changes,
+  it is not one-step.
+- **No pattern study of 3+ reference files.**  "Migrate chart X to follow the
+  pattern used in chart Y" sounds small but usually requires reading Y plus 2-3
+  prior migrations (keyrock, mintaka, orion, ...) to extract the pattern — that
+  pattern-study alone makes it multi-step.  Same for "port module X to use
+  library Y" when several other modules serve as reference.
+- **Fits in a single ~30-turn Claude session end-to-end.**  The implementing
+  agent gets one session to read, plan, edit, test, and commit.  If you'd need
+  to re-open the editor three times to finish, it's multi-step.
+- **A single focused, reviewable diff.**  If a reviewer would want to split
+  the PR into "refactor" + "feature" + "tests", the ticket should be split too.
+- **No cross-subsystem coordination.**  Schema changes with downstream consumer
+  updates, interface changes with multiple implementations, etc. are always
+  multi-step even when each individual change is small.
+
+**Err on the side of `onestep-rejected` when uncertain.**  A rejected one-step
+returns to normal planning cheaply (one re-run of analysis with the tag
+removed); a misclassified one-step burns through many chained sessions on
+re-exploration — we have measured real cases where a mis-classified one-step
+cost $25+ in cached context re-reads.
+
+Use the `onestep-proceed` or `onestep-rejected` outputs below instead of
+`proceed` / `need-info` when the tag is present.  The `proceed` path is for
+tickets without the `one-step` tag.
+
 ### Output
 
 Write your analysis result to `/home/agent/completion-status.json`.
 
-**If the ticket is clear (proceed):**
+**If the ticket is clear and tagged `one-step` — and you agree it fits in one PR:**
+```json
+{
+  "status": "success",
+  "summary": "Analysis complete: ticket is a valid one-step task.",
+  "analysis_result": "onestep-proceed",
+  "analysis_comment": "[analysis:onestep-proceed]\n\n**Analysis Summary:**\n<Brief description of your understanding of the ticket requirements.>\n\n**Repositories:** <list of repos involved>\n**Base branch:** <base branch, default: main>\n**Why one-step fits:** <one-sentence rationale>"
+}
+```
+
+**If the ticket is tagged `one-step` but you disagree (human reevaluation needed):**
+```json
+{
+  "status": "blocked",
+  "reason": "Ticket is tagged one-step but requires a multi-step approach.",
+  "analysis_result": "onestep-rejected",
+  "analysis_comment": "[analysis:onestep-rejected]\n\n**Why one-step does not fit:**\n<Concrete reasons — which subsystems are touched, why the work cannot be validated in a single PR, etc.>\n\n**Suggestion:** Remove the `one-step` tag to proceed with normal planning, or split the ticket into smaller tickets."
+}
+```
+
+**If the ticket is clear (normal, no `one-step` tag):**
 ```json
 {
   "status": "success",
@@ -37,7 +93,7 @@ Write your analysis result to `/home/agent/completion-status.json`.
 }
 ```
 
-**If more information is needed:**
+**If more information is needed (any ticket):**
 ```json
 {
   "status": "blocked",
@@ -60,3 +116,6 @@ for you.  You do NOT need to call any APIs yourself.
 - If the ticket references a repo, examine it to inform your analysis.
 - Always include the `analysis_result` and `analysis_comment` fields — the
   orchestrator depends on them.
+- When the ticket carries the `one-step` tag, you MUST use either
+  `onestep-proceed` or `onestep-rejected` (or `need-info` if the ticket is
+  underspecified) — never fall back to plain `proceed`.
