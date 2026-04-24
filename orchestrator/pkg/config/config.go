@@ -44,6 +44,19 @@ type AgentsConfig struct {
 	EscalationThreshold int                   `yaml:"escalationThreshold"`
 	ContainerImage      string                `yaml:"containerImage"`
 	Specializations     map[string]SpecConfig `yaml:"specializations"`
+
+	// ReconcilerMode selects the stateless reconciler's behaviour:
+	//   - ""            (default): legacy loop only, reconciler disabled.
+	//   - "shadow":     legacy loop authoritative; reconciler runs and
+	//                   logs its decisions for validation, but spawns
+	//                   nothing.
+	//   - "authoritative": reconciler is the single spawn path. The
+	//                   legacy reconcile loop and webhook-driven Enqueue
+	//                   / respawnAgent / spawnFixAgent paths are
+	//                   disabled; webhooks nudge the reconciler via
+	//                   ReconcileTicket instead. Use only after shadow
+	//                   mode has been validated in the target cluster.
+	ReconcilerMode string `yaml:"reconcilerMode"`
 }
 
 // SpecConfig holds per-specialization overrides.

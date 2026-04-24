@@ -82,4 +82,9 @@ COPY --chown=agent:agent system-prompt-plan.md /home/agent/system-prompt-plan.md
 COPY --chown=agent:agent system-prompt-step.md /home/agent/system-prompt-step.md
 COPY --chown=agent:agent system-prompt-fix.md /home/agent/system-prompt-fix.md
 
+# Claude Code PreToolUse hooks — currently: truncate large Bash output so
+# multi-KB tool results do not accumulate in the per-turn cache.
+COPY --chown=agent:agent hooks/ /home/agent/hooks/
+RUN chmod +x /home/agent/hooks/*.py
+
 ENTRYPOINT ["/bin/bash", "/home/agent/bootstrap.sh"]

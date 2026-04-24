@@ -29,6 +29,7 @@ import (
 	"github.com/wistefan/dev-env/orchestrator/pkg/lifecycle"
 	"github.com/wistefan/dev-env/orchestrator/pkg/metrics"
 	"github.com/wistefan/dev-env/orchestrator/pkg/notifications"
+	"github.com/wistefan/dev-env/orchestrator/pkg/reconciler"
 	"github.com/wistefan/dev-env/orchestrator/pkg/review"
 	"github.com/wistefan/dev-env/orchestrator/pkg/state"
 	"github.com/wistefan/dev-env/orchestrator/pkg/taiga"
@@ -82,6 +83,21 @@ type orchestrator struct {
 	// registeredRepos tracks repos that have a Gitea webhook registered.
 	// Prevents duplicate webhook registrations within a single run.
 	registeredRepos map[string]bool
+
+	// reconcilerSvc is the stateless Taiga+Gitea-derived reconciler.
+	// Nil when reconcilerMode == "" (legacy-only).
+	reconcilerSvc *reconciler.Reconciler
+
+	// reconcilerMode caches config.Agents.ReconcilerMode as the
+	// reconciler's typed Mode enum. Compared against ModeAuthoritative
+	// to decide whether legacy spawn paths run.
+	reconcilerMode reconciler.Mode
+
+	// legacyReconcileActive is true iff the legacy reconcile loop and
+	// webhook-driven spawn paths are authoritative. False when the new
+	// reconciler has taken over. Distinct from reconcilerMode so future
+	// modes (e.g. partial takeovers) can flip independently.
+	legacyReconcileActive bool
 }
 
 func main() {
@@ -133,9 +149,14 @@ func main() {
 		log.Printf("  Webhooks must be configured manually or the orchestrator will rely on polling only.")
 	}
 
-	// Reconcile state on startup (catch missed events)
-	if err := orch.reconcile(ctx); err != nil {
-		log.Printf("WARNING: Initial reconciliation failed: %v", err)
+	// Reconcile state on startup (catch missed events). Only the
+	// authoritative loop runs the startup pass — in authoritative mode
+	// the stateless reconciler does its own initial pass inside
+	// runReconcilerLoop.
+	if orch.legacyReconcileActive {
+		if err := orch.reconcile(ctx); err != nil {
+			log.Printf("WARNING: Initial reconciliation failed: %v", err)
+		}
 	}
 
 	// Queue depth is read from the assignment engine at scrape time so
@@ -159,8 +180,22 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 	}
 
-	// Start reconciliation loop
-	go orch.reconcileLoop(ctx)
+	// Start the legacy reconcile loop only when it is still the
+	// authoritative spawn path. In authoritative mode the new
+	// reconciler is the single writer; running both would race.
+	if orch.legacyReconcileActive {
+		go orch.reconcileLoop(ctx)
+	}
+
+	// Start the stateless reconciler when enabled (shadow or
+	// authoritative mode). Shadow runs alongside the legacy loop and
+	// only logs; authoritative replaces the legacy loop and actually
+	// spawns.
+	if orch.reconcilerSvc != nil {
+		go orch.runReconcilerLoop(ctx, orch.reconcilerSvc)
+		log.Printf("Reconciler enabled in %q mode (interval: %s)",
+			cfg.Agents.ReconcilerMode, ReconcileInterval)
+	}
 
 	// Start server in goroutine
 	go func() {
@@ -351,6 +386,40 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 		registeredRepos:     make(map[string]bool),
 	}
 
+	// Configure the stateless reconciler. The Spawner is wired after
+	// the orchestrator struct is constructed so it can close over the
+	// orchestrator's existing spawn helpers.
+	switch cfg.Agents.ReconcilerMode {
+	case "authoritative":
+		orch.reconcilerMode = reconciler.ModeAuthoritative
+		orch.legacyReconcileActive = false
+	case "shadow":
+		orch.reconcilerMode = reconciler.ModeShadow
+		orch.legacyReconcileActive = true
+	case "":
+		// Legacy-only: no reconciler service is built.
+		orch.legacyReconcileActive = true
+	default:
+		log.Printf("WARNING: unknown reconcilerMode %q, falling back to legacy-only", cfg.Agents.ReconcilerMode)
+		orch.legacyReconcileActive = true
+	}
+
+	if cfg.Agents.ReconcilerMode == "shadow" || cfg.Agents.ReconcilerMode == "authoritative" {
+		orch.reconcilerSvc = reconciler.New(reconciler.Config{
+			Taiga:          taigaClient,
+			Gitea:          giteaClient,
+			Jobs:           lifecycleMgr,
+			Spawner:        &orchSpawner{o: orch},
+			Log:            log.Default(),
+			Mode:           orch.reconcilerMode,
+			ProjectID:      project.ID,
+			ReadyStatusID:  readyStatusID,
+			InProgressID:   inProgressID,
+			HumanTaigaID:   humanTaigaID,
+			MaxConcurrency: cfg.Agents.MaxConcurrency,
+		})
+	}
+
 	log.Println("Initialization complete.")
 	return orch, nil
 }
@@ -367,8 +436,14 @@ func (o *orchestrator) registerWebhookHandlers() {
 		statusName := data.Status.Name
 		log.Printf("Ticket #%d: change by %s, status=%q", data.ID, event.By.Username, statusName)
 
-		// Ticket moved to "ready" — enqueue for assignment
+		// Ticket moved to "ready" — nudge reconciler (authoritative) or
+		// enqueue via legacy path.
 		if strings.EqualFold(statusName, StatusReady) {
+			if !o.legacyReconcileActive {
+				log.Printf("Ticket #%d: status is ready, nudging reconciler", data.ID)
+				o.nudgeReconciler(data.ID)
+				return nil
+			}
 			if o.assignEngine.GetAssignment(data.ID) == nil {
 				log.Printf("Ticket #%d: status is ready, enqueuing", data.ID)
 				o.assignEngine.Enqueue(data.ID)
@@ -380,6 +455,11 @@ func (o *orchestrator) registerWebhookHandlers() {
 		// Ticket became unassigned — the human finished providing input.
 		// Re-run analysis regardless of ticket status (ready or in-progress).
 		if o.isTicketUnassigned(event) {
+			if !o.legacyReconcileActive {
+				log.Printf("Ticket #%d: unassigned, nudging reconciler", data.ID)
+				o.nudgeReconciler(data.ID)
+				return nil
+			}
 			if o.assignEngine.GetAssignment(data.ID) == nil {
 				log.Printf("Ticket #%d: unassigned, enqueuing for analysis", data.ID)
 				o.assignEngine.Enqueue(data.ID)
@@ -402,6 +482,11 @@ func (o *orchestrator) registerWebhookHandlers() {
 			return err
 		}
 		if strings.EqualFold(data.Status.Name, StatusReady) {
+			if !o.legacyReconcileActive {
+				log.Printf("New ticket #%d created in ready status, nudging reconciler", data.ID)
+				o.nudgeReconciler(data.ID)
+				return nil
+			}
 			log.Printf("New ticket #%d created in ready status, enqueuing", data.ID)
 			o.assignEngine.Enqueue(data.ID)
 			o.processQueue()
@@ -463,11 +548,17 @@ func (o *orchestrator) registerGiteaWebhookHandlers() {
 		if o.isStepComplete(ticketID) {
 			log.Printf("Gitea: ticket #%d all steps complete — transitioning to ready-for-test", ticketID)
 			o.transitionToReadyForTest(ticketID)
-		} else {
-			log.Printf("Gitea: ticket #%d PR merged — spawning step agent", ticketID)
-			o.spawnAgentForTicket(ticketID, "step")
+			return nil
 		}
 
+		if !o.legacyReconcileActive {
+			log.Printf("Gitea: ticket #%d PR merged — nudging reconciler", ticketID)
+			o.nudgeReconciler(ticketID)
+			return nil
+		}
+
+		log.Printf("Gitea: ticket #%d PR merged — spawning step agent", ticketID)
+		o.spawnAgentForTicket(ticketID, "step")
 		return nil
 	})
 
@@ -546,6 +637,14 @@ func (o *orchestrator) registerGiteaWebhookHandlers() {
 		// this ticket, skip — a previous webhook already handled it.
 		if hasJob, _ := o.lifecycleMgr.HasJobForTicket(context.Background(), ticketID); hasJob {
 			log.Printf("Gitea: ticket #%d already has a running job, skipping duplicate review event", ticketID)
+			return nil
+		}
+
+		if !o.legacyReconcileActive {
+			// In authoritative mode the reconciler detects the
+			// non-stale REQUEST_CHANGES review via Gitea and spawns
+			// the fix agent itself — no direct spawn from the webhook.
+			o.nudgeReconciler(ticketID)
 			return nil
 		}
 
@@ -779,6 +878,8 @@ func (o *orchestrator) determineMode(ticketID int) string {
 	// Collect which lifecycle markers exist anywhere in the history.
 	hasAnalysisProceed := false
 	hasAnalysisNeedInfo := false
+	hasAnalysisOneStepProceed := false
+	hasAnalysisOneStepRejected := false
 	hasPlanCreated := false
 	hasStep := false
 	hasStepComplete := false
@@ -812,6 +913,21 @@ func (o *orchestrator) determineMode(ticketID int) string {
 				newestMarker = "phase:plan-created"
 			}
 		}
+		if strings.Contains(c, "[analysis:onestep-proceed]") {
+			hasAnalysisOneStepProceed = true
+			if newestMarker == "" {
+				newestMarker = "analysis:onestep-proceed"
+			}
+		}
+		if strings.Contains(c, "[analysis:onestep-rejected]") {
+			hasAnalysisOneStepRejected = true
+			if newestMarker == "" {
+				newestMarker = "analysis:onestep-rejected"
+			}
+		}
+		// [analysis:proceed] is a proper substring check that must not
+		// match the onestep variants (both contain "analysis:" but not
+		// literal "analysis:proceed]" / "analysis:need-info]").
 		if strings.Contains(c, "[analysis:proceed]") {
 			hasAnalysisProceed = true
 			if newestMarker == "" {
@@ -830,11 +946,12 @@ func (o *orchestrator) determineMode(ticketID int) string {
 	//
 	// 1. If steps were ever started, the plan was already merged — ignore
 	//    stale [phase:plan-created] markers from duplicate agent runs.
-	// 2. If [step:complete] exists, all implementation is done.
+	// 2. If [step:complete] exists, all implementation is done (covers both
+	//    multi-step finish and onestep finish).
 	// 3. The newest marker determines the current waiting state.
 
 	if hasStepComplete {
-		return "" // all done
+		return "" // all done (multi-step or onestep)
 	}
 	if hasStep {
 		// Steps are in progress.  The newest marker tells us what to wait for.
@@ -851,6 +968,18 @@ func (o *orchestrator) determineMode(ticketID int) string {
 		}
 		// Plan created, no steps yet — waiting for plan PR merge.
 		return ""
+	}
+	// Onestep path: analysis agreed with the one-step tag and a onestep
+	// agent should run (or has run and is waiting on a PR — fix:applied on
+	// a onestep PR still means "waiting for re-review").
+	if hasAnalysisOneStepProceed {
+		if newestMarker == "fix:applied" {
+			return "" // fix pushed for onestep PR, waiting for re-review
+		}
+		return "onestep"
+	}
+	if hasAnalysisOneStepRejected {
+		return "" // analysis rejected one-step — ticket is with the human
 	}
 	if hasAnalysisProceed {
 		return "plan"
@@ -898,9 +1027,22 @@ func (o *orchestrator) handleAnalysisCompletion(ctx context.Context, ticketID in
 
 	// Search from newest to oldest for the analysis marker.
 	// Taiga history API returns newest-first (index 0 = newest).
+	//
+	// Check order: onestep variants first, because they are the more
+	// specific markers and can coexist with a later [analysis:proceed]
+	// from a re-analysis round — we want the onestep decision to win
+	// when it's newer.
 	analysisResult := ""
 	for i := 0; i < len(comments); i++ {
 		c := comments[i]
+		if strings.Contains(c.Comment, "[analysis:onestep-proceed]") {
+			analysisResult = "onestep-proceed"
+			break
+		}
+		if strings.Contains(c.Comment, "[analysis:onestep-rejected]") {
+			analysisResult = "onestep-rejected"
+			break
+		}
 		if strings.Contains(c.Comment, "[analysis:proceed]") {
 			analysisResult = "proceed"
 			break
@@ -914,23 +1056,20 @@ func (o *orchestrator) handleAnalysisCompletion(ctx context.Context, ticketID in
 	switch analysisResult {
 	case "proceed":
 		log.Printf("Ticket #%d: analysis result = proceed, moving to in-progress and spawning plan agent", ticketID)
-
-		// Transition ticket to "in-progress"
-		story, err := o.taigaClient.GetUserStory(ticketID)
-		if err != nil {
-			log.Printf("WARNING: could not fetch ticket %d: %v", ticketID, err)
-		} else {
-			_, err = o.taigaClient.UpdateUserStory(ticketID, &taiga.UserStoryUpdate{
-				Status:  &o.inProgressID,
-				Version: story.Version,
-			})
-			if err != nil {
-				log.Printf("WARNING: could not update ticket %d to in-progress: %v", ticketID, err)
-			}
-		}
-
-		// Spawn the plan agent
+		o.transitionToInProgress(ticketID)
 		o.respawnAgent(ticketID, "plan")
+
+	case "onestep-proceed":
+		log.Printf("Ticket #%d: analysis result = onestep-proceed, moving to in-progress and spawning onestep agent", ticketID)
+		o.transitionToInProgress(ticketID)
+		o.respawnAgent(ticketID, "onestep")
+
+	case "onestep-rejected":
+		log.Printf("Ticket #%d: analysis result = onestep-rejected, ticket assigned to human for reevaluation", ticketID)
+		// The analysis agent already assigned the ticket to the human and
+		// posted the rejection comment.  Clear the internal assignment so
+		// the orchestrator picks it up again when the human unassigns.
+		o.assignEngine.CompleteTicket(ticketID)
 
 	case "need-info":
 		log.Printf("Ticket #%d: analysis result = need-info, ticket assigned to human", ticketID)
@@ -945,6 +1084,24 @@ func (o *orchestrator) handleAnalysisCompletion(ctx context.Context, ticketID in
 	}
 
 	o.saveState(ctx)
+}
+
+// transitionToInProgress moves a ticket to the "in progress" Taiga status.
+// Extracted so both the proceed and onestep-proceed analysis outcomes share
+// the same status transition without duplicating fetch-and-patch plumbing.
+func (o *orchestrator) transitionToInProgress(ticketID int) {
+	story, err := o.taigaClient.GetUserStory(ticketID)
+	if err != nil {
+		log.Printf("WARNING: could not fetch ticket %d: %v", ticketID, err)
+		return
+	}
+	_, err = o.taigaClient.UpdateUserStory(ticketID, &taiga.UserStoryUpdate{
+		Status:  &o.inProgressID,
+		Version: story.Version,
+	})
+	if err != nil {
+		log.Printf("WARNING: could not update ticket %d to in-progress: %v", ticketID, err)
+	}
 }
 
 // isAssignedToHuman checks whether the ticket is currently assigned to the human user.
@@ -1184,38 +1341,32 @@ type prNeedingFix struct {
 // findPRNeedingFix checks Gitea for open PRs associated with a ticket that
 // have non-stale REQUEST_CHANGES reviews.  Returns the first such PR, or nil.
 // This catches review events the orchestrator missed (e.g. during a restart).
+//
+// PRs are discovered via ListPullRequestsForTicket (branch-prefix scan on the
+// ticket's canonical repo), not via the in-memory prMappings — Gitea is the
+// single source of truth and survives orchestrator restarts without any
+// persisted state.
 func (o *orchestrator) findPRNeedingFix(ticketID int) *prNeedingFix {
-	for key, tid := range o.prMappings {
-		if tid != ticketID {
+	owner, name := o.findRepoForTicket(ticketID)
+	if owner == "" || name == "" {
+		return nil
+	}
+	prs, err := o.giteaClient.ListPullRequestsForTicket(owner, name, ticketID)
+	if err != nil {
+		log.Printf("WARNING: findPRNeedingFix: listing PRs for ticket %d: %v", ticketID, err)
+		return nil
+	}
+	for _, pr := range prs {
+		if pr.State != "open" {
 			continue
 		}
-		// key format: "owner/repo#number"
-		hashIdx := strings.LastIndex(key, "#")
-		if hashIdx < 0 {
-			continue
-		}
-		repo := key[:hashIdx]
-		prNum, err := strconv.Atoi(key[hashIdx+1:])
-		if err != nil {
-			continue
-		}
-		parts := strings.SplitN(repo, "/", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		pr, err := o.giteaClient.GetPullRequest(parts[0], parts[1], prNum)
-		if err != nil || pr.State != "open" {
-			continue
-		}
-
-		reviews, err := o.giteaClient.GetPRReviews(parts[0], parts[1], prNum)
+		reviews, err := o.giteaClient.GetPRReviews(owner, name, pr.Number)
 		if err != nil {
 			continue
 		}
 		for _, r := range reviews {
 			if r.State == "REQUEST_CHANGES" && !r.Stale {
-				return &prNeedingFix{repo: repo, number: prNum}
+				return &prNeedingFix{repo: owner + "/" + name, number: pr.Number}
 			}
 		}
 	}
@@ -1226,32 +1377,25 @@ func (o *orchestrator) findPRNeedingFix(ticketID int) *prNeedingFix {
 // and returns the next agent mode that should be spawned.  This recovers from
 // events the orchestrator missed (e.g. a plan PR merged while the orchestrator
 // was down).  Returns "" if no follow-up is needed.
+//
+// As with findPRNeedingFix, PRs are discovered via branch-prefix scan on the
+// ticket's canonical repo, not via prMappings.
 func (o *orchestrator) determineModeFromPRState(ticketID int) string {
+	owner, name := o.findRepoForTicket(ticketID)
+	if owner == "" || name == "" {
+		return ""
+	}
+	prs, err := o.giteaClient.ListPullRequestsForTicket(owner, name, ticketID)
+	if err != nil {
+		log.Printf("WARNING: determineModeFromPRState: listing PRs for ticket %d: %v", ticketID, err)
+		return ""
+	}
+
 	hasMergedPlanPR := false
 	hasMergedStepPR := false
 	hasOpenPR := false
 
-	for key, tid := range o.prMappings {
-		if tid != ticketID {
-			continue
-		}
-		hashIdx := strings.LastIndex(key, "#")
-		if hashIdx < 0 {
-			continue
-		}
-		repo := key[:hashIdx]
-		prNum, err := strconv.Atoi(key[hashIdx+1:])
-		if err != nil {
-			continue
-		}
-		parts := strings.SplitN(repo, "/", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		pr, err := o.giteaClient.GetPullRequest(parts[0], parts[1], prNum)
-		if err != nil {
-			continue
-		}
+	for _, pr := range prs {
 		if pr.State == "open" {
 			hasOpenPR = true
 			continue
@@ -1259,7 +1403,6 @@ func (o *orchestrator) determineModeFromPRState(ticketID int) string {
 		if !pr.Merged {
 			continue
 		}
-		// Classify the merged PR by its title or target branch.
 		if strings.Contains(pr.Title, "Implementation Plan") || strings.Contains(pr.Title, "implementation plan") {
 			hasMergedPlanPR = true
 		} else {
@@ -1717,6 +1860,148 @@ func (o *orchestrator) reconcileLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// runReconcilerLoop runs the stateless reconciler on the same interval
+// as the legacy loop. In shadow mode it only logs, so it is safe to
+// run alongside the legacy loop. In authoritative mode the legacy loop
+// is disabled and this loop is the single spawn path.
+func (o *orchestrator) runReconcilerLoop(ctx context.Context, r *reconciler.Reconciler) {
+	ticker := time.NewTicker(ReconcileInterval)
+	defer ticker.Stop()
+
+	// Immediate first pass so operators see reconciler output without
+	// having to wait 30s after startup.
+	if err := r.ReconcileAll(ctx); err != nil {
+		log.Printf("Reconciler error (initial pass): %v", err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := r.ReconcileAll(ctx); err != nil {
+				log.Printf("Reconciler error: %v", err)
+			}
+		}
+	}
+}
+
+// orchSpawner adapts the orchestrator's internal spawn helpers to the
+// reconciler.Spawner interface. The reconciler decides WHICH mode to
+// spawn; the adapter handles agent identity selection, Taiga
+// assignment, Gitea collaborator grants for fix mode, and Job creation.
+type orchSpawner struct {
+	o *orchestrator
+}
+
+// Spawn routes a reconciler decision to the orchestrator's spawn path.
+// Implements reconciler.Spawner.
+func (s *orchSpawner) Spawn(ctx context.Context, ticketID int, d reconciler.Decision, busy map[string]bool) error {
+	return s.o.spawnForReconciler(ctx, ticketID, d, busy)
+}
+
+// spawnForReconciler is the authoritative spawn path invoked by the
+// stateless reconciler. Mirrors spawnAgentForTicket/spawnFixAgent but
+// takes the K8s-derived busy-agent set as a parameter rather than
+// reading it from the legacy in-memory engine state.
+func (o *orchestrator) spawnForReconciler(ctx context.Context, ticketID int, d reconciler.Decision, busy map[string]bool) error {
+	if o.ticketAssignedToHuman(ticketID) {
+		log.Printf("Ticket #%d: assigned to human, skipping %s spawn", ticketID, d.Mode)
+		return nil
+	}
+
+	// When the ticket is still in "ready" but we are spawning a
+	// non-analysis mode, the analysis phase has already produced a
+	// verdict (e.g. [analysis:proceed]) — move the ticket to
+	// "in-progress" so Taiga UI reflects active work. Mirrors the
+	// transition the legacy handleAnalysisCompletion does.
+	if d.Mode != reconciler.ModeAnalysis {
+		if story, err := o.taigaClient.GetUserStory(ticketID); err == nil && story.Status == o.readyStatusID {
+			o.transitionToInProgress(ticketID)
+		}
+	}
+
+	agent, err := o.pickAgentForTicketWithBusy(ticketID, busy)
+	if err != nil {
+		return fmt.Errorf("picking agent: %w", err)
+	}
+
+	// The legacy engine map and saved state are still populated for
+	// other code paths that read them (removed in step 6). Nothing
+	// authoritative depends on this write any more.
+	o.assignEngine.AssignAgent(ticketID, agent.ID)
+	o.assignTicketInTaiga(ticketID, agent.TaigaUserID)
+
+	spec := &lifecycle.AgentJobSpec{
+		AgentID:        agent.ID,
+		Specialization: agent.Specialization,
+		TicketID:       ticketID,
+		Mode:           d.Mode,
+		GiteaUsername:  agent.ID,
+		GiteaPassword:  agent.Password,
+		TaigaUsername:  agent.ID,
+		TaigaPassword:  agent.Password,
+		HumanUsername:  o.cfg.Taiga.HumanUsername,
+		HumanTaigaID:   o.humanTaigaID,
+		TaigaProjectID: o.projectID,
+	}
+
+	if d.Mode == reconciler.ModeFix && d.Fix != nil {
+		spec.PRNumber = d.Fix.Number
+		spec.PRRepo = d.Fix.Owner + "/" + d.Fix.Repo
+		spec.RepoOwner = d.Fix.Owner
+		spec.RepoName = d.Fix.Repo
+		// Grant write access so the fix branch can be pushed when the
+		// fix agent is not the repo owner.
+		if d.Fix.Owner != agent.ID {
+			if err := o.giteaClient.AddCollaborator(d.Fix.Owner, d.Fix.Repo, agent.ID, "write"); err != nil {
+				log.Printf("WARNING: ticket #%d: could not grant fix agent %s write access to %s/%s: %v",
+					ticketID, agent.ID, d.Fix.Owner, d.Fix.Repo, err)
+			}
+		}
+	} else {
+		o.pinRepoToTicket(ticketID, agent.ID, spec)
+	}
+
+	jobName, err := o.lifecycleMgr.CreateJob(ctx, spec)
+	if err != nil {
+		return fmt.Errorf("creating job: %w", err)
+	}
+	log.Printf("Ticket #%d: %s agent %s spawned (job: %s)", ticketID, d.Mode, agent.ID, jobName)
+	o.saveState(ctx)
+	return nil
+}
+
+// pickAgentForTicketWithBusy is the explicit-busy-set variant of
+// pickAgentForTicket. The reconciler passes a K8s-derived busy-agents
+// map so no in-memory engine state is read on the authoritative path.
+func (o *orchestrator) pickAgentForTicketWithBusy(ticketID int, busy map[string]bool) (*identity.AgentIdentity, error) {
+	if prev := o.findLastAgentForTicket(ticketID); prev != "" {
+		if a := o.identityMgr.GetAgent(prev); a != nil {
+			if !busy[prev] {
+				log.Printf("Ticket #%d: continuing with previous agent %s", ticketID, prev)
+				return a, nil
+			}
+			log.Printf("Ticket #%d: previous agent %s is busy; picking a fresh one", ticketID, prev)
+		}
+	}
+	return o.identityMgr.GetOrCreateAgent("general", busy)
+}
+
+// nudgeReconciler runs ReconcileTicket in a goroutine so the webhook
+// can return quickly. The reconciler itself is safe for concurrent
+// calls — see reconciler.Reconciler.
+func (o *orchestrator) nudgeReconciler(ticketID int) {
+	if o.reconcilerSvc == nil {
+		return
+	}
+	go func() {
+		if err := o.reconcilerSvc.ReconcileTicket(context.Background(), ticketID); err != nil {
+			log.Printf("ERROR: reconciler nudge for ticket %d failed: %v", ticketID, err)
+		}
+	}()
 }
 
 // registerTaigaWebhook registers the orchestrator's webhook endpoint with Taiga.

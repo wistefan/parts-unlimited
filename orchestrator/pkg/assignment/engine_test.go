@@ -111,6 +111,69 @@ func TestAssignAgent(t *testing.T) {
 	}
 }
 
+// TestAssignAgent_HandoffDoesNotLeakBusySlot verifies that re-assigning a
+// ticket to a different agent (e.g. analysis → onestep handoff) releases
+// the previous primary from the busy pool. Historical bug: the previous
+// agent's entry lingered in busyAgents forever, eventually pinning max
+// concurrency and blocking all further dequeues while no Jobs ran.
+func TestAssignAgent_HandoffDoesNotLeakBusySlot(t *testing.T) {
+	e := NewEngine(3, 2)
+
+	e.AssignAgent(42, "general-agent-1") // analysis
+	e.AssignAgent(42, "general-agent-2") // onestep handoff
+
+	busy := e.GetBusyAgents()
+	if busy["general-agent-1"] {
+		t.Error("general-agent-1 should have been released after handoff, but is still marked busy")
+	}
+	if !busy["general-agent-2"] {
+		t.Error("general-agent-2 should be busy after handoff")
+	}
+	if len(busy) != 1 {
+		t.Errorf("expected exactly 1 busy agent after handoff, got %d: %v", len(busy), busy)
+	}
+}
+
+// TestAssignAgent_ReassignSameAgentIdempotent verifies that re-assigning
+// the same agent to the same ticket (e.g. a fix after WaitForPR that
+// reuses the original agent) does not remove them from the busy pool.
+func TestAssignAgent_ReassignSameAgentIdempotent(t *testing.T) {
+	e := NewEngine(3, 2)
+
+	e.AssignAgent(42, "general-agent-1")
+	e.AssignAgent(42, "general-agent-1") // reassign same agent
+
+	busy := e.GetBusyAgents()
+	if !busy["general-agent-1"] {
+		t.Error("general-agent-1 should remain busy after self-reassignment")
+	}
+	if len(busy) != 1 {
+		t.Errorf("expected 1 busy agent, got %d: %v", len(busy), busy)
+	}
+}
+
+// TestAssignAgent_HandoffReleasesDelegatedAgents verifies that a primary-
+// agent handoff also releases any in-flight delegations. Without this,
+// delegated agents would leak the same way the previous primary did.
+func TestAssignAgent_HandoffReleasesDelegatedAgents(t *testing.T) {
+	e := NewEngine(5, 2)
+
+	e.AssignAgent(42, "general-agent-1")
+	e.RecordDelegation(42, "frontend-agent-1")
+	e.AssignAgent(42, "general-agent-2") // handoff — releases g1 and frontend
+
+	busy := e.GetBusyAgents()
+	if busy["general-agent-1"] {
+		t.Error("general-agent-1 should have been released on handoff")
+	}
+	if busy["frontend-agent-1"] {
+		t.Error("frontend-agent-1 (delegated) should have been released on handoff")
+	}
+	if !busy["general-agent-2"] {
+		t.Error("general-agent-2 should be busy")
+	}
+}
+
 func TestDelegation(t *testing.T) {
 	e := NewEngine(5, 2)
 

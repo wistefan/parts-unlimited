@@ -6,6 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Parts Unlimited (dev-env) is a locally-hosted, Kubernetes-based platform that orchestrates Claude AI agents to autonomously perform software development work. Work is driven by Taiga project management tickets. All components run on a single machine using k3s.
 
+## Hard Rules
+
+### No orchestrator-side state persistence
+
+**Taiga and Gitea are the only sources of truth.** The orchestrator must not persist state (assignments, queue entries, PR mappings, escalation counters, etc.) to a Kubernetes ConfigMap, a local file, an in-memory cache that survives restarts, or any other store. Every decision — "is this ticket assigned?", "what mode should run next?", "which PR belongs to which ticket?" — must be derived on demand from Taiga (statuses, assignees, tags, comments) and Gitea (PRs, reviews, branches).
+
+Why: dual-write bugs. The current ConfigMap-backed state (`pkg/state`, the `state` field in `main.go`) drifts out of sync with Taiga/Gitea, leaving tickets that look "assigned" internally but have no running Job, no open PR, and no human owner — silently stuck forever. Deriving state fresh from the external systems eliminates the class of bug entirely.
+
+How to apply: when adding a feature, do not introduce a new field on the persisted state struct. Refactor existing code toward removing `pkg/state` and the in-memory `assignments` / `queue` / `prMappings` / `escalations` maps; replace reads with Taiga/Gitea API calls (cache within a single reconcile pass if needed, but never across passes).
+
 ## Build & Test Commands
 
 ### Orchestrator (Go)
@@ -49,7 +59,7 @@ kubectl logs -n agents <pod-name>                       # Agent worker logs
 
 Three main components communicate via REST APIs and Kubernetes Jobs:
 
-1. **Orchestrator** (`orchestrator/`) -- Go service that receives Taiga webhooks, manages a FIFO ticket queue, spawns agent worker Jobs in Kubernetes, runs automated PR reviews, and persists state to a ConfigMap.
+1. **Orchestrator** (`orchestrator/`) -- Go service that receives Taiga webhooks, manages a FIFO ticket queue, spawns agent worker Jobs in Kubernetes, and runs automated PR reviews. (Legacy: the current code also persists state to a ConfigMap via `pkg/state`; see the Hard Rules section — this is to be removed.)
 
 2. **Agent Workers** (`agent/`) -- Ephemeral containers running Claude Code CLI. Each is spawned per-ticket in one of four modes: `analysis` (evaluate ticket), `plan` (create implementation plan + CLAUDE.md), `step` (implement one plan step), `fix` (address PR review comments). The `bootstrap.sh` script orchestrates the full lifecycle.
 
@@ -64,7 +74,7 @@ The entry point is `cmd/orchestrator/main.go` (~1600 lines) which wires everythi
 | `pkg/assignment` | FIFO ticket queue, tag-based delegation (`delegate:`/`active:` tags), concurrency control |
 | `pkg/lifecycle` | K8s Job CRUD with security contexts, timeouts, retries |
 | `pkg/identity` | On-demand agent identity creation in Gitea + Taiga |
-| `pkg/state` | ConfigMap-backed persistence with optimistic locking |
+| `pkg/state` | Legacy ConfigMap-backed persistence — slated for removal; do not extend |
 | `pkg/taiga` | Taiga REST API client (stories, comments, tags, statuses) |
 | `pkg/gitea` | Gitea REST API client (repos, PRs, reviews, branches) |
 | `pkg/webhooks` | Taiga webhook receiver with HMAC verification and event routing |

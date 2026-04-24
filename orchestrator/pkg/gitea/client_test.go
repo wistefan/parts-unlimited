@@ -153,6 +153,36 @@ func TestListPullRequests(t *testing.T) {
 	}
 }
 
+func TestListPullRequestsForTicket(t *testing.T) {
+	_, client := setupTestServer(t, map[string]http.HandlerFunc{
+		"/api/v1/repos/owner/repo/pulls": func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("state") != "all" {
+				t.Errorf("expected state=all, got %s", r.URL.Query().Get("state"))
+			}
+			json.NewEncoder(w).Encode([]PullRequest{
+				{Number: 1, Title: "plan", Head: PRRef{Ref: "ticket-10/plan"}},
+				{Number: 2, Title: "step 1", Head: PRRef{Ref: "ticket-10/step-1"}},
+				{Number: 3, Title: "unrelated", Head: PRRef{Ref: "feature/x"}},
+				{Number: 4, Title: "different ticket", Head: PRRef{Ref: "ticket-11/plan"}},
+				{Number: 5, Title: "prefix lookalike", Head: PRRef{Ref: "ticket-100/plan"}},
+				{Number: 6, Title: "bare name", Head: PRRef{Ref: "ticket-10"}},
+			})
+		},
+	})
+
+	prs, err := client.ListPullRequestsForTicket("owner", "repo", 10)
+	if err != nil {
+		t.Fatalf("ListPullRequestsForTicket: %v", err)
+	}
+	if len(prs) != 2 {
+		t.Fatalf("expected 2 PRs for ticket 10, got %d: %+v", len(prs), prs)
+	}
+	gotNumbers := map[int]bool{prs[0].Number: true, prs[1].Number: true}
+	if !gotNumbers[1] || !gotNumbers[2] {
+		t.Errorf("expected PRs #1 and #2, got %v", gotNumbers)
+	}
+}
+
 func TestCreateUser(t *testing.T) {
 	_, client := setupTestServer(t, map[string]http.HandlerFunc{
 		"/api/v1/admin/users": func(w http.ResponseWriter, r *http.Request) {

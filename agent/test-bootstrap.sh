@@ -76,7 +76,18 @@ extract_repo_ref() {
     local raw
     raw=$(echo "${desc}" | grep -oP '(?i)(?:repo|gitea)\s*:\s*\K.*' | head -1 || true)
     [ -z "${raw}" ] && return
-    raw=$(echo "${raw}" | sed -E 's/^\s+//;s/\s+$//')
+    raw=$(printf '%s' "${raw}" | python3 -c '
+import sys, unicodedata
+s = sys.stdin.read()
+def strippable(c):
+    return c.isspace() or unicodedata.category(c) == "Cf"
+i, j = 0, len(s)
+while i < j and strippable(s[i]):
+    i += 1
+while j > i and strippable(s[j - 1]):
+    j -= 1
+sys.stdout.write(s[i:j])
+')
     if echo "${raw}" | grep -qP '^\[.*\]\(.*\)'; then
         raw=$(echo "${raw}" | sed -E 's/^\[([^]]*)\]\(([^)]*)\).*/\2/')
     fi
@@ -115,6 +126,21 @@ assert_eq "repo: case insensitive" "claude/my-project" "${RESULT}"
 
 RESULT=$(extract_repo_ref "repo: owner/name # this is a comment")
 assert_eq "repo: value with trailing comment" "owner/name" "${RESULT}"
+
+# Invisible unicode codepoints (rich-text paste) — these arrive via Taiga's
+# WYSIWYG editor and used to break the URL detection, routing REPO_REF to
+# the owner/name branch which mangled it into REPO_OWNER=" https:" etc.
+NBSP=$(printf '\xc2\xa0')
+ZWSP=$(printf '\xe2\x80\x8b')
+BOM=$(printf '\xef\xbb\xbf')
+RESULT=$(extract_repo_ref "repo:${NBSP}https://github.com/org/repo")
+assert_eq "repo: URL with leading NBSP" "https://github.com/org/repo" "${RESULT}"
+RESULT=$(extract_repo_ref "repo:${ZWSP}https://github.com/org/repo")
+assert_eq "repo: URL with leading ZWSP" "https://github.com/org/repo" "${RESULT}"
+RESULT=$(extract_repo_ref "repo:${BOM}https://github.com/org/repo")
+assert_eq "repo: URL with leading BOM" "https://github.com/org/repo" "${RESULT}"
+RESULT=$(extract_repo_ref "repo: https://github.com/org/repo${ZWSP}")
+assert_eq "repo: URL with trailing ZWSP" "https://github.com/org/repo" "${RESULT}"
 
 # Test that URL is detected as remote (not split into owner/name)
 RESULT=$(extract_repo_ref "repo: https://github.com/FIWARE/data-space-connector")
@@ -216,6 +242,96 @@ assert_contains "PR body has ticket link" "#42: Fix login bug" "${PR_BODY}"
 assert_contains "PR body has plan step" "Step 2" "${PR_BODY}"
 assert_contains "PR body has summary" "Fixed the authentication flow" "${PR_BODY}"
 assert_contains "PR body has Taiga URL" "localhost:9000" "${PR_BODY}"
+
+echo ""
+
+# --- Test: implementation-plan slicing ---
+echo "Plan slicing:"
+
+# Mirrors the python3 invocation in bootstrap.sh that trims the plan down to
+# the current step before embedding it in a step-mode task prompt.
+slice_plan_for_step() {
+    local step="$1"
+    local plan="$2"
+    PLAN_STEP_NUM="${step}" python3 -c '
+import os, re, sys
+raw = sys.stdin.read()
+step = os.environ["PLAN_STEP_NUM"]
+parts = re.split(r"(?m)^(### Step \d+[^\n]*)$", raw)
+out = [parts[0].rstrip() + "\n"] if parts and parts[0].strip() else []
+found = False
+for i in range(1, len(parts), 2):
+    heading = parts[i]
+    body = parts[i + 1] if i + 1 < len(parts) else ""
+    m = re.match(r"### Step (\d+)", heading)
+    if m and m.group(1) == step:
+        out.append(heading + body.rstrip() + "\n")
+        found = True
+        break
+if not found:
+    sys.stdout.write(raw)
+else:
+    sys.stdout.write("".join(out))
+    sys.stdout.write(
+        "\n_Note: only step " + step + " is shown; "
+        "read IMPLEMENTATION_PLAN.md in the workspace root for prior/later "
+        "steps if needed._\n"
+    )
+' <<< "${plan}"
+}
+
+PLAN='# Implementation Plan: Test
+
+## Overview
+Some overview.
+
+## Steps
+
+### Step 1: First
+First body.
+
+### Step 2: Second
+Second body line 1.
+Second body line 2.
+
+### Step 3: Third
+Third body.'
+
+SLICED=$(slice_plan_for_step "2" "${PLAN}")
+assert_contains "slice step 2 keeps preamble" "Some overview" "${SLICED}"
+assert_contains "slice step 2 keeps step 2 heading" "### Step 2: Second" "${SLICED}"
+assert_contains "slice step 2 keeps step 2 body" "Second body line 2" "${SLICED}"
+if echo "${SLICED}" | grep -q "### Step 1:"; then
+    echo "  [FAIL] slice step 2 excludes step 1 heading"
+    FAIL=$((FAIL + 1))
+else
+    echo "  [PASS] slice step 2 excludes step 1 heading"
+    PASS=$((PASS + 1))
+fi
+if echo "${SLICED}" | grep -q "### Step 3:"; then
+    echo "  [FAIL] slice step 2 excludes step 3 heading"
+    FAIL=$((FAIL + 1))
+else
+    echo "  [PASS] slice step 2 excludes step 3 heading"
+    PASS=$((PASS + 1))
+fi
+assert_contains "slice step 2 has note" "only step 2 is shown" "${SLICED}"
+
+SLICED=$(slice_plan_for_step "1" "${PLAN}")
+assert_contains "slice step 1 keeps step 1 body" "First body" "${SLICED}"
+if echo "${SLICED}" | grep -q "### Step 2:"; then
+    echo "  [FAIL] slice step 1 excludes step 2 heading"
+    FAIL=$((FAIL + 1))
+else
+    echo "  [PASS] slice step 1 excludes step 2 heading"
+    PASS=$((PASS + 1))
+fi
+
+# Unknown step number falls back to the full plan rather than emitting
+# an empty prompt section.
+SLICED=$(slice_plan_for_step "99" "${PLAN}")
+assert_contains "slice unknown step falls back to full plan" "### Step 1: First" "${SLICED}"
+assert_contains "slice unknown step has step 3" "### Step 3: Third" "${SLICED}"
 
 echo ""
 

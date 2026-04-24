@@ -233,8 +233,26 @@ extract_repo_ref() {
     raw=$(echo "${desc}" | grep -oP '(?i)(?:repo|gitea)\s*:\s*\K.*' | head -1 || true)
     [ -z "${raw}" ] && return
 
-    # Strip leading/trailing whitespace
-    raw=$(echo "${raw}" | sed -E 's/^\s+//;s/\s+$//')
+    # Strip leading/trailing whitespace AND invisible unicode codepoints
+    # that sed `\s` does NOT handle but can easily arrive via rich-text
+    # copy-paste into Taiga: U+00A0 NBSP, U+200B-U+200F (zero-width family),
+    # U+FEFF BOM. Leaving these intact makes later anchors like `^https?://`
+    # silently fail and the code routes to the owner/name branch with
+    # garbled output (observed: REPO_OWNER=" https:" / REPO_NAME="").
+    raw=$(printf '%s' "${raw}" | python3 -c '
+import sys, unicodedata
+s = sys.stdin.read()
+def strippable(c):
+    # Stdlib whitespace PLUS the Cf (format) unicode category, which is
+    # where the zero-width / bidi-control / BOM codepoints live.
+    return c.isspace() or unicodedata.category(c) == "Cf"
+i, j = 0, len(s)
+while i < j and strippable(s[i]):
+    i += 1
+while j > i and strippable(s[j - 1]):
+    j -= 1
+sys.stdout.write(s[i:j])
+')
 
     # Strip markdown link syntax: [text](url) → url
     if echo "${raw}" | grep -qP '^\[.*\]\(.*\)'; then
@@ -431,6 +449,13 @@ case "${MODE}" in
     plan)
         BRANCH_NAME="${BRANCH_PREFIX}/plan"
         ;;
+    onestep)
+        # One-step tickets ship as a single PR against the work branch.
+        # A dedicated `onestep` sub-branch keeps the naming distinct from
+        # the step-N series (there is no step numbering here) and avoids
+        # any confusion with chained step agents.
+        BRANCH_NAME="${BRANCH_PREFIX}/onestep"
+        ;;
     fix)
         # Fix mode: check out the existing PR branch (bootstrap determines it later
         # from the PR data).  Set a placeholder — overridden after PR fetch.
@@ -494,6 +519,48 @@ for plan_file in IMPLEMENTATION_PLAN.md implementation_plan.md PLAN.md plan.md; 
     fi
 done
 
+# For step mode, embed ONLY the current step (plus the plan preamble) in
+# the task prompt. The full plan lives in IMPLEMENTATION_PLAN.md in the
+# workspace, which the agent can Read on demand — there is no reason to pay
+# ~N × (other_steps_tokens) cache reads across every turn of session 1.
+#
+# Format contract: the plan uses `### Step N: Title` headings (see
+# system-prompt-step.md). Preamble = everything before the first such
+# heading; per-step bodies run from their heading until the next `### Step`
+# heading or EOF.
+if [ "${MODE}" = "step" ] && [ -n "${PLAN_STEP}" ] && [ -n "${PLAN_CONTENT}" ]; then
+    PLAN_CONTENT=$(PLAN_STEP_NUM="${PLAN_STEP}" python3 -c '
+import os, re, sys
+raw = sys.stdin.read()
+step = os.environ["PLAN_STEP_NUM"]
+# Split keeping the step headings as delimiters. With a capturing group,
+# re.split yields: [preamble, heading1, body1, heading2, body2, ...].
+parts = re.split(r"(?m)^(### Step \d+[^\n]*)$", raw)
+out = [parts[0].rstrip() + "\n"] if parts and parts[0].strip() else []
+found = False
+for i in range(1, len(parts), 2):
+    heading = parts[i]
+    body = parts[i + 1] if i + 1 < len(parts) else ""
+    m = re.match(r"### Step (\d+)", heading)
+    if m and m.group(1) == step:
+        out.append(heading + body.rstrip() + "\n")
+        found = True
+        break
+if not found:
+    # Fall back to full plan if the step heading is missing — better than
+    # feeding the agent an empty plan section.
+    sys.stdout.write(raw)
+else:
+    sys.stdout.write("".join(out))
+    sys.stdout.write(
+        "\n_Note: only step " + step + " is shown; "
+        "read IMPLEMENTATION_PLAN.md in the workspace root for prior/later "
+        "steps if needed._\n"
+    )
+' <<< "${PLAN_CONTENT}")
+    echo "  Sliced plan to step ${PLAN_STEP} only ($(printf '%s' "${PLAN_CONTENT}" | wc -c) bytes)"
+fi
+
 # --- Build task prompt ---
 
 echo "Building task prompt..."
@@ -539,6 +606,34 @@ When done, write /home/agent/completion-status.json:
   \"status\": \"success\",
   \"summary\": \"Implementation plan created with N steps.\",
   \"taiga_comment\": \"[phase:plan-created]\\n\\n**Steps:** N\\n**Summary:** <one-line summary>\"
+}
+\`\`\`"
+        ;;
+    onestep)
+        MODE_INSTRUCTIONS="You are a one-step implementation agent. The ticket is tagged \`one-step\` and the analysis agent agreed it fits in a single PR.
+
+Implement the full ticket on the \`${BRANCH_PREFIX}/onestep\` branch (already checked out). No plan, no step splitting — one focused change.
+
+Run tests and linters before finishing. If you discover the work does NOT fit in one PR, stop and hand back to the human (see completion schema below).
+
+When done, write /home/agent/completion-status.json:
+
+Happy path (ready for review):
+\`\`\`json
+{
+  \"status\": \"success\",
+  \"summary\": \"Implemented one-step ticket: <short title>\",
+  \"taiga_comment\": \"[step:complete]\\n\\nOne-step implementation complete.\\n\\n**Summary:** <what was changed and why>\\n\\n**Release Notes:**\\n<human-readable summary of the changes>\"
+}
+\`\`\`
+
+If the scope turned out too large:
+\`\`\`json
+{
+  \"status\": \"blocked\",
+  \"reason\": \"Scope exceeds one-step contract: <concrete reason>\",
+  \"summary\": \"One-step implementation aborted — scope too large.\",
+  \"taiga_comment\": \"[analysis:onestep-rejected]\\n\\n**Scope exceeded during implementation:**\\n<what you found, which files/subsystems are involved, why it needs splitting>.\\n\\n**Suggestion:** remove the \`one-step\` tag and re-run analysis for a multi-step plan, or split the ticket.\"
 }
 \`\`\`"
         ;;
@@ -589,7 +684,9 @@ esac
 # redundant — and on chained sessions it gets re-ingested uncached every
 # time, costing real tokens on long-running tickets. Omit it in those modes.
 case "${MODE}" in
-    analysis|plan)
+    analysis|plan|onestep)
+        # Onestep has no IMPLEMENTATION_PLAN.md — the ticket description
+        # itself is the spec, so we must keep it in the prompt.
         DESCRIPTION_SECTION="## Ticket Description
 
 ${TICKET_DESCRIPTION}
@@ -611,6 +708,7 @@ cat > "${PROMPT_FILE}" <<PROMPT_EOF
 ## Ticket
 - **ID:** ${TICKET_ID}
 - **Subject:** ${TICKET_SUBJECT}
+- **Tags:** ${TICKET_TAGS:-none}
 $([ -n "${PLAN_STEP}" ] && echo "- **Plan Step:** ${PLAN_STEP}" || true)
 
 ${DESCRIPTION_SECTION}
@@ -632,15 +730,36 @@ PROMPT_EOF
 
 echo "  Prompt written to ${PROMPT_FILE}"
 
-# --- Load system prompt template (mode-specific) ---
+# --- Load system prompt template (base + mode-specific) ---
+#
+# Always load the base system-prompt.md first — it carries cross-mode
+# guidance (subagent delegation, `### Context Summary` format and mandatory
+# emission cadence, code-quality rules). Then append the mode-specific file
+# so the mode's prescriptive rules sit on top.
+#
+# Rationale: with the previous `if/elif` the mode-specific file REPLACED the
+# base, so step/plan/fix agents never received the Context Summary guidance
+# that the chain-sessions design depends on — resulting in the fallback
+# summarizer (a second `claude -p` call) firing on every max-turns hit.
 
 SYSTEM_PROMPT=""
+if [ -f "/home/agent/system-prompt.md" ]; then
+    SYSTEM_PROMPT=$(cat /home/agent/system-prompt.md)
+fi
 SYSTEM_PROMPT_FILE="/home/agent/system-prompt-${MODE}.md"
 if [ -f "${SYSTEM_PROMPT_FILE}" ]; then
-    SYSTEM_PROMPT=$(cat "${SYSTEM_PROMPT_FILE}")
-    echo "  Using mode-specific system prompt: ${SYSTEM_PROMPT_FILE}"
-elif [ -f "/home/agent/system-prompt.md" ]; then
-    SYSTEM_PROMPT=$(cat /home/agent/system-prompt.md)
+    if [ -n "${SYSTEM_PROMPT}" ]; then
+        SYSTEM_PROMPT="${SYSTEM_PROMPT}
+
+# Mode-Specific Instructions: ${MODE}
+
+$(cat "${SYSTEM_PROMPT_FILE}")"
+        echo "  Using base + mode-specific system prompt: ${SYSTEM_PROMPT_FILE}"
+    else
+        SYSTEM_PROMPT=$(cat "${SYSTEM_PROMPT_FILE}")
+        echo "  Using mode-specific system prompt only (no base): ${SYSTEM_PROMPT_FILE}"
+    fi
+elif [ -n "${SYSTEM_PROMPT}" ]; then
     echo "  Using default system prompt"
 fi
 
@@ -673,6 +792,41 @@ if [ -f "${CRED_SECRET}" ]; then
 fi
 mkdir -p /home/agent/.claude/session-env
 
+# --- Install Claude Code hooks ---
+#
+# PreToolUse hook on Bash: pre-executes the command, truncates head+tail
+# if output exceeds ~8 KB, returns the trimmed result in place of the
+# builtin call. Motivation: builtin Bash returns the full stdout/stderr,
+# which lands in the conversation and is cache-read on every subsequent
+# turn. Noisy commands (`go test ./...`, `helm lint`, long logs) were
+# consistently adding 10-50 KB per call × 20+ turns = 200K-1M wasted
+# tokens per step. The hook caps each result at ~4 KB with a truncation
+# marker pointing the agent at narrower filters (grep, head, tail).
+#
+# Configured via `~/.claude/settings.json`. Hook script baked into the
+# image at /home/agent/hooks/bash-truncate.py.
+if [ -f /home/agent/hooks/bash-truncate.py ]; then
+    cat > /home/agent/.claude/settings.json <<'HOOK_EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/agent/hooks/bash-truncate.py",
+            "timeout": 150
+          }
+        ]
+      }
+    ]
+  }
+}
+HOOK_EOF
+    echo "  Installed PreToolUse Bash-truncation hook"
+fi
+
 echo "Invoking Claude Code..."
 
 CLAUDE_ARGS=(
@@ -700,14 +854,23 @@ fi
 #
 # Running one long Claude session accumulates context across all turns.
 # At 200+ turns the cache reads alone can cost $20+.  Session chaining
-# breaks the work into bounded sessions (default: 50 turns each).  After
-# each session the bootstrap extracts a context summary from the last
-# assistant message and feeds it into the NEXT session's prompt, so the
-# agent picks up where it left off with a fresh, compact context.
+# breaks the work into bounded sessions and resets growth, at the cost
+# of a fresh-session re-orientation penalty (agent re-reads edited files
+# for post-edit state, re-runs builds, etc.) that empirically averages
+# ~150–300K tokens per session break.
+#
+# TURNS_PER_SESSION was 20 historically, but measurements showed most
+# step-mode tasks need 50–60 turns — forcing 3 sessions per step and
+# paying the break penalty twice. Raised to 30 so medium tasks fit in
+# 2 sessions (one break); megasessions are still avoided.
+#
+# After each session the bootstrap extracts a context summary from the
+# last assistant message and feeds it into the NEXT session's prompt,
+# so the agent picks up with a fresh, compact context.
 #
 # The task is done when the agent writes completion-status.json.
 
-TURNS_PER_SESSION="${TURNS_PER_SESSION:-20}"
+TURNS_PER_SESSION="${TURNS_PER_SESSION:-30}"
 MAX_SESSIONS="${MAX_SESSIONS:-50}"
 
 # extract_context_summary <result_file>
@@ -749,46 +912,32 @@ for text in reversed(assistant_texts):
 }
 
 # generate_context_summary <session_result_file>
-# Fallback used when the agent did not emit a "### Context Summary" block
-# anywhere in the session (typically because Claude hit --max-turns mid-
-# tool-call). Builds a programmatic digest of the session via
-# summarize-session.py and pipes it to a fresh `claude -p` call that is
-# instructed to output ONLY the summary block, then prints the result on
-# stdout. Returns empty on any failure — callers tolerate that and the
-# next session falls back to the original task prompt.
+# Produce a `### Context Summary` block for the next chained session.
 #
-# Cost: ~1-3K tokens per max-turn cutoff. Worth it because otherwise the
-# next session has no real context and re-explores from scratch.
-SUMMARIZER_SYSTEM_PROMPT='You are summarizing a Claude Code agent session that ran out of turns mid-task. The user message you receive is a turn-by-turn digest of that session.
-
-Output ONLY a Markdown block beginning with "### Context Summary" containing:
-
-- **Done this session:** what was accomplished in this session only (file edits, tests run, decisions made, commits pushed). Do NOT narrate prior-step work — that belongs elsewhere.
-- **State:** the current state of the working directory and any branches/PRs.
-- **Next:** the concrete next action the follow-up session should take so it can resume from this line alone.
-- **Pitfalls:** anything tried that did not work, so the next session avoids it.
-
-Keep the whole block under ~400 words. Do not include any other text, no preamble, no closing remarks.'
-
+# Previously this piped the session digest to a fresh `claude -p` call
+# that paraphrased it. That summarizer burned 30-50K tokens per firing
+# AND produced output inferior to what the tool trace already contains:
+# the real value for the next session is (a) the list of files already
+# read — so it does not re-Read them — and (b) the prior session's
+# last narrative / intent. Both are mechanically extractable from the
+# stream-json without any LLM. The deterministic version lives in
+# summarize-session.py's `--format summary-block` mode.
+#
+# We keep the function name so callers do not change; the semantics are
+# just "build a Context Summary block from the session result, cheaply,
+# no Claude call".
 generate_context_summary() {
     local session_result="$1"
     [ -f "${session_result}" ] || return 0
 
-    local digest
-    digest=$(python3 /home/agent/summarize-session.py "${session_result}" 2>/dev/null) || return 0
-    [ -n "${digest}" ] || return 0
-
-    # 1 turn is enough — the summarizer just transforms the digest.
-    # Strip stream-json wrapper by using `--output-format text`.
     local summary
-    summary=$(printf '%s\n' "${digest}" | claude -p \
-        --max-turns 1 \
-        --system-prompt "${SUMMARIZER_SYSTEM_PROMPT}" \
-        --output-format text 2>/dev/null) || return 0
+    summary=$(python3 /home/agent/summarize-session.py \
+        --format summary-block "${session_result}" 2>/dev/null) || return 0
 
-    # Only return text if it actually looks like a Context Summary block
-    # — otherwise we'd just be polluting the next session's prompt.
-    if printf '%s' "${summary}" | grep -q '### Context Summary'; then
+    # Sanity-check the block starts where callers expect — on malformed
+    # input the extractor returns a stub block; on success it is a real
+    # `### Context Summary` header.
+    if printf '%s' "${summary}" | grep -q '^### Context Summary'; then
         printf '%s' "${summary}"
     fi
 }
@@ -924,6 +1073,94 @@ while [ "${SESSION_NUM}" -lt "${MAX_SESSIONS}" ]; do
     # is a workspace file the agent can Read on demand.
     SESSION_PROMPT_FILE="/home/agent/session-prompt.md"
     if [ -n "${SESSION_CONTEXT}" ]; then
+        # Pre-compute concrete workspace state so the agent has ZERO reason
+        # to re-probe. Observed across multiple step runs: despite explicit
+        # "do not re-orient" directives, the very first tool call of every
+        # chained session was still `git status && git branch`. Claude's
+        # trained orientation habit overrides prose instructions — but if
+        # the actual output is already inline, the probe becomes a no-op
+        # the agent can skip without effort.
+        #
+        # Recomputed fresh on each loop iteration — prior session may have
+        # committed, pushed, or changed files.
+        GIT_CURRENT_BRANCH_FRESH=$(git branch --show-current 2>/dev/null || echo "unknown")
+        GIT_PORCELAIN=$(git status --porcelain 2>/dev/null || true)
+        if [ -z "${GIT_PORCELAIN}" ]; then
+            GIT_TREE_STATE="clean (nothing to commit)"
+        else
+            GIT_TREE_STATE=$'modified/untracked:\n'"${GIT_PORCELAIN}"
+        fi
+        # Prefer commits ahead of the work branch for step/fix mode so the
+        # log shows THIS step's contribution rather than the cumulative
+        # ticket history. Falls back to the base branch when the work
+        # branch is unknown (analysis/plan modes).
+        GIT_LOG_COMPARE_REF=""
+        if [ -n "${WORK_BRANCH:-}" ] && git rev-parse --verify "origin/${WORK_BRANCH}" >/dev/null 2>&1; then
+            GIT_LOG_COMPARE_REF="origin/${WORK_BRANCH}"
+        elif git rev-parse --verify "origin/${BASE_BRANCH}" >/dev/null 2>&1; then
+            GIT_LOG_COMPARE_REF="origin/${BASE_BRANCH}"
+        fi
+        if [ -n "${GIT_LOG_COMPARE_REF}" ]; then
+            GIT_LOG_AHEAD=$(git log --oneline "${GIT_LOG_COMPARE_REF}..HEAD" 2>/dev/null | head -20 || true)
+            [ -z "${GIT_LOG_AHEAD}" ] && GIT_LOG_AHEAD="(no commits ahead of ${GIT_LOG_COMPARE_REF})"
+            GIT_LOG_LABEL="Commits on this branch ahead of \`${GIT_LOG_COMPARE_REF}\`"
+        else
+            GIT_LOG_AHEAD=$(git log --oneline -10 2>/dev/null || true)
+            GIT_LOG_LABEL="Last 10 commits on this branch"
+        fi
+        # Cumulative diff of THIS step's changes (committed + uncommitted)
+        # vs the work branch. Embedding it in the slim prompt eliminates the
+        # biggest chained-session waste pattern: the next session re-Reads
+        # the files the prior session edited, just to see the post-edit
+        # state. Observed real cost: ~800K cache-read tokens per step for
+        # Go-interface work. With the diff inline the agent can Edit
+        # directly without re-reading.
+        #
+        # Caps: 40K chars (~10K tokens) total — generous enough for a
+        # typical step's diff, bounded enough not to dominate the slim
+        # prompt. Falls back to a `--stat` only when the full diff
+        # exceeds the cap, pointing the agent at `git diff <file>` for
+        # specific deep-dives.
+        GIT_DIFF_SECTION=""
+        GIT_DIFF_CAP=40000
+        if [ -n "${GIT_LOG_COMPARE_REF}" ]; then
+            GIT_DIFF_FULL=$(git diff "${GIT_LOG_COMPARE_REF}" 2>/dev/null || true)
+            if [ -n "${GIT_DIFF_FULL}" ]; then
+                if [ "$(printf '%s' "${GIT_DIFF_FULL}" | wc -c)" -le "${GIT_DIFF_CAP}" ]; then
+                    GIT_DIFF_BLOCK="${GIT_DIFF_FULL}"
+                    GIT_DIFF_NOTE="Complete diff of THIS step's work vs \`${GIT_LOG_COMPARE_REF}\` (committed + uncommitted). This IS the post-edit state — do NOT re-Read files to see what the prior session changed."
+                else
+                    # Too big — stat only, agent can ask for specific diffs.
+                    GIT_DIFF_BLOCK=$(git diff --stat "${GIT_LOG_COMPARE_REF}" 2>/dev/null | head -40 || true)
+                    GIT_DIFF_NOTE="Diff summary of THIS step's work vs \`${GIT_LOG_COMPARE_REF}\` (full diff exceeded ${GIT_DIFF_CAP} chars). Use \`git diff ${GIT_LOG_COMPARE_REF} -- <file>\` for a specific file. Do NOT re-Read entire files — use targeted diffs."
+                fi
+                GIT_DIFF_SECTION=$(cat <<DIFF_EOF
+
+## Cumulative Diff of This Step's Work
+
+_${GIT_DIFF_NOTE}_
+
+\`\`\`diff
+${GIT_DIFF_BLOCK}
+\`\`\`
+DIFF_EOF
+)
+            fi
+        fi
+        # Include the current step's plan content when available — session-1
+        # had it inline in PROMPT_FILE, but sessions 2+ previously had to
+        # `Read` IMPLEMENTATION_PLAN.md on every restart.
+        PLAN_SECTION=""
+        if [ -n "${PLAN_CONTENT}" ]; then
+            PLAN_SECTION=$(cat <<PLAN_EOF
+
+## Current Step (from IMPLEMENTATION_PLAN.md, sliced for this step only)
+
+${PLAN_CONTENT}
+PLAN_EOF
+)
+        fi
+
         cat > "${SESSION_PROMPT_FILE}" <<SLIM_EOF
 # Task Continuation
 
@@ -934,22 +1171,76 @@ while [ "${SESSION_NUM}" -lt "${MAX_SESSIONS}" ]; do
 ## Ticket
 - **ID:** ${TICKET_ID}
 - **Subject:** ${TICKET_SUBJECT}
+- **Tags:** ${TICKET_TAGS:-none}
 $([ -n "${PLAN_STEP}" ] && echo "- **Plan Step:** ${PLAN_STEP}" || true)
 
-## Continuing From Previous Session
+## Verified Workspace State (as of this session start)
 
-You are continuing work from a previous chained session. Resume from the
-state below — do not re-read the full ticket description or re-explore the
-codebase from scratch. \`IMPLEMENTATION_PLAN.md\` is in the workspace root
-if you need to re-check the current step.
+These values were captured by the bootstrap RIGHT BEFORE invoking you.
+They are authoritative — do not re-verify.
+
+- **cwd:** \`$(pwd)\` (already the cloned repo)
+- **Current branch:** \`${GIT_CURRENT_BRANCH_FRESH}\` (already checked out)
+- **Working tree:** ${GIT_TREE_STATE}
+- **${GIT_LOG_LABEL}:**
+\`\`\`
+${GIT_LOG_AHEAD}
+\`\`\`
+${PLAN_SECTION}${GIT_DIFF_SECTION}
+
+## Summary From Previous Session
 
 ${SESSION_CONTEXT}
+
+## How To Proceed
+
+Go DIRECTLY to the action described in **Next** above. You already have:
+
+- your branch (checked out)
+- working-tree state (above)
+- the commits you've already made (above)
+- the current step's plan (above, if applicable)
+- the **complete diff** of the prior session's edits (above, if applicable)
+- what was done last session (in the summary)
+
+Do NOT run \`git status\`, \`git branch\`, \`git log\`, \`git diff\`, or \`ls\` as
+your first turn — those outputs are already in this prompt. Every
+re-orientation turn costs ~30K cached tokens and is your largest
+avoidable waste.
+
+### Do NOT Re-Read Files Whose Post-Edit State Is In The Diff Above
+
+Observed pattern (real, measured): the next session re-Reads each file
+the prior session edited, just to see the post-edit state, then re-reads
+the unchanged reference files it "wants to double-check", then runs
+\`go build\` / \`npm test\` / \`helm lint\` to verify things the prior
+session already verified. For a mid-sized step this alone burns ~800K
+cache-read tokens. The cumulative diff above is the authoritative
+post-edit state — trust it.
+
+Rules (mechanical, not advisory):
+
+1. If a file appears in the diff above, you already have its post-edit
+   state. Go directly to Edit if you need further changes. Do NOT Read
+   it "to see the current content" — that content is IN the diff.
+2. If a file appears in the summary's **Files already READ** list AND
+   NOT in the diff above, it is unchanged since the prior session read
+   it. The prior read was ingested once; do NOT re-Read.
+3. If the prior session's last tool calls show a successful build / test
+   run, do NOT re-run the same build / test as your first action. Only
+   re-run after you have made NEW edits.
+4. If you genuinely need the current state of a specific untouched
+   file, use \`git show HEAD:<file>\` (which is cache-efficient) instead
+   of a full \`Read\` of the working-tree copy.
+
+If state is truly ambiguous, ask ONE specific question via \`git diff <file>\`
+or \`git show <ref>:<file>\` — not a broad probe.
 
 ## Completion Instructions
 
 ${MODE_INSTRUCTIONS}
 SLIM_EOF
-        echo "  Session ${SESSION_NUM}: continuing with $(wc -c < "${SESSION_PROMPT_FILE}") bytes (slim prompt)"
+        echo "  Session ${SESSION_NUM}: continuing with $(wc -c < "${SESSION_PROMPT_FILE}") bytes (slim prompt with verified state)"
     else
         cp "${PROMPT_FILE}" "${SESSION_PROMPT_FILE}"
         echo "  Session ${SESSION_NUM}: initial session ($(wc -c < "${SESSION_PROMPT_FILE}") bytes)"
@@ -975,6 +1266,28 @@ SLIM_EOF
     if [ -f "/home/agent/completion-status.json" ]; then
         echo "  Task completed in session ${SESSION_NUM}."
         break
+    fi
+
+    # Onestep early-exit: a one-step task whose first full session produces
+    # ZERO file edits and ZERO commits is almost certainly misclassified.
+    # Every chained session after this re-reads the same files (the slim
+    # prompt's cumulative diff is empty until something is committed), and
+    # we have measured real runs burning 8 sessions × 30 turns × ~40K
+    # cached tokens per turn = ~10M cache-read tokens on re-exploration.
+    # Bail with an [analysis:onestep-rejected] marker so the orchestrator
+    # hands back to the human instead of respawning onestep over and over.
+    if [ "${MODE}" = "onestep" ] && [ "${SESSION_NUM}" = "1" ]; then
+        ONESTEP_DIRTY=$(git status --porcelain 2>/dev/null | head -c1)
+        ONESTEP_COMMITS_AHEAD=0
+        if git rev-parse --verify "origin/${WORK_BRANCH}" >/dev/null 2>&1; then
+            ONESTEP_COMMITS_AHEAD=$(git rev-list --count "origin/${WORK_BRANCH}..HEAD" 2>/dev/null || echo 0)
+        fi
+        if [ -z "${ONESTEP_DIRTY}" ] && [ "${ONESTEP_COMMITS_AHEAD}" = "0" ]; then
+            echo "Onestep session 1 ended with zero progress — handing back as scope-too-large."
+            # request_human_input posts the comment (marker on line 1 so
+            # determineMode() sees it), reassigns to human, and exits 0.
+            request_human_input "[analysis:onestep-rejected]\n\n**Scope exceeds one-step contract — no progress in session 1.**\n\nSession 1 (${TURNS_PER_SESSION} turns) produced no file edits and no commits. One-step tickets must be small enough to complete end-to-end in a single Claude session; when the whole first session goes to exploration and reference study, the ticket needs a multi-step plan instead.\n\n**Suggestion:** remove the \`one-step\` tag and move the ticket back to \`ready\` for normal analysis + planning, or split the ticket into smaller tickets."
+        fi
     fi
 
     # Non-zero exit without completion means Claude hit the turn limit
@@ -1151,6 +1464,12 @@ if [ "${MODE}" = "analysis" ]; then
     if [ "${ANALYSIS_RESULT}" = "need-info" ]; then
         echo "Analysis requires human input — assigning ticket to human."
         request_human_input "Analysis requires additional information. See the analysis comment above for details."
+    elif [ "${ANALYSIS_RESULT}" = "onestep-rejected" ]; then
+        # The analysis agent disagreed with the \`one-step\` tag.  Hand the
+        # ticket back so the human can either remove the tag (allowing a
+        # normal multi-step plan) or split the ticket.
+        echo "Analysis rejected one-step assignment — assigning ticket to human for reevaluation."
+        request_human_input "The analysis agent disagreed with the \`one-step\` tag for this ticket. See the analysis comment above. Please either remove the \`one-step\` tag and move the ticket back to \`ready\` for normal planning, or split the ticket into smaller ones."
     fi
 
 else
@@ -1159,8 +1478,17 @@ else
     # Handle blocked status
     if [ "${COMPLETION_STATUS}" = "blocked" ]; then
         BLOCKED_REASON=$(jq -r '.reason // "No reason provided"' /home/agent/completion-status.json 2>/dev/null || echo "No reason provided")
+        BLOCKED_COMMENT=$(jq -r '.taiga_comment // ""' /home/agent/completion-status.json 2>/dev/null || true)
         echo "Agent is blocked — requesting human input."
-        request_human_input "**Agent ${AGENT_ID}** is blocked and needs human input.\n\n**Reason:** ${BLOCKED_REASON}"
+        # Prefer the agent's own taiga_comment when provided — it carries
+        # lifecycle markers (e.g. [analysis:onestep-rejected] from a
+        # onestep agent that found the scope too large) that the
+        # orchestrator's determineMode() depends on.
+        if [ -n "${BLOCKED_COMMENT}" ]; then
+            request_human_input "${BLOCKED_COMMENT}"
+        else
+            request_human_input "**Agent ${AGENT_ID}** is blocked and needs human input.\n\n**Reason:** ${BLOCKED_REASON}"
+        fi
     fi
 
     # --- Silent-failure guard ---
@@ -1312,6 +1640,15 @@ ${COMPLETION_STATUS}"
             step)
                 if ! echo "${TAIGA_COMMENT}" | grep -qF '[step:'; then
                     TAIGA_COMMENT="[step:in-progress]\n\n${TAIGA_COMMENT}"
+                fi
+                ;;
+            onestep)
+                # For onestep the PR itself is the whole implementation —
+                # the marker we need is [step:complete] so the orchestrator
+                # transitions the ticket to ready-for-test when the PR
+                # merges. Inject it if the agent forgot.
+                if ! echo "${TAIGA_COMMENT}" | grep -qF '[step:'; then
+                    TAIGA_COMMENT="[step:complete]\n\n${TAIGA_COMMENT}"
                 fi
                 ;;
             fix)

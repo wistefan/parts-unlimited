@@ -139,9 +139,27 @@ func (e *Engine) Dequeue() *QueueEntry {
 }
 
 // AssignAgent records that an agent is working on a ticket.
+//
+// When a ticket already has a different PrimaryAgent (e.g. a mode handoff
+// like analysis → plan/onestep, or step N → step N+1 picked up by a
+// different agent), the previous primary and any delegated agents are
+// released from the busy pool first.  Without this release, each handoff
+// would leak one busy-agent slot — eventually pinning max concurrency to
+// zero free slots while no Jobs are actually running.
 func (e *Engine) AssignAgent(ticketID int, agentID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	if prev, exists := e.assignments[ticketID]; exists {
+		if prev.PrimaryAgent != "" && prev.PrimaryAgent != agentID {
+			delete(e.busyAgents, prev.PrimaryAgent)
+		}
+		for _, delegated := range prev.DelegatedTo {
+			if delegated != agentID {
+				delete(e.busyAgents, delegated)
+			}
+		}
+	}
 
 	e.assignments[ticketID] = &TicketAssignment{
 		TicketID:     ticketID,
