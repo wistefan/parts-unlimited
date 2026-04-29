@@ -25,7 +25,6 @@ data:
       idleTimeoutSeconds: 300
       taskTimeoutSeconds: 3600
       retryLimit: 2
-      escalationThreshold: 2
       containerImage: "localhost:5000/agent-worker:latest"
     notifications:
       webhookUrl: ""

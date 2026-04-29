@@ -36,15 +36,18 @@ var repoMarkerRE = regexp.MustCompile("(?:\\*\\*)?Repo:(?:\\*\\*)?[\\s`]*([A-Za-
 
 // FindRepoForTicket returns the canonical Gitea owner/name for a ticket
 // by scanning its Taiga comment history for a `**Repo:** owner/name`
-// marker. Every agent comment carries the marker forward, so the most
-// recent agent comment is sufficient — no need to walk all the way back
-// to the first one. Returns ("", "") when no marker exists yet (first-
-// agent case); the caller should fall back to other resolution paths.
+// marker. Returns ("", "") when no marker exists yet (first-agent case);
+// the caller should fall back to other resolution paths.
 //
-// The input must be newest-first (the order GetComments returns).
+// The input must be newest-first (the order GetComments returns); we
+// iterate in reverse so the *oldest* agent comment carrying a Repo:
+// marker wins. Anchoring on the first claim is what keeps the canonical
+// fork pointer stable when a stray agent (different identity / fork)
+// later comments — see the godoc on cmd/orchestrator.findRepoForTicket
+// for the failure mode this defends against.
 func FindRepoForTicket(comments []taiga.HistoryEntry) (owner, name string) {
-	for _, c := range comments {
-		if m := repoMarkerRE.FindStringSubmatch(c.Comment); len(m) == 3 {
+	for i := len(comments) - 1; i >= 0; i-- {
+		if m := repoMarkerRE.FindStringSubmatch(comments[i].Comment); len(m) == 3 {
 			return m[1], m[2]
 		}
 	}
@@ -157,10 +160,10 @@ type PRSnapshot struct {
 //   - humanTaigaID: the Taiga user ID of the human overseeing the
 //     orchestrator. Pass 0 to disable the "assigned to human" check.
 //
-// The decision logic mirrors the current reconcile loop in
-// cmd/orchestrator/main.go exactly, consolidating three previously
-// separate helpers (determineMode, findPRNeedingFix,
-// determineModeFromPRState) into one testable function.
+// The decision logic is the single source of truth for "what mode
+// (if any) should run for this ticket right now": comment markers
+// drive most transitions, with PR state used to recover when a PR was
+// merged or had changes requested while the orchestrator was down.
 func DeriveTicketState(
 	story *taiga.UserStory,
 	comments []taiga.HistoryEntry,
@@ -216,9 +219,10 @@ func isAssignedToHuman(story *taiga.UserStory, humanTaigaID int) bool {
 	return false
 }
 
-// modeFromComments reproduces the exact decision tree of the current
-// determineMode function. The second return value is a short reason
-// intended for logs when the mode is empty ("" means "waiting").
+// modeFromComments derives the next agent mode from a ticket's
+// comment history by scanning lifecycle markers. The second return
+// value is a short reason intended for logs when the mode is empty
+// ("" means "waiting").
 func modeFromComments(comments []taiga.HistoryEntry) (string, string) {
 	hasAnalysisProceed := false
 	hasAnalysisNeedInfo := false
@@ -326,7 +330,7 @@ func modeFromComments(comments []taiga.HistoryEntry) (string, string) {
 }
 
 // findFixTarget returns the first open PR that has a non-stale
-// REQUEST_CHANGES review. Matches findPRNeedingFix in main.go.
+// REQUEST_CHANGES review.
 func findFixTarget(prs []PRSnapshot) *FixTarget {
 	for _, snap := range prs {
 		if snap.PR.State != prStateOpen {
@@ -349,7 +353,7 @@ func findFixTarget(prs []PRSnapshot) *FixTarget {
 // catches the case where a plan or step PR was merged while the
 // orchestrator was down (or otherwise missed the merge webhook) — on the
 // next reconcile pass we look at Gitea directly and pick up where we
-// left off. Mirrors determineModeFromPRState in main.go.
+// left off.
 //
 // Returns "" when no follow-up is warranted: no PRs, a PR still open, or
 // all step work already marked complete.
@@ -389,8 +393,7 @@ func modeFromPRState(prs []PRSnapshot, comments []taiga.HistoryEntry) (string, s
 }
 
 // isPlanPR classifies a PR as a plan PR by title substring. Plan agents
-// open PRs titled "Implementation Plan for <ticket>" or similar. Matches
-// the title check in determineModeFromPRState.
+// open PRs titled "Implementation Plan for <ticket>" or similar.
 func isPlanPR(title string) bool {
 	return strings.Contains(title, planPRTitleMarker) ||
 		strings.Contains(title, planPRTitleMarkerLower)

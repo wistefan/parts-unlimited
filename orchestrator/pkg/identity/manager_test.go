@@ -190,36 +190,59 @@ func TestListBySpecialization(t *testing.T) {
 	}
 }
 
-func TestRegisterExisting(t *testing.T) {
-	mgr, _, _ := setupTestManager(t)
+func TestHydrateFromGitea(t *testing.T) {
+	giteaMux := http.NewServeMux()
+	giteaMux.HandleFunc("/api/v1/users/search", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": []gitea.GiteaUser{
+				{ID: 42, Login: "frontend-agent-5"},
+				{ID: 7, Login: "general-agent-2"},
+				{ID: 1, Login: "claude"}, // not an agent — must be ignored
+			},
+			"ok": true,
+		})
+	})
+	giteaSrv := httptest.NewServer(giteaMux)
+	t.Cleanup(giteaSrv.Close)
 
-	existing := &AgentIdentity{
-		ID:             "frontend-agent-5",
-		Specialization: "frontend",
-		GiteaUserID:    42,
-		TaigaUserID:    99,
-	}
-	mgr.RegisterExisting(existing)
+	taigaMux := http.NewServeMux()
+	taigaMux.HandleFunc("/api/v1/auth", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"auth_token": "test-token"})
+	})
+	taigaMux.HandleFunc("/api/v1/users", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]taiga.User{
+			{ID: 99, Username: "frontend-agent-5"},
+			{ID: 100, Username: "general-agent-2"},
+		})
+	})
+	taigaSrv := httptest.NewServer(taigaMux)
+	t.Cleanup(taigaSrv.Close)
 
-	agent := mgr.GetAgent("frontend-agent-5")
-	if agent == nil {
-		t.Fatal("expected to find registered agent")
-	}
-	if agent.GiteaUserID != 42 {
-		t.Errorf("expected GiteaUserID=42, got %d", agent.GiteaUserID)
+	giteaClient := gitea.NewClient(giteaSrv.URL, "admin", "password")
+	taigaClient := taiga.NewClient(taigaSrv.URL)
+	taigaClient.Authenticate("admin", "password")
+	mgr := NewManager(giteaClient, taigaClient, nil, nil, 1, 1)
+
+	if err := mgr.HydrateFromGitea(); err != nil {
+		t.Fatalf("HydrateFromGitea: %v", err)
 	}
 
-	// Creating a new frontend agent should get number 6 (after 5)
-	busy := make(map[string]bool)
-	for _, a := range mgr.ListAgents() {
-		busy[a.ID] = true
+	if a := mgr.GetAgent("frontend-agent-5"); a == nil || a.GiteaUserID != 42 || a.TaigaUserID != 99 {
+		t.Errorf("frontend-agent-5 hydration wrong: %+v", a)
 	}
-	newAgent, err := mgr.GetOrCreateAgent("frontend", busy)
-	if err != nil {
-		t.Fatalf("GetOrCreateAgent: %v", err)
+	if a := mgr.GetAgent("general-agent-2"); a == nil || a.GiteaUserID != 7 {
+		t.Errorf("general-agent-2 hydration wrong: %+v", a)
 	}
-	if newAgent.ID != "frontend-agent-6" {
-		t.Errorf("expected 'frontend-agent-6', got %q", newAgent.ID)
+	if mgr.GetAgent("claude") != nil {
+		t.Errorf("non-agent user should not be hydrated")
+	}
+
+	// counts must reflect highest seen number per spec, so new agents start at +1
+	if mgr.counts["frontend"] != 5 {
+		t.Errorf("frontend count expected 5, got %d", mgr.counts["frontend"])
+	}
+	if mgr.counts["general"] != 2 {
+		t.Errorf("general count expected 2, got %d", mgr.counts["general"])
 	}
 }
 

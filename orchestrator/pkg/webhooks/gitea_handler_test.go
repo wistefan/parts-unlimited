@@ -215,6 +215,24 @@ func TestParseTicketIDFromPRBody(t *testing.T) {
 			body:     "Just a regular change",
 			expected: 0,
 		},
+		{
+			name:     "branch in title with mode suffix",
+			title:    "ticket-12/plan: initial implementation plan",
+			body:     "",
+			expected: 12,
+		},
+		{
+			name:     "branch in title with step",
+			title:    "ticket-12/step-3: add tests",
+			body:     "",
+			expected: 12,
+		},
+		{
+			name:     "closes ticket-N work in body",
+			title:    "Some PR",
+			body:     "Closes ticket-7/work",
+			expected: 7,
+		},
 	}
 
 	for _, tt := range tests {

@@ -10,11 +10,11 @@ Parts Unlimited (dev-env) is a locally-hosted, Kubernetes-based platform that or
 
 ### No orchestrator-side state persistence
 
-**Taiga and Gitea are the only sources of truth.** The orchestrator must not persist state (assignments, queue entries, PR mappings, escalation counters, etc.) to a Kubernetes ConfigMap, a local file, an in-memory cache that survives restarts, or any other store. Every decision — "is this ticket assigned?", "what mode should run next?", "which PR belongs to which ticket?" — must be derived on demand from Taiga (statuses, assignees, tags, comments) and Gitea (PRs, reviews, branches).
+**Taiga and Gitea are the only sources of truth.** The orchestrator must not persist state (assignments, queue entries, PR mappings, escalation counters, etc.) to a Kubernetes ConfigMap, a local file, an in-memory cache that survives restarts, or any other store. Every decision — "is this ticket assigned?", "what mode should run next?", "which PR belongs to which ticket?" — must be derived on demand from Taiga (statuses, assignees, tags, comments), Gitea (PRs, reviews, branches), and the K8s API (Jobs).
 
-Why: dual-write bugs. The current ConfigMap-backed state (`pkg/state`, the `state` field in `main.go`) drifts out of sync with Taiga/Gitea, leaving tickets that look "assigned" internally but have no running Job, no open PR, and no human owner — silently stuck forever. Deriving state fresh from the external systems eliminates the class of bug entirely.
+Why: dual-write bugs. Earlier versions kept ConfigMap-backed state (`pkg/state`) and in-memory maps (`assignments`, `queue`, `prMappings`, `escalations`, `busyAgents`) alongside Taiga/Gitea; they drifted, leaving tickets that looked "assigned" internally but had no running Job, no open PR, and no human owner — silently stuck forever. Deriving state fresh from the external systems on every reconcile pass eliminates the class of bug entirely.
 
-How to apply: when adding a feature, do not introduce a new field on the persisted state struct. Refactor existing code toward removing `pkg/state` and the in-memory `assignments` / `queue` / `prMappings` / `escalations` maps; replace reads with Taiga/Gitea API calls (cache within a single reconcile pass if needed, but never across passes).
+How to apply: when adding a feature, do not introduce any field that survives a single `reconciler.ReconcileAll` pass. Per-pass caches built and discarded inside one call are fine. New reads go through `taigaClient` / `giteaClient` / `lifecycleMgr` (the K8s wrapper). The stateless reconciler in `pkg/reconciler` is the single spawn path; webhooks call `nudgeReconciler` and return.
 
 ## Build & Test Commands
 
@@ -59,7 +59,7 @@ kubectl logs -n agents <pod-name>                       # Agent worker logs
 
 Three main components communicate via REST APIs and Kubernetes Jobs:
 
-1. **Orchestrator** (`orchestrator/`) -- Go service that receives Taiga webhooks, manages a FIFO ticket queue, spawns agent worker Jobs in Kubernetes, and runs automated PR reviews. (Legacy: the current code also persists state to a ConfigMap via `pkg/state`; see the Hard Rules section — this is to be removed.)
+1. **Orchestrator** (`orchestrator/`) -- Go service that receives Taiga and Gitea webhooks, runs the stateless reconciler against Taiga + Gitea + K8s on every pass, spawns agent worker Jobs in Kubernetes, and runs automated PR reviews. Holds no cross-pass state of its own (see Hard Rules).
 
 2. **Agent Workers** (`agent/`) -- Ephemeral containers running Claude Code CLI. Each is spawned per-ticket in one of four modes: `analysis` (evaluate ticket), `plan` (create implementation plan + CLAUDE.md), `step` (implement one plan step), `fix` (address PR review comments). The `bootstrap.sh` script orchestrates the full lifecycle.
 
@@ -71,13 +71,13 @@ The entry point is `cmd/orchestrator/main.go` (~1600 lines) which wires everythi
 
 | Package | Responsibility |
 |---|---|
-| `pkg/assignment` | FIFO ticket queue, tag-based delegation (`delegate:`/`active:` tags), concurrency control |
-| `pkg/lifecycle` | K8s Job CRUD with security contexts, timeouts, retries |
-| `pkg/identity` | On-demand agent identity creation in Gitea + Taiga |
-| `pkg/state` | Legacy ConfigMap-backed persistence — slated for removal; do not extend |
+| `pkg/reconciler` | Stateless decision core: derives "what to do next" for each ticket from Taiga + Gitea + K8s on every pass. Single spawn path. |
+| `pkg/assignment` | Tag-based delegation helpers (`delegate:`/`active:` tag manipulation). No engine; no in-memory state. |
+| `pkg/lifecycle` | K8s Job CRUD with security contexts, timeouts, retries. K8s is the source of truth for "is this agent busy" via `ListActiveAgents`. |
+| `pkg/identity` | On-demand agent identity creation in Gitea + Taiga. Hydrates from Gitea on startup; no persistence. |
 | `pkg/taiga` | Taiga REST API client (stories, comments, tags, statuses) |
-| `pkg/gitea` | Gitea REST API client (repos, PRs, reviews, branches) |
-| `pkg/webhooks` | Taiga webhook receiver with HMAC verification and event routing |
+| `pkg/gitea` | Gitea REST API client (repos, PRs, reviews, branches, user search) |
+| `pkg/webhooks` | Taiga + Gitea webhook receivers; PR-body / branch-name parser for ticket-id resolution |
 | `pkg/review` | PR review via `claude -p` subprocess |
 | `pkg/plan` | Markdown plan parsing, step tracking, release notes |
 | `pkg/notifications` | Webhook + desktop notification dispatch |

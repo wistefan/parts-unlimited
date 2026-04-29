@@ -13,15 +13,14 @@ type Mode int
 
 const (
 	// ModeShadow runs the decision core on every pass and logs the
-	// verdict, but never spawns agents or mutates any system. The
-	// legacy reconcile loop (in cmd/orchestrator/main.go) stays
-	// authoritative.
+	// verdict, but never spawns agents or mutates any system. Retained
+	// for tests that exercise the read-only decision tree without a
+	// real Spawner.
 	ModeShadow Mode = iota
 
 	// ModeAuthoritative runs the decision core AND spawns agents via
 	// the configured Spawner, enforcing the maxConcurrency cap using
-	// K8s-derived busy-agent counts. The legacy loop must be disabled
-	// when this mode is used, otherwise both loops compete to spawn.
+	// K8s-derived busy-agent counts. This is the production mode.
 	ModeAuthoritative
 )
 
@@ -180,8 +179,8 @@ func (r *Reconciler) ReconcileTicket(ctx context.Context, ticketID int) error {
 }
 
 // listActionableStories concatenates Taiga's ready and in-progress
-// statuses. Ready first, matching the legacy reconcile loop's order so
-// shadow-mode logs are easy to line up against the legacy loop's logs.
+// statuses. Ready stories are listed first so a fresh ticket gets a
+// pass before in-progress ones whose state may be waiting on a PR.
 func (r *Reconciler) listActionableStories() ([]taiga.UserStory, error) {
 	ready, err := r.cfg.Taiga.ListUserStories(r.cfg.ProjectID, &taiga.UserStoryListOptions{
 		StatusID: r.cfg.ReadyStatusID,

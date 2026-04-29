@@ -37,26 +37,12 @@ type TaigaConfig struct {
 
 // AgentsConfig holds agent orchestration settings.
 type AgentsConfig struct {
-	MaxConcurrency      int                   `yaml:"maxConcurrency"`
-	IdleTimeoutSeconds  int                   `yaml:"idleTimeoutSeconds"`
-	TaskTimeoutSeconds  int                   `yaml:"taskTimeoutSeconds"`
-	RetryLimit          int                   `yaml:"retryLimit"`
-	EscalationThreshold int                   `yaml:"escalationThreshold"`
-	ContainerImage      string                `yaml:"containerImage"`
-	Specializations     map[string]SpecConfig `yaml:"specializations"`
-
-	// ReconcilerMode selects the stateless reconciler's behaviour:
-	//   - ""            (default): legacy loop only, reconciler disabled.
-	//   - "shadow":     legacy loop authoritative; reconciler runs and
-	//                   logs its decisions for validation, but spawns
-	//                   nothing.
-	//   - "authoritative": reconciler is the single spawn path. The
-	//                   legacy reconcile loop and webhook-driven Enqueue
-	//                   / respawnAgent / spawnFixAgent paths are
-	//                   disabled; webhooks nudge the reconciler via
-	//                   ReconcileTicket instead. Use only after shadow
-	//                   mode has been validated in the target cluster.
-	ReconcilerMode string `yaml:"reconcilerMode"`
+	MaxConcurrency     int                   `yaml:"maxConcurrency"`
+	IdleTimeoutSeconds int                   `yaml:"idleTimeoutSeconds"`
+	TaskTimeoutSeconds int                   `yaml:"taskTimeoutSeconds"`
+	RetryLimit         int                   `yaml:"retryLimit"`
+	ContainerImage     string                `yaml:"containerImage"`
+	Specializations    map[string]SpecConfig `yaml:"specializations"`
 }
 
 // SpecConfig holds per-specialization overrides.
@@ -103,12 +89,11 @@ func DefaultConfig() *Config {
 			HumanUsername: "wistefan",
 		},
 		Agents: AgentsConfig{
-			MaxConcurrency:      3,
-			IdleTimeoutSeconds:  300,
-			TaskTimeoutSeconds:  3600,
-			RetryLimit:          2,
-			EscalationThreshold: 2,
-			ContainerImage:      "localhost:5000/agent-worker:latest",
+			MaxConcurrency:     3,
+			IdleTimeoutSeconds: 300,
+			TaskTimeoutSeconds: 3600,
+			RetryLimit:         2,
+			ContainerImage:     "localhost:5000/agent-worker:latest",
 		},
 		Notifications: NotificationsConfig{
 			DashboardPort: 8080,

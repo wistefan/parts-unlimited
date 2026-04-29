@@ -33,6 +33,9 @@ const (
 
 	// DefaultTTLAfterFinished is how long completed Jobs are kept for log access.
 	DefaultTTLAfterFinished int32 = 300
+
+	// DefaultClaudeModel is the Claude model agents use by default.
+	DefaultClaudeModel = "claude-opus-4-6"
 )
 
 // AgentJobSpec holds the parameters needed to create an agent worker Job.
@@ -104,9 +107,8 @@ type Manager struct {
 	clientset kubernetes.Interface
 	config    *Config
 
-	mu         sync.RWMutex
-	activeJobs map[string]string     // job name -> agent ID
-	tracking   map[string]trackedJob // job name -> metrics-tracking data (dedups completion observations)
+	mu       sync.RWMutex
+	tracking map[string]trackedJob // job name -> metrics-tracking data (dedups completion observations)
 }
 
 // NewManager creates a new lifecycle manager.
@@ -115,10 +117,9 @@ func NewManager(clientset kubernetes.Interface, config *Config) *Manager {
 		config = DefaultConfig()
 	}
 	return &Manager{
-		clientset:  clientset,
-		config:     config,
-		activeJobs: make(map[string]string),
-		tracking:   make(map[string]trackedJob),
+		clientset: clientset,
+		config:    config,
+		tracking:  make(map[string]trackedJob),
 	}
 }
 
@@ -375,10 +376,6 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 		return "", fmt.Errorf("creating job %s: %w", jobName, err)
 	}
 
-	m.mu.Lock()
-	m.activeJobs[jobName] = spec.AgentID
-	m.mu.Unlock()
-
 	mode := spec.Mode
 	if mode == "" {
 		mode = "step"
@@ -398,10 +395,6 @@ func (m *Manager) DeleteJob(ctx context.Context, jobName string) error {
 	if err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("deleting job %s: %w", jobName, err)
 	}
-
-	m.mu.Lock()
-	delete(m.activeJobs, jobName)
-	m.mu.Unlock()
 
 	log.Printf("Deleted job %s", jobName)
 	return nil
@@ -601,18 +594,6 @@ func (m *Manager) HasJobForTicket(ctx context.Context, ticketID int) (bool, erro
 	return len(jobs.Items) > 0, nil
 }
 
-// GetActiveJobNames returns the set of currently tracked active job names.
-func (m *Manager) GetActiveJobNames() map[string]string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	result := make(map[string]string, len(m.activeJobs))
-	for k, v := range m.activeJobs {
-		result[k] = v
-	}
-	return result
-}
-
 // buildEnvVars constructs the environment variables for an agent container.
 func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 	envVars := []corev1.EnvVar{
@@ -642,6 +623,8 @@ func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 	if spec.AllowedTools != "" {
 		envVars = append(envVars, corev1.EnvVar{Name: "ALLOWED_TOOLS", Value: spec.AllowedTools})
 	}
+
+	envVars = append(envVars, corev1.EnvVar{Name: "CLAUDE_MODEL", Value: DefaultClaudeModel})
 
 	// Service endpoints from ConfigMap
 	envVars = append(envVars,

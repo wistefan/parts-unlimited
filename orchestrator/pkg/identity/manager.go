@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -18,6 +19,10 @@ import (
 	"github.com/wistefan/dev-env/orchestrator/pkg/gitea"
 	"github.com/wistefan/dev-env/orchestrator/pkg/taiga"
 )
+
+// agentIDInfix is the separator that splits the specialization prefix from
+// the per-specialization counter in an agent ID (e.g. "general-agent-3").
+const agentIDInfix = "-agent-"
 
 // DefaultSpecializations is the starting set of agent specializations.
 var DefaultSpecializations = []string{
@@ -175,26 +180,144 @@ func (m *Manager) ListBySpecialization(specialization string) []*AgentIdentity {
 	return result
 }
 
-// RegisterExisting adds a pre-existing agent identity to the manager.
-// Used during recovery to load agents from persisted state.
-func (m *Manager) RegisterExisting(agent *AgentIdentity) {
+// AdoptExisting registers an agent that already exists in Gitea and
+// Taiga but isn't yet known to this manager instance. Used to recover
+// the identity of a ticket's prior agent when the in-memory registry
+// has lost it (e.g. after orchestrator restart) — without that, the
+// caller would fall through to a freshly-allocated agent and the
+// ticket's work history would split across two forks.
+//
+// All inputs are derived from external systems (Gitea user record +
+// Taiga project membership). The deterministic password and email
+// match what createAgentLocked would have generated.
+func (m *Manager) AdoptExisting(username string) (*AgentIdentity, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.agents[agent.ID] = agent
+	if existing, ok := m.agents[username]; ok {
+		return existing, nil
+	}
 
-	// Update the count so new agents get the next number
-	// Parse the number from the ID to keep counts in sync
-	var num int
-	var spec string
-	_, err := fmt.Sscanf(agent.ID, "%s", &spec)
-	if err == nil {
-		// Extract number from "specialization-agent-N"
-		fmt.Sscanf(agent.ID, agent.Specialization+"-agent-%d", &num)
-		if num >= m.counts[agent.Specialization] {
-			m.counts[agent.Specialization] = num
+	spec := specializationFromAgentID(username)
+	if spec == "" {
+		return nil, fmt.Errorf("agent ID %q does not match expected pattern <spec>%s<n>", username, agentIDInfix)
+	}
+
+	giteaUser, err := m.giteaClient.GetUser(username)
+	if err != nil {
+		return nil, fmt.Errorf("looking up Gitea user %s: %w", username, err)
+	}
+	if giteaUser == nil {
+		return nil, fmt.Errorf("Gitea user %s does not exist", username)
+	}
+
+	taigaUserID, err := m.findTaigaUserID(username)
+	if err != nil {
+		return nil, fmt.Errorf("looking up Taiga user %s: %w", username, err)
+	}
+
+	a := &AgentIdentity{
+		ID:             username,
+		Specialization: spec,
+		GiteaUserID:    giteaUser.ID,
+		TaigaUserID:    taigaUserID,
+		Password:       m.defaultPasswd,
+		Email:          fmt.Sprintf("%s@dev-env.local", username),
+	}
+	m.agents[username] = a
+
+	if num := agentNumberFromID(username, spec); num > m.counts[spec] {
+		m.counts[spec] = num
+	}
+
+	log.Printf("Adopted existing agent %s (gitea=%d, taiga=%d)", username, giteaUser.ID, taigaUserID)
+	return a, nil
+}
+
+// findTaigaUserID returns the Taiga user ID for a username by scanning
+// the project's member list.
+func (m *Manager) findTaigaUserID(username string) (int, error) {
+	members, err := m.taigaClient.ListProjectMembers(m.taigaProject)
+	if err != nil {
+		return 0, err
+	}
+	for _, u := range members {
+		if u.Username == username {
+			return u.ID, nil
 		}
 	}
+	return 0, fmt.Errorf("user %s is not a member of project %d", username, m.taigaProject)
+}
+
+// specializationFromAgentID parses the specialization prefix from an
+// agent ID of the form "<spec>-agent-<n>". Returns "" if the format
+// doesn't match.
+func specializationFromAgentID(id string) string {
+	idx := strings.LastIndex(id, agentIDInfix)
+	if idx <= 0 {
+		return ""
+	}
+	return id[:idx]
+}
+
+// agentNumberFromID parses the per-specialization counter from an
+// agent ID. Returns 0 if the suffix isn't a positive integer.
+func agentNumberFromID(id, spec string) int {
+	var num int
+	fmt.Sscanf(id, spec+agentIDInfix+"%d", &num)
+	return num
+}
+
+// HydrateFromGitea rebuilds the in-memory agent registry by listing
+// Gitea users that match the agent ID pattern (`<spec>-agent-<n>`).
+// Gitea is the source of truth for which agent identities exist; the
+// orchestrator persists nothing across restarts. Called once during
+// initialization so subsequent GetOrCreateAgent calls can find idle
+// existing agents instead of creating duplicates.
+//
+// Errors during Taiga lookup for a given user are logged and skipped
+// rather than aborting the whole hydration — a transient Taiga miss
+// shouldn't prevent the orchestrator from starting up.
+func (m *Manager) HydrateFromGitea() error {
+	users, err := m.giteaClient.SearchUsers(agentIDInfix)
+	if err != nil {
+		return fmt.Errorf("searching gitea users: %w", err)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, u := range users {
+		spec := specializationFromAgentID(u.Login)
+		if spec == "" {
+			continue
+		}
+		if _, exists := m.agents[u.Login]; exists {
+			continue
+		}
+
+		taigaUserID, err := m.findTaigaUserID(u.Login)
+		if err != nil {
+			log.Printf("WARNING: hydrate: skipping %s (no Taiga membership): %v", u.Login, err)
+			continue
+		}
+
+		m.agents[u.Login] = &AgentIdentity{
+			ID:             u.Login,
+			Specialization: spec,
+			GiteaUserID:    u.ID,
+			TaigaUserID:    taigaUserID,
+			Password:       m.defaultPasswd,
+			Email:          fmt.Sprintf("%s@dev-env.local", u.Login),
+		}
+
+		if num := agentNumberFromID(u.Login, spec); num > m.counts[spec] {
+			m.counts[spec] = num
+		}
+	}
+
+	log.Printf("Identity: hydrated %d agents from Gitea", len(m.agents))
+	return nil
 }
 
 // RemoveAgent deactivates an agent identity.

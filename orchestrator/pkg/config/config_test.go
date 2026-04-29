@@ -19,9 +19,6 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Agents.MaxConcurrency != 3 {
 		t.Errorf("expected MaxConcurrency=3, got %d", cfg.Agents.MaxConcurrency)
 	}
-	if cfg.Agents.EscalationThreshold != 2 {
-		t.Errorf("expected EscalationThreshold=2, got %d", cfg.Agents.EscalationThreshold)
-	}
 }
 
 func TestAgentsTimeout(t *testing.T) {

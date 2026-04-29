@@ -7,6 +7,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -170,10 +171,10 @@ func TestCreateJob(t *testing.T) {
 		t.Error("expected GITEA_URL from configmap")
 	}
 
-	// Check active jobs tracking
-	active := mgr.GetActiveJobNames()
-	if active[jobName] != "general-agent-1" {
-		t.Errorf("expected job in active tracking, got %v", active)
+	// Verify the Job exists in the K8s API — this is the source of
+	// truth, not any in-memory tracking.
+	if _, err := mgr.clientset.BatchV1().Jobs("agents").Get(context.Background(), jobName, metav1.GetOptions{}); err != nil {
+		t.Errorf("expected job %s to exist in K8s, got: %v", jobName, err)
 	}
 }
 
@@ -235,9 +236,10 @@ func TestDeleteJob(t *testing.T) {
 		t.Fatalf("DeleteJob: %v", err)
 	}
 
-	active := mgr.GetActiveJobNames()
-	if _, exists := active[jobName]; exists {
-		t.Error("expected job removed from active tracking")
+	// The Job should no longer exist in the K8s API — that is the
+	// only source of truth.
+	if _, err := mgr.clientset.BatchV1().Jobs("agents").Get(ctx, jobName, metav1.GetOptions{}); !errors.IsNotFound(err) {
+		t.Errorf("expected job %s to be gone from K8s, got: %v", jobName, err)
 	}
 }
 

@@ -342,6 +342,33 @@ func (c *Client) CreateUser(username, password, email string) (*GiteaUser, error
 	return &user, nil
 }
 
+// SearchUsers returns Gitea users whose username, full name, or email
+// matches the given query substring. Used to rebuild the agent
+// registry from Gitea on orchestrator startup — Gitea is the source of
+// truth for which agent identities exist.
+func (c *Client) SearchUsers(query string) ([]GiteaUser, error) {
+	path := fmt.Sprintf("/api/v1/users/search?q=%s&limit=50", query)
+
+	resp, err := c.doRequest(http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("search users: status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Data []GiteaUser `json:"data"`
+		OK   bool        `json:"ok"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding search response: %w", err)
+	}
+	return result.Data, nil
+}
+
 // GetUser retrieves a user by username. Returns nil if not found.
 func (c *Client) GetUser(username string) (*GiteaUser, error) {
 	path := fmt.Sprintf("/api/v1/users/%s", username)

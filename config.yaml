@@ -29,21 +29,8 @@ agents:
   # Number of Job retries before escalating to human
   retryLimit: 2
 
-  # Number of no-op reassignment cycles before escalating to human
-  escalationThreshold: 2
-
   # Docker image for agent worker containers
   containerImage: "localhost:5000/agent-worker:latest"
-
-  # Stateless reconciler mode. Controls whether and how the new
-  # Taiga+Gitea-derived reconciler runs.
-  #   ""            — legacy loop only (default, safest).
-  #   "shadow"      — legacy loop stays authoritative; reconciler runs
-  #                   alongside and logs its decisions for validation.
-  #   "authoritative" — reconciler is the single spawn path; the legacy
-  #                   loop and webhook spawn-paths are disabled. Only
-  #                   enable after shadow mode has been validated.
-  reconcilerMode: ""
 
   # Per-specialization tool restrictions.
   # Omitted specializations use the default allowed tools (all).

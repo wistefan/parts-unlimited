@@ -38,10 +38,6 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
-  # Manage orchestrator state ConfigMap
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["create", "get", "update", "patch"]
   # Read secrets (agent credentials)
   - apiGroups: [""]
     resources: ["secrets"]

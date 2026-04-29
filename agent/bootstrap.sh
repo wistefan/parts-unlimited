@@ -399,6 +399,45 @@ extract_base_branch() {
     echo "${raw}"
 }
 
+# count_merged_step_prs returns the number of merged step PRs for this
+# ticket on the current repo. PR records persist on Gitea even when
+# branches are deleted on merge, so this is a stable source of truth for
+# "how many steps have already shipped" — unlike `git ls-remote ... step-*`
+# which silently regresses to zero when the repo has delete-branch-on-merge
+# enabled.
+#
+# A merged step PR is identified by two stable signals that both survive
+# branch deletion (Gitea rewrites a deleted head ref to `refs/pull/N/head`,
+# so head-ref prefix matching alone undercounts):
+#   - base.ref == "ticket-${TICKET_ID}/work"  (every step PR targets work)
+#   - title  starts with  "Ticket #${TICKET_ID} - Step "
+#                          (the format hard-coded by bootstrap.sh below)
+#
+# Requires REPO_OWNER, REPO_NAME, TICKET_ID, GITEA_URL, GITEA_USERNAME,
+# GITEA_PASSWORD to be set.
+PR_PAGE_SIZE=50
+count_merged_step_prs() {
+    local page=1 total=0 page_json page_count batch
+    local title_prefix="Ticket #${TICKET_ID} - Step "
+    local work_base="ticket-${TICKET_ID}/work"
+    while :; do
+        page_json=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+            "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}/pulls?state=closed&limit=${PR_PAGE_SIZE}&page=${page}" \
+            2>/dev/null || echo '[]')
+        page_count=$(echo "${page_json}" | jq 'length' 2>/dev/null || echo 0)
+        batch=$(echo "${page_json}" \
+            | jq --arg base "${work_base}" --arg tprefix "${title_prefix}" \
+                "[.[] | select(.merged == true)
+                       | select(.base.ref == \$base)
+                       | select(.title | startswith(\$tprefix))
+                  ] | length" 2>/dev/null || echo 0)
+        total=$((total + batch))
+        [ "${page_count}" -lt "${PR_PAGE_SIZE}" ] && break
+        page=$((page + 1))
+    done
+    echo "${total}"
+}
+
 BASE_BRANCH=$(extract_base_branch "${TICKET_DESCRIPTION}")
 BASE_BRANCH="${BASE_BRANCH:-main}"
 echo "Base branch: ${BASE_BRANCH}"
@@ -463,22 +502,20 @@ case "${MODE}" in
         ;;
     step|*)
         # Step agents always work on a step branch so the resulting PR
-        # targets the integration work branch (never `main`). If the
-        # orchestrator did not provide PLAN_STEP, derive the next step
-        # number by scanning existing `ticket-X/step-N` branches on the
-        # remote — the new branch is `max(N)+1`, or `step-1` when none
-        # exist yet. Working directly on the work branch would cause a
-        # work → BASE_BRANCH PR, which this repo never wants.
+        # targets the integration work branch (never `main`). Working
+        # directly on the work branch would cause a work → BASE_BRANCH
+        # PR, which this repo never wants.
+        #
+        # PLAN_STEP is the 1-based index of the step this agent is about
+        # to ship. It must be derived from a source that survives
+        # delete-branch-on-merge, otherwise the counter regresses once
+        # earlier step branches are reaped (observed: ticket #22 going
+        # `[step:3/6]` → `[step:1/6]`). Counting *merged* step PRs is
+        # stable: PR records persist forever on Gitea.
         if [ -z "${PLAN_STEP}" ]; then
-            MAX_EXISTING_STEP=$(git ls-remote --heads origin "${BRANCH_PREFIX}/step-*" 2>/dev/null \
-                | sed -n "s#.*refs/heads/${BRANCH_PREFIX}/step-\([0-9][0-9]*\)\$#\1#p" \
-                | sort -n | tail -1 || true)
-            if [ -z "${MAX_EXISTING_STEP}" ]; then
-                PLAN_STEP=1
-            else
-                PLAN_STEP=$((MAX_EXISTING_STEP + 1))
-            fi
-            echo "Derived PLAN_STEP=${PLAN_STEP} from existing step branches."
+            MERGED_STEP_PR_COUNT=$(count_merged_step_prs)
+            PLAN_STEP=$((MERGED_STEP_PR_COUNT + 1))
+            echo "Derived PLAN_STEP=${PLAN_STEP} from ${MERGED_STEP_PR_COUNT} merged step PR(s)."
         fi
         BRANCH_NAME="${BRANCH_PREFIX}/step-${PLAN_STEP}"
         ;;
@@ -1638,8 +1675,31 @@ ${COMPLETION_STATUS}"
                 fi
                 ;;
             step)
-                if ! echo "${TAIGA_COMMENT}" | grep -qF '[step:'; then
-                    TAIGA_COMMENT="[step:in-progress]\n\n${TAIGA_COMMENT}"
+                # Overwrite whatever step marker the LLM wrote with one
+                # derived from authoritative sources. The agent has
+                # historically picked the wrong N (e.g. ticket #22 went
+                # `[step:3/6]` → `[step:1/6]` after a plan rewrite), so
+                # we trust merged-PR count + plan heading count instead.
+                # `[step:complete]` is a different terminal marker —
+                # leave it untouched.
+                if ! echo "${TAIGA_COMMENT}" | grep -qF '[step:complete]'; then
+                    AUTH_N="${PLAN_STEP}"
+                    AUTH_M=$(grep -cE '^### Step [0-9]+' \
+                        "${WORKSPACE}/IMPLEMENTATION_PLAN.md" 2>/dev/null || echo 0)
+                    if [ "${AUTH_M}" -gt 0 ]; then
+                        CANONICAL_STEP_MARKER="[step:${AUTH_N}/${AUTH_M}]"
+                        if echo "${TAIGA_COMMENT}" | grep -qE '\[step:[^]]*\]'; then
+                            TAIGA_COMMENT=$(printf '%s' "${TAIGA_COMMENT}" \
+                                | sed -E "s#\\[step:[^]]*\\]#${CANONICAL_STEP_MARKER}#")
+                        else
+                            TAIGA_COMMENT="${CANONICAL_STEP_MARKER}\n\n${TAIGA_COMMENT}"
+                        fi
+                    elif ! echo "${TAIGA_COMMENT}" | grep -qF '[step:'; then
+                        # Plan unreadable / missing — fall back to the
+                        # in-progress marker so the orchestrator at least
+                        # sees *some* step marker.
+                        TAIGA_COMMENT="[step:in-progress]\n\n${TAIGA_COMMENT}"
+                    fi
                 fi
                 ;;
             onestep)

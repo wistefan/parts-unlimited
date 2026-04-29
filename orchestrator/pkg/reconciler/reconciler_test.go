@@ -414,11 +414,14 @@ func TestFindRepoForTicket(t *testing.T) {
 			wantRepo:  "example-repo",
 		},
 		{
-			name: "newest marker wins when multiple agents comment",
-			// newest-first: the top comment holds the authoritative repo.
+			name: "oldest marker wins when multiple agents comment",
+			// Comments are newest-first (the order GetComments returns),
+			// so the *last* element here is the oldest. The original
+			// claim sticks; later comments cannot rebind the canonical
+			// fork — see the godoc on FindRepoForTicket.
 			comments:  comments("**Repo:** `claude-2/forked`", "**Repo:** `claude/original`"),
-			wantOwner: "claude-2",
-			wantRepo:  "forked",
+			wantOwner: "claude",
+			wantRepo:  "original",
 		},
 	}
 	for _, tc := range tests {
