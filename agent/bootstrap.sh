@@ -477,6 +477,36 @@ else
     echo "No upstream URL on Gitea repo — greenfield or Gitea-native, skipping refresh."
 fi
 
+# --- Fetch base branch from parent fork if missing locally ---
+#
+# When the agent works on a Gitea fork and the base branch is a
+# ticket-level work branch (e.g. ticket-28/work), it only exists on
+# the parent repo, not on the fork.  Detect this via the `parent`
+# field Gitea sets on forked repos and pull the branch across.
+if ! git rev-parse --verify "origin/${BASE_BRANCH}" >/dev/null 2>&1; then
+    PARENT_FULL_NAME=$(echo "${REPO_METADATA}" | jq -r '.parent.full_name // ""' 2>/dev/null || true)
+    if [ -n "${PARENT_FULL_NAME}" ] && [ "${PARENT_FULL_NAME}" != "null" ]; then
+        PARENT_CLONE_URL="http://${GITEA_USERNAME}:${GITEA_PASSWORD}@${GITEA_HOST}/${PARENT_FULL_NAME}.git"
+        echo "Base branch ${BASE_BRANCH} not on fork — fetching from parent ${PARENT_FULL_NAME}..."
+        git remote add parent "${PARENT_CLONE_URL}" 2>/dev/null \
+            || git remote set-url parent "${PARENT_CLONE_URL}"
+        if git fetch parent "${BASE_BRANCH}" 2>/dev/null; then
+            git checkout -B "${BASE_BRANCH}" "parent/${BASE_BRANCH}"
+            if git push origin "${BASE_BRANCH}" 2>/dev/null; then
+                echo "  Pushed ${BASE_BRANCH} to fork from parent."
+            else
+                echo "  WARNING: Could not push ${BASE_BRANCH} to fork — continuing with local copy."
+            fi
+        else
+            echo "  ERROR: Could not fetch ${BASE_BRANCH} from parent ${PARENT_FULL_NAME}."
+            request_human_input "Base branch \`${BASE_BRANCH}\` does not exist on the fork or its parent repo. Please ensure it exists."
+        fi
+    else
+        echo "  ERROR: Base branch ${BASE_BRANCH} not found and repo is not a fork."
+        request_human_input "Base branch \`${BASE_BRANCH}\` does not exist on \`${REPO_OWNER}/${REPO_NAME}\`. Please ensure it exists."
+    fi
+fi
+
 # --- Determine branch ---
 
 BRANCH_PREFIX="ticket-${TICKET_ID}"
@@ -983,47 +1013,6 @@ echo "  Claude args: ${CLAUDE_ARGS[*]}"
 echo "  Prompt size: $(wc -c < "${PROMPT_FILE}") bytes"
 echo "  Session chaining: ${TURNS_PER_SESSION} turns/session, max ${MAX_SESSIONS} sessions"
 
-# push_metrics_to_pushgateway <result_file>
-# Parses the cumulative stream-json result and pushes Prometheus metrics to
-# the Pushgateway. No-op when PUSHGATEWAY_URL is unset (disables metrics
-# locally and in tests). Safe to call repeatedly during the run — the
-# Pushgateway replaces the group for the same label set, so the latest push
-# always reflects the most recent state.
-push_metrics_to_pushgateway() {
-    local result_file="$1"
-    if [ -z "${PUSHGATEWAY_URL:-}" ]; then
-        return 0
-    fi
-    local metrics_file="/tmp/agent-metrics.prom"
-    local duration=$((SECONDS - CLAUDE_START_SECONDS))
-
-    if ! python3 /home/agent/parse-usage.py "${result_file}" \
-            --format prometheus --duration "${duration}" \
-            > "${metrics_file}" 2>/dev/null; then
-        return 0
-    fi
-
-    # Pushgateway grouping path: job name first, then key/value pairs of
-    # identity labels. Labels with empty values would break the URL, so
-    # each optional label is appended only when set.
-    local url="${PUSHGATEWAY_URL}/metrics/job/agent-worker"
-    url="${url}/ticket_id/${TICKET_ID}"
-    url="${url}/agent_id/${AGENT_ID}"
-    url="${url}/mode/${MODE}"
-    url="${url}/specialization/${AGENT_SPECIALIZATION}"
-    if [ -n "${PLAN_STEP:-}" ]; then
-        url="${url}/plan_step/${PLAN_STEP}"
-    fi
-    if [ -n "${REPO_NAME:-}" ]; then
-        url="${url}/repo/${REPO_NAME}"
-    fi
-
-    if ! curl -sf -X POST --data-binary "@${metrics_file}" "${url}" > /dev/null 2>&1; then
-        echo "WARNING: Failed to push metrics to ${PUSHGATEWAY_URL}"
-    fi
-    rm -f "${metrics_file}"
-}
-
 CLAUDE_EXIT=0
 SESSION_NUM=0
 CUMULATIVE_RESULT="${RESULT_FILE}"
@@ -1294,11 +1283,6 @@ SLIM_EOF
     # Append session result to cumulative result for usage tracking
     cat "${SESSION_RESULT}" >> "${CUMULATIVE_RESULT}"
 
-    # Push metrics after every session so the Pushgateway always holds the
-    # latest state — if the pod is killed before the task completes, the
-    # partial usage is still captured.
-    push_metrics_to_pushgateway "${CUMULATIVE_RESULT}"
-
     # Check if the agent completed its task
     if [ -f "/home/agent/completion-status.json" ]; then
         echo "  Task completed in session ${SESSION_NUM}."
@@ -1360,7 +1344,7 @@ elif [ "${CLAUDE_EXIT}" -ne 0 ]; then
     tail -20 "${CUMULATIVE_RESULT}" || true
 fi
 
-# --- Extract token usage + push final metrics ---
+# --- Extract token usage ---
 
 USAGE_SUMMARY=""
 if [ -f "${RESULT_FILE}" ]; then
@@ -1371,9 +1355,6 @@ if [ -f "${RESULT_FILE}" ]; then
         echo "Token usage:"
         echo "${USAGE_SUMMARY}"
     fi
-
-    # Final push — includes the completed duration now that the loop exited.
-    push_metrics_to_pushgateway "${RESULT_FILE}"
 fi
 
 # --- Export transcript for Claude Spend ---

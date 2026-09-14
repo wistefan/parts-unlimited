@@ -321,6 +321,9 @@ func modeFromComments(comments []taiga.HistoryEntry) (string, string) {
 		return ModePlan, "analysis approved proceed"
 	}
 	if hasAnalysisNeedInfo {
+		if hasNewerNonMarkerComment(comments) {
+			return ModeAnalysis, "human replied after need-info — re-running analysis"
+		}
 		return "", "analysis needs info — waiting for human"
 	}
 	if !hasAnalysisProceed && !hasPlanCreated && !hasStep {
@@ -409,4 +412,29 @@ func hasStepCompleteMarker(comments []taiga.HistoryEntry) bool {
 		}
 	}
 	return false
+}
+
+// containsAnyLifecycleMarker reports whether a comment string contains
+// any recognised lifecycle marker.
+func containsAnyLifecycleMarker(c string) bool {
+	return strings.Contains(c, markerStepComplete) ||
+		strings.Contains(c, markerStepPrefix) ||
+		strings.Contains(c, markerFixApplied) ||
+		strings.Contains(c, markerPhasePlanCreated) ||
+		strings.Contains(c, markerAnalysisOneStepOK) ||
+		strings.Contains(c, markerAnalysisOneStepReject) ||
+		strings.Contains(c, markerAnalysisProceed) ||
+		strings.Contains(c, markerAnalysisNeedInfo)
+}
+
+// hasNewerNonMarkerComment reports whether the newest comment in the
+// slice (index 0, since comments are sorted newest-first) does not
+// contain any lifecycle marker. This detects the case where a human
+// replied with additional information after an agent posted
+// [analysis:need-info].
+func hasNewerNonMarkerComment(comments []taiga.HistoryEntry) bool {
+	if len(comments) == 0 {
+		return false
+	}
+	return !containsAnyLifecycleMarker(comments[0].Comment)
 }

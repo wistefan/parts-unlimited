@@ -18,7 +18,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
@@ -27,7 +26,6 @@ import (
 	"github.com/wistefan/dev-env/orchestrator/pkg/gitea"
 	"github.com/wistefan/dev-env/orchestrator/pkg/identity"
 	"github.com/wistefan/dev-env/orchestrator/pkg/lifecycle"
-	"github.com/wistefan/dev-env/orchestrator/pkg/metrics"
 	"github.com/wistefan/dev-env/orchestrator/pkg/notifications"
 	"github.com/wistefan/dev-env/orchestrator/pkg/reconciler"
 	"github.com/wistefan/dev-env/orchestrator/pkg/review"
@@ -132,16 +130,10 @@ func main() {
 		log.Printf("  Webhooks must be configured manually or the orchestrator will rely on polling only.")
 	}
 
-	// Queue depth is the count of tickets in "ready" status. The
-	// reconciler will pick them up on its next pass; they are the
-	// effective queue, sourced from Taiga directly.
-	metrics.RegisterQueueDepth(orch.readyTicketCount)
-
 	// Start HTTP server
 	mux := http.NewServeMux()
 	mux.Handle("/webhooks/taiga", orch.webhookHandler)
 	mux.Handle("/webhooks/gitea", orch.giteaWebhookHandler)
-	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ok")
@@ -361,6 +353,14 @@ func (o *orchestrator) registerWebhookHandlers() {
 		// Re-run analysis regardless of ticket status (ready or in-progress).
 		if o.isTicketUnassigned(event) {
 			log.Printf("Ticket #%d: unassigned, nudging reconciler", data.ID)
+			o.nudgeReconciler(data.ID)
+			return nil
+		}
+
+		// A comment was added — nudge so the reconciler can detect human
+		// replies to [analysis:need-info].
+		if event.Change != nil && event.Change.Comment != "" {
+			log.Printf("Ticket #%d: new comment, nudging reconciler", data.ID)
 			o.nudgeReconciler(data.ID)
 			return nil
 		}
@@ -1017,21 +1017,6 @@ func (o *orchestrator) pickAgentForTicketWithBusy(ticketID int, busy map[string]
 
 	log.Printf("Ticket #%d: continuing with previous agent %s", ticketID, prev)
 	return a, nil
-}
-
-// readyTicketCount returns the number of Taiga user stories currently
-// in "ready" status. Used as the orchestrator_queue_depth metric on
-// each Prometheus scrape. Errors are logged and the gauge reports 0,
-// preserving the rule that no orchestrator-side state crosses passes.
-func (o *orchestrator) readyTicketCount() int {
-	stories, err := o.taigaClient.ListUserStories(o.projectID, &taiga.UserStoryListOptions{
-		StatusID: o.readyStatusID,
-	})
-	if err != nil {
-		log.Printf("WARNING: queue-depth metric: listing ready tickets: %v", err)
-		return 0
-	}
-	return len(stories)
 }
 
 // nudgeReconciler runs ReconcileTicket in a goroutine so the webhook

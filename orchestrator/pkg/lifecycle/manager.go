@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"sync"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -14,8 +13,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-
-	"github.com/wistefan/dev-env/orchestrator/pkg/metrics"
 )
 
 const (
@@ -94,21 +91,10 @@ type JobStatus struct {
 	StartTime *time.Time
 }
 
-// trackedJob captures the data needed to emit completion metrics for a Job
-// at the moment it first transitions to a terminal state.
-type trackedJob struct {
-	mode           string
-	specialization string
-	startTime      time.Time
-}
-
 // Manager manages agent worker Kubernetes Jobs.
 type Manager struct {
 	clientset kubernetes.Interface
 	config    *Config
-
-	mu       sync.RWMutex
-	tracking map[string]trackedJob // job name -> metrics-tracking data (dedups completion observations)
 }
 
 // NewManager creates a new lifecycle manager.
@@ -119,38 +105,7 @@ func NewManager(clientset kubernetes.Interface, config *Config) *Manager {
 	return &Manager{
 		clientset: clientset,
 		config:    config,
-		tracking:  make(map[string]trackedJob),
 	}
-}
-
-// trackJobCreation records the data needed to emit completion metrics
-// later and increments the jobs-created counter.
-func (m *Manager) trackJobCreation(jobName, mode, specialization string) {
-	m.mu.Lock()
-	m.tracking[jobName] = trackedJob{
-		mode:           mode,
-		specialization: specialization,
-		startTime:      time.Now(),
-	}
-	m.mu.Unlock()
-	metrics.JobsCreated.WithLabelValues(mode, specialization).Inc()
-}
-
-// observeCompletion emits the completion metrics for a Job at most once.
-// Subsequent calls for the same jobName are no-ops. `status` should be one
-// of metrics.JobStatus{Succeeded,Failed,Timeout}.
-func (m *Manager) observeCompletion(jobName, status string) {
-	m.mu.Lock()
-	tj, ok := m.tracking[jobName]
-	if !ok {
-		m.mu.Unlock()
-		return
-	}
-	delete(m.tracking, jobName)
-	m.mu.Unlock()
-
-	metrics.JobsCompleted.WithLabelValues(tj.mode, tj.specialization, status).Inc()
-	metrics.JobDuration.WithLabelValues(tj.mode, tj.specialization).Observe(time.Since(tj.startTime).Seconds())
 }
 
 // JobName generates a deterministic job name for an agent/ticket/mode combination.
@@ -376,12 +331,6 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 		return "", fmt.Errorf("creating job %s: %w", jobName, err)
 	}
 
-	mode := spec.Mode
-	if mode == "" {
-		mode = "step"
-	}
-	m.trackJobCreation(jobName, mode, spec.Specialization)
-
 	log.Printf("Created job %s for agent %s on ticket %d", created.Name, spec.AgentID, spec.TicketID)
 	return created.Name, nil
 }
@@ -422,7 +371,6 @@ func (m *Manager) GetJobStatus(ctx context.Context, jobName string) (*JobStatus,
 		status.StartTime = &t
 	}
 
-	var failureReason string
 	for _, cond := range job.Status.Conditions {
 		switch cond.Type {
 		case batchv1.JobComplete:
@@ -432,21 +380,7 @@ func (m *Manager) GetJobStatus(ctx context.Context, jobName string) (*JobStatus,
 		case batchv1.JobFailed:
 			if cond.Status == corev1.ConditionTrue {
 				status.Failed = true
-				failureReason = cond.Reason
 			}
-		}
-	}
-
-	// Emit completion metrics exactly once per job. "DeadlineExceeded" is
-	// Kubernetes's reason code when ActiveDeadlineSeconds fires, which is
-	// semantically distinct from other failures and worth labeling.
-	if status.Succeeded {
-		m.observeCompletion(jobName, metrics.JobStatusSucceeded)
-	} else if status.Failed {
-		if failureReason == "DeadlineExceeded" {
-			m.observeCompletion(jobName, metrics.JobStatusTimeout)
-		} else {
-			m.observeCompletion(jobName, metrics.JobStatusFailed)
 		}
 	}
 
@@ -643,15 +577,6 @@ func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: "agent-service-endpoints"},
 					Key:                  "TAIGA_URL",
-				},
-			},
-		},
-		corev1.EnvVar{
-			Name: "PUSHGATEWAY_URL",
-			ValueFrom: &corev1.EnvVarSource{
-				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: "agent-service-endpoints"},
-					Key:                  "PUSHGATEWAY_URL",
 				},
 			},
 		},

@@ -166,6 +166,13 @@ func TestListPullRequestsForTicket(t *testing.T) {
 				{Number: 4, Title: "different ticket", Head: PRRef{Ref: "ticket-11/plan"}},
 				{Number: 5, Title: "prefix lookalike", Head: PRRef{Ref: "ticket-100/plan"}},
 				{Number: 6, Title: "bare name", Head: PRRef{Ref: "ticket-10"}},
+				// Branch deleted after merge: Gitea rewrites Ref to the
+				// synthetic pull ref, but Label keeps the branch name.
+				{Number: 7, Title: "merged, branch deleted", Head: PRRef{Ref: "refs/pull/7/head", Label: "ticket-10/step-2"}},
+				// Cross-repo PR: Label carries an "{owner}:" prefix.
+				{Number: 8, Title: "cross-repo", Head: PRRef{Ref: "refs/pull/8/head", Label: "fork-owner:ticket-10/step-3"}},
+				// Deleted branch belonging to a different ticket.
+				{Number: 9, Title: "other ticket, deleted", Head: PRRef{Ref: "refs/pull/9/head", Label: "ticket-11/step-1"}},
 			})
 		},
 	})
@@ -174,12 +181,17 @@ func TestListPullRequestsForTicket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPullRequestsForTicket: %v", err)
 	}
-	if len(prs) != 2 {
-		t.Fatalf("expected 2 PRs for ticket 10, got %d: %+v", len(prs), prs)
+	if len(prs) != 4 {
+		t.Fatalf("expected 4 PRs for ticket 10, got %d: %+v", len(prs), prs)
 	}
-	gotNumbers := map[int]bool{prs[0].Number: true, prs[1].Number: true}
-	if !gotNumbers[1] || !gotNumbers[2] {
-		t.Errorf("expected PRs #1 and #2, got %v", gotNumbers)
+	gotNumbers := map[int]bool{}
+	for _, pr := range prs {
+		gotNumbers[pr.Number] = true
+	}
+	for _, want := range []int{1, 2, 7, 8} {
+		if !gotNumbers[want] {
+			t.Errorf("expected PR #%d in results, got %v", want, gotNumbers)
+		}
 	}
 }
 

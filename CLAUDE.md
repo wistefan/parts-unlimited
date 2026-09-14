@@ -82,7 +82,6 @@ The entry point is `cmd/orchestrator/main.go` (~1600 lines) which wires everythi
 | `pkg/plan` | Markdown plan parsing, step tracking, release notes |
 | `pkg/notifications` | Webhook + desktop notification dispatch |
 | `pkg/config` | YAML config loading with defaults |
-| `pkg/metrics` | Prometheus metric definitions + /metrics handler registration |
 
 ### Ticket Lifecycle & Agent Modes
 
@@ -117,20 +116,10 @@ Fix agents are spawned when a human requests changes on any PR.
 In-cluster service URLs:
 - Gitea: `http://gitea-http.gitea.svc.cluster.local:3001`
 - Taiga: `http://taiga-gateway.taiga.svc.cluster.local:9000`
-- Pushgateway: `http://pushgateway.monitoring.svc.cluster.local:9091` (injected into agent pods as `PUSHGATEWAY_URL`)
-- Prometheus: `http://prometheus.monitoring.svc.cluster.local:9090`
 
-External URLs: Gitea at `http://localhost:3001`, Taiga at `http://localhost:9000`, Grafana at `http://localhost:3000` (admin/password), Prometheus at `http://localhost:9090`.
+External URLs: Gitea at `http://localhost:3001`, Taiga at `http://localhost:9000`.
 
 ## Observability
-
-Token usage and job metrics flow through a Prometheus stack:
-
-- Agent pods push per-turn, per-session, per-tool, and job-level gauges to the Pushgateway at the end of every session via `agent/parse-usage.py` (run from `bootstrap.sh`).
-- The orchestrator exposes `/metrics` on port 8080 with job create/complete counters, job-duration histograms, a queue-depth gauge, and review-invocation counters.
-- Three provisioned Grafana dashboards (under `k8s/monitoring/grafana-dashboards.yaml`) cover: Token Usage Overview, Cache Efficiency, and Tool Usage & Attribution.
-
-Dashboards, scrape config, and pushgateway network access are deployed by `./scripts/setup.sh` (step 5 — "Monitoring"). Disable metrics push per-run by unsetting `PUSHGATEWAY_URL` in the agent environment.
 
 ### Claude Spend integration
 

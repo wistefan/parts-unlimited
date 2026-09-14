@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -197,16 +198,35 @@ func (c *Client) ListPullRequestsForTicket(owner, repo string, ticketID int) ([]
 	prefix := fmt.Sprintf(ticketBranchPrefixFmt, ticketID)
 	var matches []PullRequest
 	for _, pr := range all {
-		if pr.Head.Ref == "" {
-			continue
-		}
-		// Exact-prefix match — a stray branch literally named `ticket-10`
-		// should not look like a ticket-10 PR; only `ticket-10/...` does.
-		if len(pr.Head.Ref) >= len(prefix) && pr.Head.Ref[:len(prefix)] == prefix {
+		if headBranchMatchesTicket(pr.Head, prefix) {
 			matches = append(matches, pr)
 		}
 	}
 	return matches, nil
+}
+
+// headBranchMatchesTicket reports whether a PR's head branch belongs to
+// the ticket identified by prefix (e.g. "ticket-45/").
+//
+// It checks both Head.Ref and Head.Label because Gitea rewrites Head.Ref
+// to the synthetic pull ref "refs/pull/{n}/head" once the source branch
+// is deleted — which routinely happens after a plan/step PR is merged
+// with "delete branch on merge" enabled. Head.Label continues to carry
+// the original branch name in that case. For cross-repo PRs the label is
+// prefixed with "{owner}:", which is stripped before matching.
+//
+// The match is an exact-prefix match: a stray branch literally named
+// `ticket-4` must not look like a `ticket-45/...` PR, only `ticket-45/...`
+// does.
+func headBranchMatchesTicket(head PRRef, prefix string) bool {
+	if strings.HasPrefix(head.Ref, prefix) {
+		return true
+	}
+	label := head.Label
+	if idx := strings.IndexByte(label, ':'); idx >= 0 {
+		label = label[idx+1:]
+	}
+	return strings.HasPrefix(label, prefix)
 }
 
 // GetPullRequest retrieves a single pull request.

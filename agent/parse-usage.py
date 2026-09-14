@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 """Parse Claude Code stream-json output and emit token usage metrics.
 
-Two output formats are supported:
-
-* ``markdown`` — a compact, human-readable table meant for Taiga ticket
-  comments. Preserves the shape of the legacy inline summary so existing
-  downstream consumers keep working.
-* ``prometheus`` — exposition-format text for the Prometheus Pushgateway.
-  Emits job-level gauges, plus per-session, per-turn, and per-tool-call
-  gauges labeled by session, turn, and tool name. Common identity labels
-  (``ticket_id``, ``agent_id``, ``mode``, ...) are applied by the
-  Pushgateway via the URL grouping path and are not embedded here.
+Produces a compact, human-readable markdown table meant for Taiga ticket
+comments. Preserves the shape of the legacy inline summary so existing
+downstream consumers keep working.
 
 The input file is the ``--output-format stream-json`` output of one or
 more ``claude`` invocations concatenated together. Sessions are delimited
@@ -193,105 +186,6 @@ def format_markdown(sessions: List[Session]) -> str:
     return "\n".join(rows)
 
 
-def _escape_label_value(value: str) -> str:
-    """Escape a Prometheus label value per the exposition format spec."""
-    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-
-
-def format_prometheus(sessions: List[Session], duration_seconds: float) -> str:
-    """Render Prometheus exposition text for job/session/turn/tool metrics."""
-    lines: List[str] = []
-    total_input, total_output, total_cache_write, total_cache_read, total_turns = _job_totals(
-        sessions
-    )
-
-    job_metrics = [
-        ("agent_tokens_input_total", total_input),
-        ("agent_tokens_output_total", total_output),
-        ("agent_tokens_cache_write_total", total_cache_write),
-        ("agent_tokens_cache_read_total", total_cache_read),
-        ("agent_turns_total", total_turns),
-        ("agent_sessions_total", len(sessions)),
-        ("agent_duration_seconds", duration_seconds),
-    ]
-    for name, value in job_metrics:
-        lines.append(f"# TYPE {name} gauge")
-        lines.append(f"{name} {value}")
-
-    session_declared: List[str] = []
-
-    def declare_session(name: str) -> None:
-        if name not in session_declared:
-            lines.append(f"# TYPE {name} gauge")
-            session_declared.append(name)
-
-    for s in sessions:
-        label = f'session="{s.number}"'
-        for name, value in [
-            ("agent_session_tokens_input", s.input_tokens),
-            ("agent_session_tokens_output", s.output_tokens),
-            ("agent_session_tokens_cache_write", s.cache_write),
-            ("agent_session_tokens_cache_read", s.cache_read),
-            ("agent_session_turns", len(s.turns)),
-            ("agent_session_cache_hit_ratio", round(s.cache_hit_ratio, 6)),
-            ("agent_session_prompt_bytes", s.prompt_bytes),
-        ]:
-            declare_session(name)
-            lines.append(f"{name}{{{label}}} {value}")
-
-    turn_declared: List[str] = []
-
-    def declare_turn(name: str) -> None:
-        if name not in turn_declared:
-            lines.append(f"# TYPE {name} gauge")
-            turn_declared.append(name)
-
-    for s in sessions:
-        for t in s.turns:
-            label = f'session="{t.session}",turn="{t.turn}"'
-            for name, value in [
-                ("agent_turn_tokens_input", t.input_tokens),
-                ("agent_turn_tokens_output", t.output_tokens),
-                ("agent_turn_tokens_cache_write", t.cache_write),
-                ("agent_turn_tokens_cache_read", t.cache_read),
-                ("agent_turn_cache_hit_ratio", round(t.cache_hit_ratio, 6)),
-            ]:
-                declare_turn(name)
-                lines.append(f"{name}{{{label}}} {value}")
-
-    # Tool-use: aggregate counts per (session, turn, tool) to avoid duplicate
-    # label sets when the same tool is called multiple times in one turn.
-    # ``agent_tool_tokens_after`` is a proxy for tool-result size — the
-    # cumulative input+cache_read tokens observed on the turn immediately
-    # following the tool call. Multiple tools in the same turn share this
-    # value, which is an accepted attribution limitation.
-    tool_call_counts: dict = {}
-    tool_tokens_after: dict = {}
-    for s in sessions:
-        for idx, t in enumerate(s.turns):
-            next_tokens = 0
-            if idx + 1 < len(s.turns):
-                nxt = s.turns[idx + 1]
-                next_tokens = nxt.input_tokens + nxt.cache_read
-            for tool in t.tools:
-                key = (t.session, t.turn, tool)
-                tool_call_counts[key] = tool_call_counts.get(key, 0) + 1
-                tool_tokens_after[key] = next_tokens
-
-    if tool_call_counts:
-        lines.append("# TYPE agent_tool_calls_total gauge")
-        lines.append("# TYPE agent_tool_tokens_after gauge")
-        for (session, turn, tool), count in tool_call_counts.items():
-            labels = (
-                f'session="{session}",turn="{turn}",tool="{_escape_label_value(tool)}"'
-            )
-            lines.append(f"agent_tool_calls_total{{{labels}}} {count}")
-            lines.append(f"agent_tool_tokens_after{{{labels}}} {tool_tokens_after[(session, turn, tool)]}")
-
-    lines.append("")
-    return "\n".join(lines)
-
-
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
@@ -299,24 +193,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument(
         "--format",
-        choices=["markdown", "prometheus"],
+        choices=["markdown"],
         default="markdown",
         help="Output format (default: markdown).",
-    )
-    parser.add_argument(
-        "--duration",
-        type=float,
-        default=0.0,
-        help="Wall-clock job duration in seconds (prometheus format only).",
     )
     args = parser.parse_args(argv)
 
     sessions = parse_stream_json(args.result_file)
-
-    if args.format == "markdown":
-        print(format_markdown(sessions))
-    else:
-        sys.stdout.write(format_prometheus(sessions, args.duration))
+    print(format_markdown(sessions))
     return 0
 
 
