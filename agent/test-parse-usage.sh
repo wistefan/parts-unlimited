@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Unit tests for parse-usage.py.
-# Builds synthetic stream-json fixtures and asserts on both markdown and
-# Prometheus outputs. Runs without a Claude invocation.
+# Builds synthetic stream-json fixtures and asserts on markdown output.
+# Runs without a Claude invocation.
 
 set -euo pipefail
 
@@ -88,31 +88,6 @@ assert_contains "markdown: turn count"        "| Turns | 2 |" "${OUT}"
 assert_contains "markdown: session count"     "| Sessions | 1 |" "${OUT}"
 assert_contains "markdown: has total row"     "| **Total** |" "${OUT}"
 
-PROM=$(python3 "${PARSER}" "${FIXTURE_1}" --format prometheus --duration 12.5)
-assert_contains "prom: input total metric"        "agent_tokens_input_total 120" "${PROM}"
-assert_contains "prom: output total metric"       "agent_tokens_output_total 80" "${PROM}"
-assert_contains "prom: cache write total metric"  "agent_tokens_cache_write_total 400" "${PROM}"
-assert_contains "prom: cache read total metric"   "agent_tokens_cache_read_total 480" "${PROM}"
-assert_contains "prom: turns total"               "agent_turns_total 2" "${PROM}"
-assert_contains "prom: sessions total"            "agent_sessions_total 1" "${PROM}"
-assert_contains "prom: duration seconds"          "agent_duration_seconds 12.5" "${PROM}"
-
-# Per-session
-assert_contains "prom: session 1 input"           'agent_session_tokens_input{session="1"} 120' "${PROM}"
-assert_contains "prom: session 1 cache hit ratio" 'agent_session_cache_hit_ratio{session="1"} 0.8' "${PROM}"
-
-# Per-turn
-assert_contains "prom: turn 1 input"              'agent_turn_tokens_input{session="1",turn="1"} 100' "${PROM}"
-assert_contains "prom: turn 2 cache read"         'agent_turn_tokens_cache_read{session="1",turn="2"} 480' "${PROM}"
-
-# Tool attribution: Read in turn 1, Bash in turn 2. agent_tool_tokens_after
-# for the Read call should be turn 2's input (20) + cache_read (480) = 500.
-assert_contains "prom: Read tool call in turn 1"  'agent_tool_calls_total{session="1",turn="1",tool="Read"} 1' "${PROM}"
-assert_contains "prom: Read tokens_after=500"     'agent_tool_tokens_after{session="1",turn="1",tool="Read"} 500' "${PROM}"
-assert_contains "prom: Bash tool call in turn 2"  'agent_tool_calls_total{session="1",turn="2",tool="Bash"} 1' "${PROM}"
-# No next turn for Bash, so tokens_after should be 0
-assert_contains "prom: Bash tokens_after=0"       'agent_tool_tokens_after{session="1",turn="2",tool="Bash"} 0' "${PROM}"
-
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -128,13 +103,10 @@ EOF
 
 echo "Two sessions:"
 
-PROM2=$(python3 "${PARSER}" "${FIXTURE_2}" --format prometheus)
-assert_contains "prom: sessions=2"           "agent_sessions_total 2" "${PROM2}"
-assert_contains "prom: session 1 input=10"   'agent_session_tokens_input{session="1"} 10' "${PROM2}"
-assert_contains "prom: session 2 input=7"    'agent_session_tokens_input{session="2"} 7' "${PROM2}"
-# Each session restarts its own turn counter.
-assert_contains "prom: s1 turn 1"            'agent_turn_tokens_input{session="1",turn="1"} 10' "${PROM2}"
-assert_contains "prom: s2 turn 1"            'agent_turn_tokens_input{session="2",turn="1"} 7' "${PROM2}"
+OUT2=$(python3 "${PARSER}" "${FIXTURE_2}" --format markdown)
+assert_contains "markdown: two-session input total"  "17" "${OUT2}"
+assert_contains "markdown: two-session output total" "8" "${OUT2}"
+assert_contains "markdown: two-session sessions"     "| Sessions | 2 |" "${OUT2}"
 
 echo ""
 
@@ -150,13 +122,8 @@ EOF
 
 echo "Edge cases:"
 
-PROM3=$(python3 "${PARSER}" "${FIXTURE_3}" --format prometheus)
-assert_contains "prom: malformed line skipped, session=1" "agent_sessions_total 1" "${PROM3}"
-# Read called twice in the same turn → single label set with count=2
-assert_contains "prom: duplicate tool count aggregated"   'agent_tool_calls_total{session="1",turn="1",tool="Read"} 2' "${PROM3}"
-# Should not produce two separate lines for the same tool/turn
-DUP_COUNT=$(printf '%s\n' "${PROM3}" | grep -c 'agent_tool_calls_total{session="1",turn="1",tool="Read"}' || true)
-assert_eq "prom: only one line for the aggregated tool" "1" "${DUP_COUNT}"
+OUT3=$(python3 "${PARSER}" "${FIXTURE_3}" --format markdown)
+assert_contains "markdown: malformed line skipped, sessions=1" "| Sessions | 1 |" "${OUT3}"
 
 echo ""
 
@@ -172,11 +139,6 @@ OUT4=$(python3 "${PARSER}" "${FIXTURE_4}" --format markdown)
 assert_contains "markdown: empty still renders header"   "| Metric | Tokens |" "${OUT4}"
 assert_contains "markdown: empty has zero turns"         "| Turns | 0 |" "${OUT4}"
 assert_contains "markdown: empty has zero sessions"      "| Sessions | 0 |" "${OUT4}"
-
-PROM4=$(python3 "${PARSER}" "${FIXTURE_4}" --format prometheus)
-assert_contains "prom: empty still emits job gauges"     "agent_tokens_input_total 0" "${PROM4}"
-assert_not_contains "prom: no per-session metrics"       "agent_session_tokens_input{" "${PROM4}"
-assert_not_contains "prom: no tool metrics"              "agent_tool_calls_total{" "${PROM4}"
 
 echo ""
 echo "=== Results: ${PASS} passed, ${FAIL} failed ==="

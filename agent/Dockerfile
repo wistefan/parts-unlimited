@@ -81,6 +81,8 @@ COPY --chown=agent:agent system-prompt-analysis.md /home/agent/system-prompt-ana
 COPY --chown=agent:agent system-prompt-plan.md /home/agent/system-prompt-plan.md
 COPY --chown=agent:agent system-prompt-step.md /home/agent/system-prompt-step.md
 COPY --chown=agent:agent system-prompt-fix.md /home/agent/system-prompt-fix.md
+COPY --chown=agent:agent system-prompt-onestep.md /home/agent/system-prompt-onestep.md
+COPY --chown=agent:agent system-prompt-review.md /home/agent/system-prompt-review.md
 
 # Claude Code PreToolUse hooks — currently: truncate large Bash output so
 # multi-KB tool results do not accumulate in the per-turn cache.

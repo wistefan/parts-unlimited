@@ -166,6 +166,13 @@ func TestListPullRequestsForTicket(t *testing.T) {
 				{Number: 4, Title: "different ticket", Head: PRRef{Ref: "ticket-11/plan"}},
 				{Number: 5, Title: "prefix lookalike", Head: PRRef{Ref: "ticket-100/plan"}},
 				{Number: 6, Title: "bare name", Head: PRRef{Ref: "ticket-10"}},
+				// Branch deleted after merge: Gitea rewrites Ref to the
+				// synthetic pull ref, but Label keeps the branch name.
+				{Number: 7, Title: "merged, branch deleted", Head: PRRef{Ref: "refs/pull/7/head", Label: "ticket-10/step-2"}},
+				// Cross-repo PR: Label carries an "{owner}:" prefix.
+				{Number: 8, Title: "cross-repo", Head: PRRef{Ref: "refs/pull/8/head", Label: "fork-owner:ticket-10/step-3"}},
+				// Deleted branch belonging to a different ticket.
+				{Number: 9, Title: "other ticket, deleted", Head: PRRef{Ref: "refs/pull/9/head", Label: "ticket-11/step-1"}},
 			})
 		},
 	})
@@ -174,12 +181,17 @@ func TestListPullRequestsForTicket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPullRequestsForTicket: %v", err)
 	}
-	if len(prs) != 2 {
-		t.Fatalf("expected 2 PRs for ticket 10, got %d: %+v", len(prs), prs)
+	if len(prs) != 4 {
+		t.Fatalf("expected 4 PRs for ticket 10, got %d: %+v", len(prs), prs)
 	}
-	gotNumbers := map[int]bool{prs[0].Number: true, prs[1].Number: true}
-	if !gotNumbers[1] || !gotNumbers[2] {
-		t.Errorf("expected PRs #1 and #2, got %v", gotNumbers)
+	gotNumbers := map[int]bool{}
+	for _, pr := range prs {
+		gotNumbers[pr.Number] = true
+	}
+	for _, want := range []int{1, 2, 7, 8} {
+		if !gotNumbers[want] {
+			t.Errorf("expected PR #%d in results, got %v", want, gotNumbers)
+		}
 	}
 }
 
@@ -359,5 +371,101 @@ func TestCreateRepoWebhook(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("CreateRepoWebhook: %v", err)
+	}
+}
+
+// TestGetPullRequestParsesHeadSHA pins the head-SHA field the reconciler
+// uses to decide whether a PR has gained commits since its last
+// automated review. Without it every PR looks unreviewed forever.
+func TestGetPullRequestParsesHeadSHA(t *testing.T) {
+	const wantSHA = "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567"
+
+	_, client := setupTestServer(t, map[string]http.HandlerFunc{
+		"/api/v1/repos/owner/repo/pulls/1": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			// Raw JSON rather than the struct: the point is that the
+			// wire field `head.sha` is decoded.
+			w.Write([]byte(`{
+				"id": 1, "number": 1, "title": "Step 1", "state": "open",
+				"head": {"label": "ticket-1/step-1", "ref": "ticket-1/step-1", "sha": "` + wantSHA + `"},
+				"base": {"label": "ticket-1/work", "ref": "ticket-1/work", "sha": "aaaa"}
+			}`))
+		},
+	})
+
+	pr, err := client.GetPullRequest("owner", "repo", 1)
+	if err != nil {
+		t.Fatalf("GetPullRequest: %v", err)
+	}
+	if pr.Head.Sha != wantSHA {
+		t.Errorf("head SHA: got %q, want %q", pr.Head.Sha, wantSHA)
+	}
+	if pr.Base.Sha != "aaaa" {
+		t.Errorf("base SHA: got %q, want %q", pr.Base.Sha, "aaaa")
+	}
+}
+
+// TestCreateReviewWithInlineComments checks that inline code comments
+// reach Gitea in the shape its reviews API expects.
+func TestCreateReviewWithInlineComments(t *testing.T) {
+	_, client := setupTestServer(t, map[string]http.HandlerFunc{
+		"/api/v1/repos/owner/repo/pulls/1/reviews": func(w http.ResponseWriter, r *http.Request) {
+			var body CreateReviewRequest
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decoding request: %v", err)
+			}
+			if body.Event != "COMMENT" {
+				t.Errorf("expected event='COMMENT', got %q", body.Event)
+			}
+			if len(body.Comments) != 1 {
+				t.Fatalf("expected 1 inline comment, got %d", len(body.Comments))
+			}
+			c := body.Comments[0]
+			if c.Path != "pkg/foo/bar.go" {
+				t.Errorf("path: got %q", c.Path)
+			}
+			if c.NewLine != 42 {
+				t.Errorf("new_position: got %d, want 42", c.NewLine)
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(Review{ID: 1, Body: body.Body, State: "COMMENT"})
+		},
+	})
+
+	_, err := client.CreateReview("owner", "repo", 1, &CreateReviewRequest{
+		Body:  "Summary",
+		Event: "COMMENT",
+		Comments: []CreateReviewComment{
+			{Path: "pkg/foo/bar.go", Body: "This can overflow.", NewLine: 42},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateReview: %v", err)
+	}
+}
+
+// TestCreateReviewOmitsEmptyComments guards the summary-only case: an
+// empty Comments slice must not appear in the payload at all, since
+// Gitea rejects an empty comments array on some versions.
+func TestCreateReviewOmitsEmptyComments(t *testing.T) {
+	_, client := setupTestServer(t, map[string]http.HandlerFunc{
+		"/api/v1/repos/owner/repo/pulls/1/reviews": func(w http.ResponseWriter, r *http.Request) {
+			var raw map[string]interface{}
+			if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+				t.Fatalf("decoding request: %v", err)
+			}
+			if _, present := raw["comments"]; present {
+				t.Errorf("comments key should be omitted when empty, got %v", raw["comments"])
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(Review{ID: 1, State: "COMMENT"})
+		},
+	})
+
+	if _, err := client.CreateReview("owner", "repo", 1, &CreateReviewRequest{
+		Body:  "Summary only",
+		Event: "COMMENT",
+	}); err != nil {
+		t.Fatalf("CreateReview: %v", err)
 	}
 }

@@ -15,8 +15,38 @@ Your identity and current task are provided in the task prompt. Always commit un
 
 # Code Quality
 
-- Every public method must be documented according to the language's conventions (GoDoc, JSDoc, docstrings, etc.).
-- Every class, struct with methods, or module must be documented.
+- Every public method, and every class/struct-with-methods/module, must carry a
+  doc comment in the language's native convention (GoDoc, JSDoc, docstring, ...).
+- **Write them short and dense.** One line saying what it is and why it exists.
+  Add a second line only for a contract the signature cannot show: ownership,
+  nil/error semantics, units, concurrency, side effects, invariants. Beyond
+  three lines you are almost certainly padding.
+- Do not restate the signature. No `@param`/`@return`/`Args:` blocks that only
+  echo names and types, no usage examples for an obvious API, no prose that
+  walks through the body step by step, no "This function ..." preamble.
+- Document what a reader cannot infer. If a line adds nothing beyond the name
+  and the types, delete it.
+
+  ```go
+  // Bad
+  // GetUserByID retrieves a user by their ID. It takes a context and an id
+  // parameter, queries the database for the matching user record, and returns
+  // the user and an error.
+  //
+  // Parameters:
+  //   - ctx: the context
+  //   - id: the user's ID
+  //
+  // Returns the user, or an error if the lookup fails.
+
+  // Good
+  // GetUserByID loads a user. Returns ErrNotFound when no row matches.
+  ```
+
+- Inline comments explain *why*, never *what*. If the code already says it,
+  leave it out.
+- Match the comment density of the surrounding file. Never hand back a file
+  wordier than you found it, and do not add docs to code you did not touch.
 - Never use magic constants. Define named constants with descriptive names.
 - Use parameterized tests where possible.
 - Follow the language's idiomatic style and best practices.

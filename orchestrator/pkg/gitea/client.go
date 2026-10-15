@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -119,6 +120,11 @@ type PullRequest struct {
 type PRRef struct {
 	Label string `json:"label"`
 	Ref   string `json:"ref"`
+	// Sha is the commit the ref pointed at when the PR was fetched. For
+	// the head ref this is the revision a reviewer actually looked at,
+	// which is how the reconciler decides whether a PR has gained new
+	// commits since its last automated review.
+	Sha string `json:"sha"`
 }
 
 // CreatePullRequest creates a new pull request.
@@ -197,16 +203,35 @@ func (c *Client) ListPullRequestsForTicket(owner, repo string, ticketID int) ([]
 	prefix := fmt.Sprintf(ticketBranchPrefixFmt, ticketID)
 	var matches []PullRequest
 	for _, pr := range all {
-		if pr.Head.Ref == "" {
-			continue
-		}
-		// Exact-prefix match — a stray branch literally named `ticket-10`
-		// should not look like a ticket-10 PR; only `ticket-10/...` does.
-		if len(pr.Head.Ref) >= len(prefix) && pr.Head.Ref[:len(prefix)] == prefix {
+		if headBranchMatchesTicket(pr.Head, prefix) {
 			matches = append(matches, pr)
 		}
 	}
 	return matches, nil
+}
+
+// headBranchMatchesTicket reports whether a PR's head branch belongs to
+// the ticket identified by prefix (e.g. "ticket-45/").
+//
+// It checks both Head.Ref and Head.Label because Gitea rewrites Head.Ref
+// to the synthetic pull ref "refs/pull/{n}/head" once the source branch
+// is deleted — which routinely happens after a plan/step PR is merged
+// with "delete branch on merge" enabled. Head.Label continues to carry
+// the original branch name in that case. For cross-repo PRs the label is
+// prefixed with "{owner}:", which is stripped before matching.
+//
+// The match is an exact-prefix match: a stray branch literally named
+// `ticket-4` must not look like a `ticket-45/...` PR, only `ticket-45/...`
+// does.
+func headBranchMatchesTicket(head PRRef, prefix string) bool {
+	if strings.HasPrefix(head.Ref, prefix) {
+		return true
+	}
+	label := head.Label
+	if idx := strings.IndexByte(label, ':'); idx >= 0 {
+		label = label[idx+1:]
+	}
+	return strings.HasPrefix(label, prefix)
 }
 
 // GetPullRequest retrieves a single pull request.
@@ -266,8 +291,23 @@ func (c *Client) CreateReview(owner, repo string, prNumber int, review *CreateRe
 
 // CreateReviewRequest holds parameters for creating a PR review.
 type CreateReviewRequest struct {
-	Body  string          `json:"body"`
-	Event string          `json:"event"` // "APPROVED", "REQUEST_CHANGES", "COMMENT"
+	Body  string `json:"body"`
+	Event string `json:"event"` // "APPROVED", "REQUEST_CHANGES", "COMMENT"
+	// Comments carries inline, line-anchored remarks submitted together
+	// with the review. Optional: a review with an empty slice is a
+	// summary-only review.
+	Comments []CreateReviewComment `json:"comments,omitempty"`
+}
+
+// CreateReviewComment is a single inline code comment submitted as part
+// of a review. NewLine anchors the comment to a line on the head
+// revision of the diff; Gitea rejects comments whose path/line pair is
+// not part of the PR's diff.
+type CreateReviewComment struct {
+	Path    string `json:"path"`
+	Body    string `json:"body"`
+	NewLine int    `json:"new_position,omitempty"`
+	OldLine int    `json:"old_position,omitempty"`
 }
 
 // --- PR Comments ---
@@ -340,6 +380,33 @@ func (c *Client) CreateUser(username, password, email string) (*GiteaUser, error
 	}
 
 	return &user, nil
+}
+
+// SearchUsers returns Gitea users whose username, full name, or email
+// matches the given query substring. Used to rebuild the agent
+// registry from Gitea on orchestrator startup — Gitea is the source of
+// truth for which agent identities exist.
+func (c *Client) SearchUsers(query string) ([]GiteaUser, error) {
+	path := fmt.Sprintf("/api/v1/users/search?q=%s&limit=50", query)
+
+	resp, err := c.doRequest(http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("search users: status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Data []GiteaUser `json:"data"`
+		OK   bool        `json:"ok"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding search response: %w", err)
+	}
+	return result.Data, nil
 }
 
 // GetUser retrieves a user by username. Returns nil if not found.

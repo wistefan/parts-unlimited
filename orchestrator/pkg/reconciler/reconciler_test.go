@@ -96,9 +96,13 @@ func TestDeriveTicketState(t *testing.T) {
 		comments     []taiga.HistoryEntry
 		prs          []PRSnapshot
 		humanTaigaID int
-		wantAction   Action
-		wantMode     string
-		wantFix      *FixTarget
+		// reviewEnabled defaults to false so these cases exercise the
+		// lifecycle decision tree in isolation; the review rule has its
+		// own table in TestDeriveTicketStateReview.
+		reviewEnabled bool
+		wantAction    Action
+		wantMode      string
+		wantFix       *FixTarget
 	}{
 		{
 			name:       "nil story returns no action",
@@ -148,6 +152,29 @@ func TestDeriveTicketState(t *testing.T) {
 			comments:     comments("[analysis:need-info] need clarification"),
 			humanTaigaID: testHumanTaigaID,
 			wantAction:   ActionNone,
+		},
+		{
+			name:         "analysis:need-info + human reply — re-run analysis",
+			story:        story(),
+			comments:     comments("Here is the additional info you asked for", "[analysis:need-info] need clarification"),
+			humanTaigaID: testHumanTaigaID,
+			wantAction:   ActionSpawn,
+			wantMode:     ModeAnalysis,
+		},
+		{
+			name:         "analysis:need-info + second need-info after reply — still waiting",
+			story:        story(),
+			comments:     comments("[analysis:need-info] still unclear", "extra details", "[analysis:need-info] need clarification"),
+			humanTaigaID: testHumanTaigaID,
+			wantAction:   ActionNone,
+		},
+		{
+			name:         "analysis:need-info + marker reply — not treated as human reply",
+			story:        story(),
+			comments:     comments("[analysis:proceed] approved", "[analysis:need-info] need clarification"),
+			humanTaigaID: testHumanTaigaID,
+			wantAction:   ActionSpawn,
+			wantMode:     ModePlan,
 		},
 		{
 			name:         "analysis:onestep-rejected — waiting for human",
@@ -360,7 +387,7 @@ func TestDeriveTicketState(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := DeriveTicketState(tc.story, tc.comments, tc.prs, tc.humanTaigaID)
+			got := DeriveTicketState(tc.story, tc.comments, tc.prs, tc.humanTaigaID, tc.reviewEnabled)
 			if got.Action != tc.wantAction {
 				t.Fatalf("Action: got %v, want %v (reason: %q)", got.Action, tc.wantAction, got.Reason)
 			}
@@ -414,11 +441,14 @@ func TestFindRepoForTicket(t *testing.T) {
 			wantRepo:  "example-repo",
 		},
 		{
-			name: "newest marker wins when multiple agents comment",
-			// newest-first: the top comment holds the authoritative repo.
+			name: "oldest marker wins when multiple agents comment",
+			// Comments are newest-first (the order GetComments returns),
+			// so the *last* element here is the oldest. The original
+			// claim sticks; later comments cannot rebind the canonical
+			// fork — see the godoc on FindRepoForTicket.
 			comments:  comments("**Repo:** `claude-2/forked`", "**Repo:** `claude/original`"),
-			wantOwner: "claude-2",
-			wantRepo:  "forked",
+			wantOwner: "claude",
+			wantRepo:  "original",
 		},
 	}
 	for _, tc := range tests {
@@ -449,5 +479,267 @@ func TestIsPlanPR(t *testing.T) {
 		if got := isPlanPR(tc.title); got != tc.want {
 			t.Errorf("isPlanPR(%q) = %v, want %v", tc.title, got, tc.want)
 		}
+	}
+}
+
+// --- automated PR review ---
+
+// Fixed SHAs used across the review tests. headSHA is the revision a PR
+// currently points at; oldSHA is a revision it pointed at before new
+// commits were pushed.
+const (
+	headSHA = "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567"
+	oldSHA  = "fedcba98765432100123456789abcdefabcdef01"
+)
+
+// openPRAtSHA returns an open PR whose head points at the given commit.
+func openPRAtSHA(number int, title, sha string) PRSnapshot {
+	snap := openPR(number, title)
+	snap.PR.Head.Sha = sha
+	return snap
+}
+
+// agentReview builds a review as a review agent would have posted it:
+// COMMENT event, login carrying [ReviewAgentPrefix], and the reviewed
+// revision recorded in the body marker.
+func agentReview(commitID, bodySHA string) gitea.PRReview {
+	r := gitea.PRReview{State: "COMMENT", CommitID: commitID}
+	r.User.Login = ReviewAgentPrefix + "1"
+	if bodySHA != "" {
+		r.Body = "Looks reasonable overall.\n\n" + ReviewSHAMarker(bodySHA)
+	}
+	return r
+}
+
+// humanReview builds a review posted by a person.
+func humanReview(state, commitID string) gitea.PRReview {
+	r := gitea.PRReview{State: state, CommitID: commitID}
+	r.User.Login = "wistefan"
+	return r
+}
+
+func TestDeriveTicketStateReview(t *testing.T) {
+	// Every case below sits in the "waiting for a PR event" window: the
+	// ticket has a [step:2/5] marker and an open PR, so no other mode is
+	// due. That isolates the review rule from the rest of the tree.
+	waiting := comments("[step:2/5] shipped step 2")
+
+	tests := []struct {
+		name string
+		// comments overrides the default `waiting` history for cases
+		// that need a different lifecycle position.
+		comments      []taiga.HistoryEntry
+		prs           []PRSnapshot
+		reviewEnabled bool
+		wantAction    Action
+		wantReview    *ReviewTarget
+	}{
+		{
+			name:          "open PR with no reviews at all — review it",
+			prs:           []PRSnapshot{openPRAtSHA(7, "Step implementation", headSHA)},
+			reviewEnabled: true,
+			wantAction:    ActionSpawn,
+			wantReview:    &ReviewTarget{Owner: "claude", Repo: "example", Number: 7, HeadSHA: headSHA},
+		},
+		{
+			name: "agent review recorded via commit_id at head — skip",
+			prs: func() []PRSnapshot {
+				s := openPRAtSHA(7, "Step implementation", headSHA)
+				s.Reviews = []gitea.PRReview{agentReview(headSHA, "")}
+				return []PRSnapshot{s}
+			}(),
+			reviewEnabled: true,
+			wantAction:    ActionNone,
+		},
+		{
+			name: "agent review recorded via body marker at head — skip",
+			prs: func() []PRSnapshot {
+				s := openPRAtSHA(7, "Step implementation", headSHA)
+				// commit_id absent, as Gitea leaves it on some COMMENT reviews.
+				s.Reviews = []gitea.PRReview{agentReview("", headSHA)}
+				return []PRSnapshot{s}
+			}(),
+			reviewEnabled: true,
+			wantAction:    ActionNone,
+		},
+		{
+			name: "agent review exists but only for an older revision — re-review",
+			prs: func() []PRSnapshot {
+				s := openPRAtSHA(7, "Step implementation", headSHA)
+				s.Reviews = []gitea.PRReview{agentReview(oldSHA, oldSHA)}
+				return []PRSnapshot{s}
+			}(),
+			reviewEnabled: true,
+			wantAction:    ActionSpawn,
+			wantReview:    &ReviewTarget{Owner: "claude", Repo: "example", Number: 7, HeadSHA: headSHA},
+		},
+		{
+			name: "only a human has reviewed the head revision — still review",
+			prs: func() []PRSnapshot {
+				s := openPRAtSHA(7, "Step implementation", headSHA)
+				s.Reviews = []gitea.PRReview{humanReview("APPROVED", headSHA)}
+				return []PRSnapshot{s}
+			}(),
+			reviewEnabled: true,
+			wantAction:    ActionSpawn,
+			wantReview:    &ReviewTarget{Owner: "claude", Repo: "example", Number: 7, HeadSHA: headSHA},
+		},
+		{
+			name:          "plan PRs are reviewed too",
+			prs:           []PRSnapshot{openPRAtSHA(3, "Ticket #1: Implementation Plan", headSHA)},
+			reviewEnabled: true,
+			wantAction:    ActionSpawn,
+			wantReview:    &ReviewTarget{Owner: "claude", Repo: "example", Number: 3, HeadSHA: headSHA},
+		},
+		{
+			name:          "unknown head SHA — skip rather than re-review every pass",
+			prs:           []PRSnapshot{openPRAtSHA(7, "Step implementation", "")},
+			reviewEnabled: true,
+			wantAction:    ActionNone,
+		},
+		{
+			// [step:complete] parks the ticket, so the merged PR is the
+			// only thing left that could conceivably be reviewed.
+			name:          "merged PRs are never reviewed",
+			comments:      comments("[step:complete] all steps done"),
+			prs:           []PRSnapshot{mergedPR(7, "Step implementation")},
+			reviewEnabled: true,
+			wantAction:    ActionNone,
+		},
+		{
+			name:          "closed-unmerged PRs are never reviewed",
+			prs:           []PRSnapshot{closedPR(7, "Step implementation")},
+			reviewEnabled: true,
+			wantAction:    ActionNone,
+		},
+		{
+			name:          "review disabled — never spawn a reviewer",
+			prs:           []PRSnapshot{openPRAtSHA(7, "Step implementation", headSHA)},
+			reviewEnabled: false,
+			wantAction:    ActionNone,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			history := tc.comments
+			if history == nil {
+				history = waiting
+			}
+			got := DeriveTicketState(story(), history, tc.prs, testHumanTaigaID, tc.reviewEnabled)
+			if got.Action != tc.wantAction {
+				t.Fatalf("Action: got %v, want %v (reason: %q)", got.Action, tc.wantAction, got.Reason)
+			}
+			if tc.wantAction == ActionSpawn && got.Mode != ModeReview {
+				t.Fatalf("Mode: got %q, want %q", got.Mode, ModeReview)
+			}
+			if (got.Review == nil) != (tc.wantReview == nil) {
+				t.Fatalf("Review presence mismatch: got %+v, want %+v", got.Review, tc.wantReview)
+			}
+			if tc.wantReview != nil && *got.Review != *tc.wantReview {
+				t.Fatalf("Review target: got %+v, want %+v", *got.Review, *tc.wantReview)
+			}
+		})
+	}
+}
+
+// TestReviewNeverPreemptsWork pins the ordering guarantee: a review is
+// only ever decided when nothing else is due. If this regresses, agent
+// work silently stalls behind reviews.
+func TestReviewNeverPreemptsWork(t *testing.T) {
+	reviewable := openPRAtSHA(7, "Step implementation", headSHA)
+
+	tests := []struct {
+		name     string
+		comments []taiga.HistoryEntry
+		prs      []PRSnapshot
+		wantMode string
+	}{
+		{
+			name:     "analysis is due — analysis wins over review",
+			comments: nil,
+			prs:      []PRSnapshot{reviewable},
+			wantMode: ModeAnalysis,
+		},
+		{
+			name:     "analysis approved, plan is due — plan wins over review",
+			comments: comments("[analysis:proceed]"),
+			prs:      []PRSnapshot{reviewable},
+			wantMode: ModePlan,
+		},
+		{
+			name:     "human requested changes — fix wins over review",
+			comments: comments("[step:2/5] shipped step 2"),
+			prs: func() []PRSnapshot {
+				s := openPRAtSHA(7, "Step implementation", headSHA)
+				s.Reviews = []gitea.PRReview{humanReview(reviewStateRequestChanges, headSHA)}
+				return []PRSnapshot{s}
+			}(),
+			wantMode: ModeFix,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := DeriveTicketState(story(), tc.comments, tc.prs, testHumanTaigaID, true)
+			if got.Action != ActionSpawn {
+				t.Fatalf("Action: got %v, want ActionSpawn (reason: %q)", got.Action, got.Reason)
+			}
+			if got.Mode != tc.wantMode {
+				t.Fatalf("Mode: got %q, want %q (reason: %q)", got.Mode, tc.wantMode, got.Reason)
+			}
+		})
+	}
+}
+
+// TestReviewCapStopsRunawayReviews covers the failure mode the SHA check
+// cannot: a review that never lands (bad access, rejected payload, Job
+// killed) leaves no marker, so the PR looks unreviewed on every single
+// pass. The cap is what keeps that from spawning a reviewer forever.
+func TestReviewCapStopsRunawayReviews(t *testing.T) {
+	waiting := comments("[step:2/5] shipped step 2")
+
+	// Reviews that all landed on older revisions — exactly what an
+	// unposted-review loop looks like from Gitea's side.
+	withAgentReviews := func(n int) []PRSnapshot {
+		s := openPRAtSHA(7, "Step implementation", headSHA)
+		for i := 0; i < n; i++ {
+			s.Reviews = append(s.Reviews, agentReview(oldSHA, oldSHA))
+		}
+		return []PRSnapshot{s}
+	}
+
+	tests := []struct {
+		name         string
+		agentReviews int
+		wantAction   Action
+	}{
+		{name: "well under the cap", agentReviews: 1, wantAction: ActionSpawn},
+		{name: "one below the cap", agentReviews: maxAgentReviewsPerPR - 1, wantAction: ActionSpawn},
+		{name: "at the cap", agentReviews: maxAgentReviewsPerPR, wantAction: ActionNone},
+		{name: "past the cap", agentReviews: maxAgentReviewsPerPR + 5, wantAction: ActionNone},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := DeriveTicketState(story(), waiting, withAgentReviews(tc.agentReviews), testHumanTaigaID, true)
+			if got.Action != tc.wantAction {
+				t.Fatalf("Action: got %v, want %v (reason: %q)", got.Action, tc.wantAction, got.Reason)
+			}
+		})
+	}
+}
+
+// TestReviewCapIgnoresHumanReviews makes sure a heavily human-reviewed
+// PR is not starved of automated review by the cap.
+func TestReviewCapIgnoresHumanReviews(t *testing.T) {
+	s := openPRAtSHA(7, "Step implementation", headSHA)
+	for i := 0; i < maxAgentReviewsPerPR*2; i++ {
+		s.Reviews = append(s.Reviews, humanReview("COMMENT", oldSHA))
+	}
+
+	got := DeriveTicketState(story(), comments("[step:2/5] shipped"), []PRSnapshot{s}, testHumanTaigaID, true)
+	if got.Action != ActionSpawn || got.Mode != ModeReview {
+		t.Fatalf("got %v/%q, want ActionSpawn/%s (reason: %q)", got.Action, got.Mode, ModeReview, got.Reason)
 	}
 }

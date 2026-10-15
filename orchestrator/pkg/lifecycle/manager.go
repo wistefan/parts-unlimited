@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"sync"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -14,8 +13,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-
-	"github.com/wistefan/dev-env/orchestrator/pkg/metrics"
 )
 
 const (
@@ -33,6 +30,51 @@ const (
 
 	// DefaultTTLAfterFinished is how long completed Jobs are kept for log access.
 	DefaultTTLAfterFinished int32 = 300
+
+	// TerminationGracePeriodSeconds is the window bootstrap.sh gets between
+	// SIGTERM and SIGKILL to commit and push whatever the agent has produced.
+	// The default of 30s is not enough: the handler has to stop the Claude
+	// CLI, stage a worktree that may hold a full build tree, commit, and push
+	// to Gitea. Without the checkpoint the work of a whole deadline-killed run
+	// is discarded and the next agent starts the step over.
+	TerminationGracePeriodSeconds int64 = 120
+
+	// DefaultClaudeModel is the Claude model the implementing agents
+	// (analysis, plan, step, onestep, fix) use unless Config overrides it.
+	DefaultClaudeModel = "claude-opus-5-5"
+
+	// DefaultReviewClaudeModel is the Claude model review agents use
+	// unless Config overrides it.
+	//
+	// It is deliberately a separate knob from DefaultClaudeModel even
+	// though the two currently hold the same value: reviewing judges a
+	// changeset it cannot compile or test, which is a different job from
+	// writing one, and being able to move the reviewers alone — without
+	// rebuilding any image — is the point. Nothing may assume the two
+	// stay equal.
+	DefaultReviewClaudeModel = "claude-opus-5-5"
+
+	// DefaultClaudeEffort and DefaultReviewClaudeEffort are the CLI
+	// effort levels (low, medium, high, xhigh, max) for implementing and
+	// review agents. Passed to the Claude CLI as --effort; empty leaves
+	// the CLI's own per-model default in place.
+	//
+	// Effort buys thinking tokens, which land in output — 0.2% of this
+	// system's measured token spend, against 99.8% in cached context.
+	// The direct cost of raising it is therefore near zero; what it can
+	// cost is longer runs, since every extra turn re-reads the context.
+	// Judge a change here by run length in the claude-spend data, not by
+	// the output-token count.
+	DefaultClaudeEffort       = "high"
+	DefaultReviewClaudeEffort = "high"
+
+	// ModeFix and ModeReview are the two agent modes that operate on an
+	// existing pull request rather than on a ticket branch, and so need
+	// PR coordinates in their environment. Mirrors the mode constants in
+	// pkg/reconciler; duplicated rather than imported to keep this
+	// Kubernetes-facing package free of decision-logic dependencies.
+	ModeFix    = "fix"
+	ModeReview = "review"
 )
 
 // AgentJobSpec holds the parameters needed to create an agent worker Job.
@@ -44,8 +86,9 @@ type AgentJobSpec struct {
 	PlanStep       string
 	RepoOwner      string
 	RepoName       string
-	PRNumber       int    // PR to fix (fix mode only)
-	PRRepo         string // "{owner}/{repo}" of the PR (fix mode only)
+	PRNumber       int    // PR to fix or review (fix and review modes)
+	PRRepo         string // "{owner}/{repo}" of the PR (fix and review modes)
+	PRHeadSHA      string // head revision under review (review mode only)
 	GiteaUsername  string
 	GiteaPassword  string
 	TaigaUsername  string
@@ -66,6 +109,18 @@ type Config struct {
 	TTLAfterFinished   int32
 	ResourceRequests   corev1.ResourceList
 	ResourceLimits     corev1.ResourceList
+
+	// ClaudeModel is the model given to implementing agents, and
+	// ReviewClaudeModel the one given to review agents. Empty means the
+	// DefaultClaudeModel / DefaultReviewClaudeModel constants above, so
+	// a Config that predates these fields keeps working.
+	ClaudeModel       string
+	ReviewClaudeModel string
+
+	// ClaudeEffort and ReviewClaudeEffort are the matching --effort
+	// levels. Empty means the Default*Effort constants above.
+	ClaudeEffort       string
+	ReviewClaudeEffort string
 }
 
 // DefaultConfig returns the default lifecycle manager configuration.
@@ -77,7 +132,45 @@ func DefaultConfig() *Config {
 		TaskTimeoutSeconds: 3600,
 		RetryLimit:         2,
 		TTLAfterFinished:   DefaultTTLAfterFinished,
+		ClaudeModel:        DefaultClaudeModel,
+		ReviewClaudeModel:  DefaultReviewClaudeModel,
+		ClaudeEffort:       DefaultClaudeEffort,
+		ReviewClaudeEffort: DefaultReviewClaudeEffort,
 	}
+}
+
+// modelFor returns the Claude model an agent running in mode should use.
+//
+// Review agents get their own model: they judge a changeset rather than
+// produce one, and the two jobs are not equally well served by the same
+// model. Every other mode — analysis, plan, step, onestep, fix — is an
+// implementing agent and shares one model.
+func (m *Manager) modelFor(mode string) string {
+	if mode == ModeReview {
+		if m.config != nil && m.config.ReviewClaudeModel != "" {
+			return m.config.ReviewClaudeModel
+		}
+		return DefaultReviewClaudeModel
+	}
+	if m.config != nil && m.config.ClaudeModel != "" {
+		return m.config.ClaudeModel
+	}
+	return DefaultClaudeModel
+}
+
+// effortFor returns the Claude CLI effort level an agent running in mode
+// should use, following the same review/implementation split as modelFor.
+func (m *Manager) effortFor(mode string) string {
+	if mode == ModeReview {
+		if m.config != nil && m.config.ReviewClaudeEffort != "" {
+			return m.config.ReviewClaudeEffort
+		}
+		return DefaultReviewClaudeEffort
+	}
+	if m.config != nil && m.config.ClaudeEffort != "" {
+		return m.config.ClaudeEffort
+	}
+	return DefaultClaudeEffort
 }
 
 // JobStatus represents the observed status of an agent Job.
@@ -91,22 +184,10 @@ type JobStatus struct {
 	StartTime *time.Time
 }
 
-// trackedJob captures the data needed to emit completion metrics for a Job
-// at the moment it first transitions to a terminal state.
-type trackedJob struct {
-	mode           string
-	specialization string
-	startTime      time.Time
-}
-
 // Manager manages agent worker Kubernetes Jobs.
 type Manager struct {
 	clientset kubernetes.Interface
 	config    *Config
-
-	mu         sync.RWMutex
-	activeJobs map[string]string     // job name -> agent ID
-	tracking   map[string]trackedJob // job name -> metrics-tracking data (dedups completion observations)
 }
 
 // NewManager creates a new lifecycle manager.
@@ -115,41 +196,9 @@ func NewManager(clientset kubernetes.Interface, config *Config) *Manager {
 		config = DefaultConfig()
 	}
 	return &Manager{
-		clientset:  clientset,
-		config:     config,
-		activeJobs: make(map[string]string),
-		tracking:   make(map[string]trackedJob),
+		clientset: clientset,
+		config:    config,
 	}
-}
-
-// trackJobCreation records the data needed to emit completion metrics
-// later and increments the jobs-created counter.
-func (m *Manager) trackJobCreation(jobName, mode, specialization string) {
-	m.mu.Lock()
-	m.tracking[jobName] = trackedJob{
-		mode:           mode,
-		specialization: specialization,
-		startTime:      time.Now(),
-	}
-	m.mu.Unlock()
-	metrics.JobsCreated.WithLabelValues(mode, specialization).Inc()
-}
-
-// observeCompletion emits the completion metrics for a Job at most once.
-// Subsequent calls for the same jobName are no-ops. `status` should be one
-// of metrics.JobStatus{Succeeded,Failed,Timeout}.
-func (m *Manager) observeCompletion(jobName, status string) {
-	m.mu.Lock()
-	tj, ok := m.tracking[jobName]
-	if !ok {
-		m.mu.Unlock()
-		return
-	}
-	delete(m.tracking, jobName)
-	m.mu.Unlock()
-
-	metrics.JobsCompleted.WithLabelValues(tj.mode, tj.specialization, status).Inc()
-	metrics.JobDuration.WithLabelValues(tj.mode, tj.specialization).Observe(time.Since(tj.startTime).Seconds())
 }
 
 // JobName generates a deterministic job name for an agent/ticket/mode combination.
@@ -202,9 +251,10 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 					},
 				},
 				Spec: corev1.PodSpec{
-					ServiceAccountName:           m.config.ServiceAccount,
-					AutomountServiceAccountToken: &falseVal,
-					RestartPolicy:                corev1.RestartPolicyNever,
+					ServiceAccountName:            m.config.ServiceAccount,
+					AutomountServiceAccountToken:  &falseVal,
+					RestartPolicy:                 corev1.RestartPolicyNever,
+					TerminationGracePeriodSeconds: int64Ptr(TerminationGracePeriodSeconds),
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot: boolPtr(true),
 						RunAsUser:    int64Ptr(1000),
@@ -375,16 +425,6 @@ func (m *Manager) CreateJob(ctx context.Context, spec *AgentJobSpec) (string, er
 		return "", fmt.Errorf("creating job %s: %w", jobName, err)
 	}
 
-	m.mu.Lock()
-	m.activeJobs[jobName] = spec.AgentID
-	m.mu.Unlock()
-
-	mode := spec.Mode
-	if mode == "" {
-		mode = "step"
-	}
-	m.trackJobCreation(jobName, mode, spec.Specialization)
-
 	log.Printf("Created job %s for agent %s on ticket %d", created.Name, spec.AgentID, spec.TicketID)
 	return created.Name, nil
 }
@@ -398,10 +438,6 @@ func (m *Manager) DeleteJob(ctx context.Context, jobName string) error {
 	if err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("deleting job %s: %w", jobName, err)
 	}
-
-	m.mu.Lock()
-	delete(m.activeJobs, jobName)
-	m.mu.Unlock()
 
 	log.Printf("Deleted job %s", jobName)
 	return nil
@@ -429,7 +465,6 @@ func (m *Manager) GetJobStatus(ctx context.Context, jobName string) (*JobStatus,
 		status.StartTime = &t
 	}
 
-	var failureReason string
 	for _, cond := range job.Status.Conditions {
 		switch cond.Type {
 		case batchv1.JobComplete:
@@ -439,21 +474,7 @@ func (m *Manager) GetJobStatus(ctx context.Context, jobName string) (*JobStatus,
 		case batchv1.JobFailed:
 			if cond.Status == corev1.ConditionTrue {
 				status.Failed = true
-				failureReason = cond.Reason
 			}
-		}
-	}
-
-	// Emit completion metrics exactly once per job. "DeadlineExceeded" is
-	// Kubernetes's reason code when ActiveDeadlineSeconds fires, which is
-	// semantically distinct from other failures and worth labeling.
-	if status.Succeeded {
-		m.observeCompletion(jobName, metrics.JobStatusSucceeded)
-	} else if status.Failed {
-		if failureReason == "DeadlineExceeded" {
-			m.observeCompletion(jobName, metrics.JobStatusTimeout)
-		} else {
-			m.observeCompletion(jobName, metrics.JobStatusFailed)
 		}
 	}
 
@@ -601,18 +622,6 @@ func (m *Manager) HasJobForTicket(ctx context.Context, ticketID int) (bool, erro
 	return len(jobs.Items) > 0, nil
 }
 
-// GetActiveJobNames returns the set of currently tracked active job names.
-func (m *Manager) GetActiveJobNames() map[string]string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	result := make(map[string]string, len(m.activeJobs))
-	for k, v := range m.activeJobs {
-		result[k] = v
-	}
-	return result
-}
-
 // buildEnvVars constructs the environment variables for an agent container.
 func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 	envVars := []corev1.EnvVar{
@@ -632,15 +641,29 @@ func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 		{Name: "TAIGA_PROJECT_ID", Value: fmt.Sprintf("%d", spec.TaigaProjectID)},
 	}
 
-	if spec.Mode == "fix" && spec.PRNumber > 0 {
+	// Both fix and review modes operate on an existing PR rather than on
+	// a ticket branch, so both need the PR coordinates.
+	if (spec.Mode == ModeFix || spec.Mode == ModeReview) && spec.PRNumber > 0 {
 		envVars = append(envVars,
 			corev1.EnvVar{Name: "PR_NUMBER", Value: fmt.Sprintf("%d", spec.PRNumber)},
 			corev1.EnvVar{Name: "PR_REPO", Value: spec.PRRepo},
 		)
 	}
 
+	if spec.Mode == ModeReview && spec.PRHeadSHA != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: "PR_HEAD_SHA", Value: spec.PRHeadSHA})
+	}
+
 	if spec.AllowedTools != "" {
 		envVars = append(envVars, corev1.EnvVar{Name: "ALLOWED_TOOLS", Value: spec.AllowedTools})
+	}
+
+	envVars = append(envVars, corev1.EnvVar{Name: "CLAUDE_MODEL", Value: m.modelFor(spec.Mode)})
+
+	// Omitted when empty so the CLI keeps its own per-model default
+	// rather than being handed an invalid empty --effort.
+	if effort := m.effortFor(spec.Mode); effort != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: "CLAUDE_EFFORT", Value: effort})
 	}
 
 	// Service endpoints from ConfigMap
@@ -660,15 +683,6 @@ func (m *Manager) buildEnvVars(spec *AgentJobSpec) []corev1.EnvVar {
 				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: "agent-service-endpoints"},
 					Key:                  "TAIGA_URL",
-				},
-			},
-		},
-		corev1.EnvVar{
-			Name: "PUSHGATEWAY_URL",
-			ValueFrom: &corev1.EnvVarSource{
-				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: "agent-service-endpoints"},
-					Key:                  "PUSHGATEWAY_URL",
 				},
 			},
 		},

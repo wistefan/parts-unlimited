@@ -129,7 +129,6 @@ metadata:
 data:
   GITEA_URL: "http://gitea-http.gitea.svc.cluster.local:${GITEA_PORT}"
   TAIGA_URL: "http://taiga-gateway.taiga.svc.cluster.local:${TAIGA_PORT}"
-  PUSHGATEWAY_URL: "http://pushgateway.monitoring.svc.cluster.local:9091"
 ENDPOINTS
 echo ""
 
@@ -169,25 +168,9 @@ echo "Pre-pulling external images to avoid Docker Hub rate limits..."
 bash "${SCRIPT_DIR}/cache-images.sh"
 echo ""
 
-# --- Step 5: Monitoring stack ---
+# --- Step 5: Shared volume directories ---
 
-echo "=== Step 5: Monitoring ==="
-
-kubectl apply -f "${PROJECT_DIR}/k8s/monitoring/prometheus.yaml"
-kubectl apply -f "${PROJECT_DIR}/k8s/monitoring/pushgateway.yaml"
-kubectl apply -f "${PROJECT_DIR}/k8s/monitoring/grafana.yaml"
-kubectl apply -f "${PROJECT_DIR}/k8s/monitoring/grafana-dashboards.yaml"
-
-echo "  Waiting for monitoring pods..."
-kubectl wait --for=condition=Ready pod -l app=prometheus -n monitoring --timeout=120s 2>/dev/null || true
-kubectl wait --for=condition=Ready pod -l app=pushgateway -n monitoring --timeout=120s 2>/dev/null || true
-kubectl wait --for=condition=Ready pod -l app=grafana -n monitoring --timeout=120s 2>/dev/null || true
-echo "  Grafana available at localhost:3000 (admin/password)."
-echo ""
-
-# --- Step 6: Shared volume directories ---
-
-echo "=== Step 6: Shared volumes ==="
+echo "=== Step 5: Shared volumes ==="
 # Taiga directories — static/media (UID 999) and PostgreSQL (UID 999)
 mkdir -p /var/lib/dev-env/taiga/static
 mkdir -p /var/lib/dev-env/taiga/media
@@ -214,9 +197,9 @@ chown -R 1000:1000 /var/lib/dev-env/claude-spend
 echo "Created host directories for persistent volumes."
 echo ""
 
-# --- Step 7: Deploy Gitea ---
+# --- Step 6: Deploy Gitea ---
 
-echo "=== Step 7: Gitea ==="
+echo "=== Step 6: Gitea ==="
 
 # Create hostPath-backed PVs and PVCs before Helm touches the namespace.
 # These must exist before helm install so the chart binds to them instead
@@ -250,9 +233,9 @@ echo "Waiting for Gitea pods..."
 bash "${SCRIPT_DIR}/wait-for-ready.sh" gitea 300
 echo ""
 
-# --- Step 8: Deploy Taiga ---
+# --- Step 7: Deploy Taiga ---
 
-echo "=== Step 8: Taiga ==="
+echo "=== Step 7: Taiga ==="
 
 # Generate and inject the secret key
 TAIGA_SECRET_YAML="${PROJECT_DIR}/k8s/taiga/secret.yaml"
@@ -280,9 +263,9 @@ echo "Waiting for all Taiga pods..."
 bash "${SCRIPT_DIR}/wait-for-ready.sh" taiga 600
 echo ""
 
-# --- Step 9: Initialize services ---
+# --- Step 8: Initialize services ---
 
-echo "=== Step 9: Initialization ==="
+echo "=== Step 8: Initialization ==="
 
 echo "--- Initializing Gitea ---"
 GITEA_URL="http://localhost:${GITEA_PORT}" \
@@ -300,15 +283,15 @@ TAIGA_URL="http://localhost:${TAIGA_PORT}" \
     bash "${SCRIPT_DIR}/init-taiga.sh"
 echo ""
 
-# --- Step 10: Agent policies ---
+# --- Step 9: Agent policies ---
 
-echo "=== Step 10: Agent policies ==="
+echo "=== Step 9: Agent policies ==="
 kubectl apply -f "${PROJECT_DIR}/k8s/agents/policies.yaml"
 echo ""
 
-# --- Step 11: Anthropic API key ---
+# --- Step 10: Anthropic API key ---
 
-echo "=== Step 11: Claude Credentials ==="
+echo "=== Step 10: Claude Credentials ==="
 CLAUDE_CREDENTIALS="${REAL_HOME}/.claude/.credentials.json"
 
 # Two credential mechanisms are supported. If ANTHROPIC_API_KEY is set, it is
@@ -350,9 +333,9 @@ if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ ! -f "${CLAUDE_CREDENTIALS}" ]; then
 fi
 echo ""
 
-# --- Step 12: CI/CD Runner (optional) ---
+# --- Step 11: CI/CD Runner (optional) ---
 
-echo "=== Step 12: CI/CD Runner ==="
+echo "=== Step 11: CI/CD Runner ==="
 # The act-runner needs a registration token from Gitea.
 # Generate one via the Gitea API and create the secret.
 echo "Generating Gitea Actions runner registration token..."
@@ -374,9 +357,9 @@ else
 fi
 echo ""
 
-# --- Step 13: Build container images ---
+# --- Step 12: Build container images ---
 
-echo "=== Step 13: Container Images ==="
+echo "=== Step 12: Container Images ==="
 
 REGISTRY="localhost:${REGISTRY_PORT}"
 
@@ -397,9 +380,9 @@ else
 fi
 echo ""
 
-# --- Step 14: Deploy orchestrator ---
+# --- Step 13: Deploy orchestrator ---
 
-echo "=== Step 14: Orchestrator ==="
+echo "=== Step 13: Orchestrator ==="
 apply_manifest "${PROJECT_DIR}/k8s/agents/orchestrator.yaml"
 # Force a rollout to pick up new image (idempotent on first deploy)
 kubectl rollout restart deployment/orchestrator -n agents 2>/dev/null || true
@@ -408,9 +391,9 @@ kubectl rollout status deployment/orchestrator -n agents --timeout=120s 2>/dev/n
 echo "  Orchestrator deployed."
 echo ""
 
-# --- Step 15: Verify ---
+# --- Step 14: Verify ---
 
-echo "=== Step 15: Verification ==="
+echo "=== Step 14: Verification ==="
 GITEA_URL="http://localhost:${GITEA_PORT}" \
     TAIGA_URL="http://localhost:${TAIGA_PORT}" \
     HUMAN_USERNAME="${HUMAN_USERNAME}" \
@@ -427,10 +410,6 @@ echo ""
 echo "  Taiga:  http://localhost:${TAIGA_PORT}"
 echo "    Admin: admin / password"
 echo "    Human: ${HUMAN_USERNAME} / ${HUMAN_PASSWORD} (superuser)"
-echo ""
-echo "  Grafana: http://localhost:3000"
-echo "    Admin: admin / password"
-echo "    Anonymous viewer access enabled"
 echo ""
 echo "  kubectl: export KUBECONFIG=/etc/rancher/k3s/k3s.yaml"
 echo "=========================================="
