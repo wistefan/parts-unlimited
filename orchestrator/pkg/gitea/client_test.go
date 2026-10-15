@@ -373,3 +373,99 @@ func TestCreateRepoWebhook(t *testing.T) {
 		t.Fatalf("CreateRepoWebhook: %v", err)
 	}
 }
+
+// TestGetPullRequestParsesHeadSHA pins the head-SHA field the reconciler
+// uses to decide whether a PR has gained commits since its last
+// automated review. Without it every PR looks unreviewed forever.
+func TestGetPullRequestParsesHeadSHA(t *testing.T) {
+	const wantSHA = "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567"
+
+	_, client := setupTestServer(t, map[string]http.HandlerFunc{
+		"/api/v1/repos/owner/repo/pulls/1": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			// Raw JSON rather than the struct: the point is that the
+			// wire field `head.sha` is decoded.
+			w.Write([]byte(`{
+				"id": 1, "number": 1, "title": "Step 1", "state": "open",
+				"head": {"label": "ticket-1/step-1", "ref": "ticket-1/step-1", "sha": "` + wantSHA + `"},
+				"base": {"label": "ticket-1/work", "ref": "ticket-1/work", "sha": "aaaa"}
+			}`))
+		},
+	})
+
+	pr, err := client.GetPullRequest("owner", "repo", 1)
+	if err != nil {
+		t.Fatalf("GetPullRequest: %v", err)
+	}
+	if pr.Head.Sha != wantSHA {
+		t.Errorf("head SHA: got %q, want %q", pr.Head.Sha, wantSHA)
+	}
+	if pr.Base.Sha != "aaaa" {
+		t.Errorf("base SHA: got %q, want %q", pr.Base.Sha, "aaaa")
+	}
+}
+
+// TestCreateReviewWithInlineComments checks that inline code comments
+// reach Gitea in the shape its reviews API expects.
+func TestCreateReviewWithInlineComments(t *testing.T) {
+	_, client := setupTestServer(t, map[string]http.HandlerFunc{
+		"/api/v1/repos/owner/repo/pulls/1/reviews": func(w http.ResponseWriter, r *http.Request) {
+			var body CreateReviewRequest
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decoding request: %v", err)
+			}
+			if body.Event != "COMMENT" {
+				t.Errorf("expected event='COMMENT', got %q", body.Event)
+			}
+			if len(body.Comments) != 1 {
+				t.Fatalf("expected 1 inline comment, got %d", len(body.Comments))
+			}
+			c := body.Comments[0]
+			if c.Path != "pkg/foo/bar.go" {
+				t.Errorf("path: got %q", c.Path)
+			}
+			if c.NewLine != 42 {
+				t.Errorf("new_position: got %d, want 42", c.NewLine)
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(Review{ID: 1, Body: body.Body, State: "COMMENT"})
+		},
+	})
+
+	_, err := client.CreateReview("owner", "repo", 1, &CreateReviewRequest{
+		Body:  "Summary",
+		Event: "COMMENT",
+		Comments: []CreateReviewComment{
+			{Path: "pkg/foo/bar.go", Body: "This can overflow.", NewLine: 42},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateReview: %v", err)
+	}
+}
+
+// TestCreateReviewOmitsEmptyComments guards the summary-only case: an
+// empty Comments slice must not appear in the payload at all, since
+// Gitea rejects an empty comments array on some versions.
+func TestCreateReviewOmitsEmptyComments(t *testing.T) {
+	_, client := setupTestServer(t, map[string]http.HandlerFunc{
+		"/api/v1/repos/owner/repo/pulls/1/reviews": func(w http.ResponseWriter, r *http.Request) {
+			var raw map[string]interface{}
+			if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+				t.Fatalf("decoding request: %v", err)
+			}
+			if _, present := raw["comments"]; present {
+				t.Errorf("comments key should be omitted when empty, got %v", raw["comments"])
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(Review{ID: 1, State: "COMMENT"})
+		},
+	})
+
+	if _, err := client.CreateReview("owner", "repo", 1, &CreateReviewRequest{
+		Body:  "Summary only",
+		Event: "COMMENT",
+	}); err != nil {
+		t.Fatalf("CreateReview: %v", err)
+	}
+}

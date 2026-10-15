@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) and other coding agents when working with code in this repository.
 
 ## Project Overview
 
@@ -59,9 +59,9 @@ kubectl logs -n agents <pod-name>                       # Agent worker logs
 
 Three main components communicate via REST APIs and Kubernetes Jobs:
 
-1. **Orchestrator** (`orchestrator/`) -- Go service that receives Taiga and Gitea webhooks, runs the stateless reconciler against Taiga + Gitea + K8s on every pass, spawns agent worker Jobs in Kubernetes, and runs automated PR reviews. Holds no cross-pass state of its own (see Hard Rules).
+1. **Orchestrator** (`orchestrator/`) -- Go service that receives Taiga and Gitea webhooks, runs the stateless reconciler against Taiga + Gitea + K8s on every pass, and spawns agent worker Jobs in Kubernetes. Holds no cross-pass state of its own (see Hard Rules). It does not review PRs itself -- the orchestrator image has no Claude CLI; reviewing is a `review`-mode agent Job like any other work.
 
-2. **Agent Workers** (`agent/`) -- Ephemeral containers running Claude Code CLI. Each is spawned per-ticket in one of four modes: `analysis` (evaluate ticket), `plan` (create implementation plan + CLAUDE.md), `step` (implement one plan step), `fix` (address PR review comments). The `bootstrap.sh` script orchestrates the full lifecycle.
+2. **Agent Workers** (`agent/`) -- Ephemeral containers running Claude Code CLI. Each is spawned per-ticket in one of six modes: `analysis` (evaluate ticket), `plan` (create implementation plan + AGENTS.md), `step` (implement one plan step), `onestep` (implement a whole small ticket in one PR), `fix` (address PR review comments), `review` (post an advisory senior-engineer review on a PR). The `bootstrap.sh` script orchestrates the full lifecycle.
 
 3. **Infrastructure** (`k8s/`, `scripts/`) -- Gitea (git hosting + CI/CD via Actions), Taiga (project management + webhooks), and supporting k3s manifests.
 
@@ -78,7 +78,6 @@ The entry point is `cmd/orchestrator/main.go` (~1600 lines) which wires everythi
 | `pkg/taiga` | Taiga REST API client (stories, comments, tags, statuses) |
 | `pkg/gitea` | Gitea REST API client (repos, PRs, reviews, branches, user search) |
 | `pkg/webhooks` | Taiga + Gitea webhook receivers; PR-body / branch-name parser for ticket-id resolution |
-| `pkg/review` | PR review via `claude -p` subprocess |
 | `pkg/plan` | Markdown plan parsing, step tracking, release notes |
 | `pkg/notifications` | Webhook + desktop notification dispatch |
 | `pkg/config` | YAML config loading with defaults |
@@ -93,6 +92,88 @@ ready --> analysis agent --> [analysis:proceed] --> plan agent --> plan PR
 ```
 
 Fix agents are spawned when a human requests changes on any PR.
+
+A fix agent is anchored to the PR, not to a ticket branch: it resolves
+`BRANCH_NAME` from the PR's `head.ref`, commits there, pushes, and
+answers on the PR itself -- a threaded reply under each inline review
+comment it was given, plus one issue comment summarising the fix as a
+whole. Both are plain comments (a *review* would be rejected by Gitea,
+since the fix agent authored the branch). The replies are addressed by
+comment id: the ids are rendered into the fix prompt alongside each
+comment, the agent returns them in `pr_comment_replies` in
+`completion-status.json`, and `bootstrap.sh` POSTs each to
+`/pulls/{index}/comments/{id}/replies`. Ids the agent did not receive
+are dropped -- Gitea comment ids are repo-global, so an invented one
+could otherwise land a reply on an unrelated PR. Pushing is
+also what ends the fix loop -- Gitea marks the human's `REQUEST_CHANGES`
+review stale once new commits land, and `findFixTarget` only matches
+non-stale ones. A fix agent that cannot resolve the head branch fails
+loudly via `request_human_input` rather than cutting a branch of its own;
+a guessed branch would look like success and land nothing.
+
+### Automated PR Review
+
+A `review`-mode agent posts an advisory review on every open ticket PR
+(plan PRs included). It is bounded by three rules, and each is enforced
+mechanically rather than by prompt:
+
+- **It can only comment.** `bootstrap.sh` hard-codes `event: "COMMENT"`
+  when posting; nothing the agent writes into `review-result.json`
+  becomes an `APPROVED` or `REQUEST_CHANGES` review. This matters beyond
+  etiquette: `REQUEST_CHANGES` is the trigger for spawning a fix agent,
+  so a reviewer able to emit it could dispatch agents on its own opinion.
+  Approving and merging stay with the human.
+- **It reviews a revision once.** The reconciler compares the PR's head
+  SHA against the reviews already on the PR, matching either Gitea's
+  `commit_id` or the `<!-- agent-review: <sha> -->` marker the reviewer
+  embeds in its body (`ReviewSHAMarker` in `pkg/reconciler`, mirrored in
+  `bootstrap.sh`). A PR is re-reviewed only after new commits land. A PR
+  whose head SHA cannot be read is skipped, never re-reviewed forever.
+- **It owns nothing.** Reviewers are a separate `review-agent-N`
+  identity (Gitea rejects a review by the PR's author), get `read`
+  access only, run with a read-only tool set, and post no Taiga
+  comment -- so they never enter a ticket's working-agent history or its
+  lifecycle-marker stream.
+
+Review is the last decision in `DeriveTicketState`, so it can only run
+when no plan/step/fix work is due; it never delays implementation.
+Toggle with `agents.review.enabled` in `config.yaml`.
+
+### Credential Renewal
+
+Agent pods mount the `claude-credentials` Secret read-only and copy it
+into an `emptyDir`, so any OAuth token the Claude CLI refreshes inside a
+pod is discarded when that pod exits. `scripts/setup.sh` writes the
+Secret once, from the host's `~/.claude/.credentials.json`; nothing
+updated it afterwards. When its access token expired, every agent failed
+in well under a second with `OAuth session expired and could not be
+refreshed`, produced no output, and was respawned on the next reconcile
+pass indefinitely -- a review agent burned 139 runs on one PR this way,
+because `maxAgentReviewsPerPR` counts *posted* reviews and a run that
+posts nothing never increments it.
+
+`pkg/credentials` closes that. The orchestrator checks the Secret every
+`agents.credentials.checkIntervalSeconds` and performs the OAuth
+`refresh_token` grant when the token is within
+`refreshBeforeExpirySeconds` of expiring, writing the result back to the
+Secret. Three details matter:
+
+- **One refresher, not N.** Refresh tokens rotate, so pods refreshing
+  independently meant the first one consumed the stored token and
+  invalidated it for every other pod. Agents are now pure consumers.
+- **Unmodelled fields round-trip.** The document is decoded with
+  `UseNumber()` into a generic map and only the fields the token
+  response speaks to are replaced, so fields this code does not model
+  survive and millisecond epochs stay integer literals rather than being
+  rewritten into exponent notation.
+- **A dead refresh token fails loudly** with the operator action
+  (`claude login`, then re-run `scripts/setup.sh`) instead of retrying a
+  token that can never be exchanged.
+
+This persists a credential, not state, so it does not breach the Hard
+Rule above: it caches nothing across calls and answers no question about
+a ticket. Toggle with `agents.credentials.enabled`; an API-key setup is
+skipped automatically.
 
 ### Branch Naming Convention
 
@@ -112,6 +193,30 @@ Fix agents are spawned when a human requests changes on any PR.
 - `agents.taskTimeoutSeconds` (default: 3600) -- K8s Job deadline
 - `agents.retryLimit` (default: 2) -- retries before escalation
 - `agents.containerImage` (default: `agent-worker:latest`)
+- `agents.model` / `agents.effort` (defaults: `claude-opus-5-5`, `high`) --
+  model and effort for the implementing agents: analysis, plan, step,
+  onestep, fix
+- `agents.review.model` / `agents.review.effort` (same defaults) -- model and
+  effort for review agents
+
+Reviewers keep their own keys even while the values match the implementing
+agents': reviewing judges a changeset it cannot compile or test, and moving
+the reviewers alone — by ConfigMap edit, with no image rebuild — is the point
+of the split. Nothing in the code assumes the two stay equal.
+
+All four values are passed straight to the Claude CLI as `--model` /
+`--effort`. A model name the CLI does not recognise is not a startup error:
+every agent exits in under a second with `There's an issue with the selected
+model`, writes nothing, and is respawned on the next reconcile pass
+indefinitely. The dotted spelling `claude-opus-4.8` cost ~40 no-op runs in
+ten minutes this way.
+
+Effort (`low|medium|high|xhigh|max`) buys thinking tokens, which land in
+output. Measured over a week of real runs, output is **0.2%** of token spend
+against **99.8%** in cached context, so raising effort costs almost nothing
+directly -- what it can cost is longer runs, since every added turn re-reads
+the context. Judge a change by run length in the claude-spend data, not by
+output tokens.
 
 In-cluster service URLs:
 - Gitea: `http://gitea-http.gitea.svc.cluster.local:3001`
@@ -153,8 +258,8 @@ Agent containers run non-root (UID 1000), have no K8s API access (`automountServ
 ## Token Optimization Patterns
 
 - **Rolling context summaries**: agents end Taiga comments with `### Context Summary` replacing full history
-- **CLAUDE.md codebase context**: generated during plan phase, auto-loaded by Claude Code for step/fix agents
-- **System prompt caching**: stable context (mode prompt + CLAUDE.md) placed in system prompt for API cache hits
+- **AGENTS.md codebase context**: generated during plan phase, auto-loaded by Claude Code for step/fix agents
+- **System prompt caching**: stable context (mode prompt + AGENTS.md) placed in system prompt for API cache hits
 
 ## Common Troubleshooting
 

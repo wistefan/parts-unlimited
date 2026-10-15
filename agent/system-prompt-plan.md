@@ -16,7 +16,7 @@ for human review.
 3. If a `base:` branch is specified, verify it exists; otherwise use `main`.
 4. Create or reuse the work branch (`ticket-{id}/work`) from the base branch.
 5. Create a plan sub-branch (`ticket-{id}/plan`) from the work branch.
-6. Write `CLAUDE.md` in the repo root (see below).
+6. Write `AGENTS.md` in the repo root (see below).
 7. Write `IMPLEMENTATION_PLAN.md` in the repo root.
 8. Commit both files and push.
 9. Create a pull request targeting the work branch.
@@ -76,9 +76,9 @@ posts the `taiga_comment` on the Taiga ticket for you:
 }
 ```
 
-## CLAUDE.md — Codebase Context File
+## AGENTS.md — Codebase Context File
 
-Create `CLAUDE.md` in the repo root.  This file is automatically loaded by Claude Code
+Create `AGENTS.md` in the repo root.  This file is automatically loaded by Claude Code
 at the start of every session, so step and fix agents will not need to re-explore the
 codebase.  Include:
 
@@ -111,9 +111,17 @@ Tailor the content to what is actually in the repo.  Be specific — list real p
 commands, real class names.  This is NOT documentation for humans; it is a context file
 for AI agents that will work on this codebase. Keep it as small as possible.
 
+**If the repo already has a `CLAUDE.md`, rename it instead of adding a second file:**
+run `git mv CLAUDE.md AGENTS.md`, then update the renamed file's contents to match the
+structure above.  The same applies to any `CLAUDE.md` found in a subdirectory — rename
+each one to `AGENTS.md` in the same commit.  Never leave a `CLAUDE.md` behind and never
+create a new one; `AGENTS.md` is the only codebase-context filename this system uses.
+Also update references to the old filename in files you touch (for example a README
+pointing at `CLAUDE.md`).
+
 ## Important Rules
 
-- Do NOT implement any code — only write the plan and CLAUDE.md.
+- Do NOT implement any code — only write the plan and AGENTS.md.
 - Do NOT create step branches — only the plan branch.
 - Do NOT call Taiga or Gitea APIs directly — the bootstrap script handles PR creation
   and comment posting.
@@ -121,6 +129,10 @@ for AI agents that will work on this codebase. Keep it as small as possible.
 - Consider the existing codebase structure when planning.
 - Follow the project's conventions (language, framework, testing patterns).
 - The plan should respect the code quality standards:
-  - Every public method documented per language conventions.
+  - Every public method documented per language conventions, kept terse — one
+    line on what it is and why, no `@param`/`@return` echoes of the signature.
   - No magic constants.
   - Parameterized tests where possible.
+- When you write the `## Key Conventions` section of `AGENTS.md`, record the
+  repo's *actual* doc-comment density so later agents match it instead of
+  inflating it.

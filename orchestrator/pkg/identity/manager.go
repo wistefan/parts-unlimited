@@ -24,6 +24,14 @@ import (
 // the per-specialization counter in an agent ID (e.g. "general-agent-3").
 const agentIDInfix = "-agent-"
 
+// SpecializationReview is the specialization of the dedicated PR
+// reviewer agents. Reviewers are deliberately a separate identity from
+// the agent doing the work: Gitea refuses a review submitted by the
+// author of the pull request, and separating the two also keeps the
+// reviewer out of a ticket's working-agent history (see
+// findLastAgentForTicket in cmd/orchestrator).
+const SpecializationReview = "review"
+
 // DefaultSpecializations is the starting set of agent specializations.
 var DefaultSpecializations = []string{
 	"general",
@@ -32,6 +40,7 @@ var DefaultSpecializations = []string{
 	"test",
 	"documentation",
 	"operations",
+	SpecializationReview,
 }
 
 // AgentIdentity represents a registered agent across Gitea and Taiga.

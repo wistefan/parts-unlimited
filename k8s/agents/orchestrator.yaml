@@ -26,6 +26,27 @@ data:
       taskTimeoutSeconds: 3600
       retryLimit: 2
       containerImage: "localhost:5000/agent-worker:latest"
+      # Claude model and effort for the implementing agents (analysis,
+      # plan, step, onestep, fix). Both go straight to the Claude CLI as
+      # --model / --effort, so a model id the CLI does not know makes
+      # every agent die in under a second and be respawned forever —
+      # change it with care. Effort is low|medium|high|xhigh|max.
+      model: "claude-opus-5-5"
+      effort: "high"
+      review:
+        # Automated senior-engineer PR reviews. A dedicated review-agent-N
+        # posts a COMMENT review on each open ticket PR whose head commit
+        # has not been reviewed yet. It never approves, requests changes,
+        # or merges — that stays with the human. Set false to disable.
+        enabled: true
+        # Separate keys from the implementing agents above even when the
+        # values match, so reviewers can be moved on their own.
+        model: "claude-opus-5-5"
+        effort: "high"
+      specializations:
+        # Reviewers read code and report; they never modify a repository.
+        review:
+          allowedTools: ["Read", "Glob", "Grep", "Bash", "Task"]
     notifications:
       webhookUrl: ""
       dashboardPort: 8080

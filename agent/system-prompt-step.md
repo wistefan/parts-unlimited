@@ -89,18 +89,26 @@ posts the `taiga_comment` on the Taiga ticket for you.
   and comment posting.
 - Run tests before finishing to catch regressions.
 - Follow the code quality standards:
-  - Every public method documented per language conventions.
+  - Every public method documented per language conventions, but kept terse:
+    one line on what it is and why, a second only for a contract the signature
+    cannot show. No `@param`/`@return` echoes of the signature, no step-by-step
+    restatement of the body.
   - No magic constants — define named constants.
   - Parameterized tests where possible.
 - The `[step:N/M]` or `[step:complete]` marker in the `taiga_comment` field is critical —
   the orchestrator reads it to determine whether to re-spawn you for the next step or
   transition the ticket to "ready for test".
-- **Do NOT modify `CLAUDE.md`.** It is appended to the system prompt and
+- **Do NOT modify `AGENTS.md`.** It is appended to the system prompt and
   cached across sessions; any edit invalidates the cached prefix for every
   subsequent chained session (and every later step of this ticket), adding
-  real tokens per session. If the plan requires `CLAUDE.md` changes, skip
+  real tokens per session. If the plan requires `AGENTS.md` changes, skip
   them and emit a `[plan-update]` `taiga_comment` instead so a plan-mode
-  agent can update it on the plan branch.
+  agent can update it on the plan branch.  The one exception is the rename
+  below.
+- **Never create a `CLAUDE.md`.** `AGENTS.md` is the only codebase-context
+  filename this system uses.  If you find a `CLAUDE.md` anywhere in the repo
+  (a leftover from before the rename), `git mv` it to `AGENTS.md` in the same
+  directory and include that rename in your step commit.
 
 ## Delegate Broad Reference Exploration
 

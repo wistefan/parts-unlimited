@@ -23,12 +23,12 @@ import (
 
 	"github.com/wistefan/dev-env/orchestrator/pkg/assignment"
 	"github.com/wistefan/dev-env/orchestrator/pkg/config"
+	"github.com/wistefan/dev-env/orchestrator/pkg/credentials"
 	"github.com/wistefan/dev-env/orchestrator/pkg/gitea"
 	"github.com/wistefan/dev-env/orchestrator/pkg/identity"
 	"github.com/wistefan/dev-env/orchestrator/pkg/lifecycle"
 	"github.com/wistefan/dev-env/orchestrator/pkg/notifications"
 	"github.com/wistefan/dev-env/orchestrator/pkg/reconciler"
-	"github.com/wistefan/dev-env/orchestrator/pkg/review"
 	"github.com/wistefan/dev-env/orchestrator/pkg/taiga"
 	"github.com/wistefan/dev-env/orchestrator/pkg/webhooks"
 )
@@ -51,6 +51,14 @@ const (
 
 	// StatusReadyForTest is the Taiga status name for completed tickets.
 	StatusReadyForTest = "ready for test"
+
+	// defaultReviewerTools is the tool set a review agent runs with when
+	// config.yaml does not override it. Read-only by construction: no
+	// Edit, no Write, so a reviewer cannot modify the code under review
+	// even if its prompt were subverted. Bash is retained because
+	// reviewing needs `git log`/`git diff`, and Task for delegating
+	// repo exploration.
+	defaultReviewerTools = "Read Glob Grep Bash Task"
 )
 
 // orchestrator holds all initialized subsystems.
@@ -61,7 +69,6 @@ type orchestrator struct {
 	lifecycleMgr        *lifecycle.Manager
 	identityMgr         *identity.Manager
 	notifySvc           *notifications.Service
-	reviewSvc           *review.Service
 	webhookHandler      *webhooks.Handler
 	giteaWebhookHandler *webhooks.GiteaHandler
 
@@ -74,6 +81,10 @@ type orchestrator struct {
 	// registeredRepos tracks repos that have a Gitea webhook registered.
 	// Prevents duplicate webhook registrations within a single run.
 	registeredRepos map[string]bool
+
+	// credentialMgr renews the Claude OAuth credential Secret that agent
+	// pods mount. Nil when renewal is disabled in config.
+	credentialMgr *credentials.Manager
 
 	// reconcilerSvc is the stateless Taiga+Gitea-derived reconciler — the
 	// single spawn path. Webhooks nudge it via ReconcileTicket; the
@@ -149,6 +160,18 @@ func main() {
 	// The stateless reconciler is the single spawn path.
 	go orch.runReconcilerLoop(ctx, orch.reconcilerSvc)
 	log.Printf("Reconciler running (interval: %s)", ReconcileInterval)
+
+	// Keep the credential agents mount from going stale. Agents cannot
+	// do this for themselves: they have no K8s API access by design, and
+	// the copy they refresh lives in an emptyDir that dies with the pod.
+	if orch.credentialMgr != nil {
+		credInterval := time.Duration(cfg.Agents.Credentials.CheckIntervalSeconds) * time.Second
+		go orch.runCredentialRefreshLoop(ctx, orch.credentialMgr, credInterval)
+		log.Printf("Credential renewal running (interval: %s, refreshing %ds before expiry)",
+			credInterval, cfg.Agents.Credentials.RefreshBeforeExpirySeconds)
+	} else {
+		log.Printf("Credential renewal disabled — the mounted Claude credential will expire on its own")
+	}
 
 	// Start server in goroutine
 	go func() {
@@ -273,6 +296,10 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 		TaskTimeoutSeconds: int64(cfg.Agents.TaskTimeoutSeconds),
 		RetryLimit:         int32(cfg.Agents.RetryLimit),
 		TTLAfterFinished:   lifecycle.DefaultTTLAfterFinished,
+		ClaudeModel:        cfg.Agents.Model,
+		ReviewClaudeModel:  cfg.Agents.Review.Model,
+		ClaudeEffort:       cfg.Agents.Effort,
+		ReviewClaudeEffort: cfg.Agents.Review.Effort,
 	}
 	lifecycleMgr := lifecycle.NewManager(clientset, lcConfig)
 
@@ -286,8 +313,6 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 		DesktopNotify: cfg.Notifications.DesktopNotify,
 	})
 
-	reviewSvc := review.NewService(giteaClient, review.DefaultConfig())
-
 	webhookHandler := webhooks.NewHandler(cfg.Taiga.WebhookSecret)
 	giteaWebhookHandler := webhooks.NewGiteaHandler("") // secret set later if configured
 
@@ -298,7 +323,6 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 		lifecycleMgr:        lifecycleMgr,
 		identityMgr:         identityMgr,
 		notifySvc:           notifySvc,
-		reviewSvc:           reviewSvc,
 		webhookHandler:      webhookHandler,
 		giteaWebhookHandler: giteaWebhookHandler,
 		projectID:           project.ID,
@@ -324,7 +348,20 @@ func initialize(ctx context.Context, cfg *config.Config) (*orchestrator, error) 
 		InProgressID:   inProgressID,
 		HumanTaigaID:   humanTaigaID,
 		MaxConcurrency: cfg.Agents.MaxConcurrency,
+		ReviewEnabled:  cfg.Agents.Review.Enabled,
 	})
+	log.Printf("  Automated PR review: %v", cfg.Agents.Review.Enabled)
+
+	// Agents cannot renew the credential they mount: they hold no K8s
+	// API access by design, and the copy they refresh lives in an
+	// emptyDir that dies with the pod. The orchestrator owns it.
+	if cfg.Agents.Credentials.Enabled {
+		orch.credentialMgr = credentials.NewManager(clientset, credentials.Config{
+			Namespace:           cfg.Kubernetes.Namespace,
+			SecretName:          cfg.Agents.Credentials.SecretName,
+			RefreshBeforeExpiry: time.Duration(cfg.Agents.Credentials.RefreshBeforeExpirySeconds) * time.Second,
+		})
+	}
 
 	log.Println("Initialization complete.")
 	return orch, nil
@@ -771,7 +808,7 @@ func (o *orchestrator) pinRepoToTicket(ticketID int, agentID string, spec *lifec
 // recent agent that commented on this ticket, derived from Taiga
 // comment history (the orchestrator keeps no local state). Continuing
 // with the same agent on each iteration keeps branch ownership, the
-// pushed IMPLEMENTATION_PLAN.md, and any CLAUDE.md context coherent;
+// pushed IMPLEMENTATION_PLAN.md, and any AGENTS.md context coherent;
 // switching agents mid-ticket loses all of that and the new agent
 // often re-does early steps. Returns "" when no agent has commented
 // yet (first-agent case).
@@ -781,6 +818,13 @@ func (o *orchestrator) findLastAgentForTicket(ticketID int) string {
 		return ""
 	}
 	for _, c := range comments {
+		// Reviewer agents are not working agents — they never own a
+		// ticket's branches or plan. They are not supposed to comment on
+		// Taiga at all, but skipping them here means a stray comment can
+		// never hand the ticket to an identity that cannot push.
+		if strings.HasPrefix(c.User.Username, reconciler.ReviewAgentPrefix) {
+			continue
+		}
 		if strings.Contains(c.User.Username, "-agent-") {
 			return c.User.Username
 		}
@@ -897,6 +941,42 @@ func (o *orchestrator) runReconcilerLoop(ctx context.Context, r *reconciler.Reco
 	}
 }
 
+// runCredentialRefreshLoop keeps the Claude OAuth credential Secret
+// valid for the agents that mount it.
+//
+// A failure is logged and retried on the next tick rather than being
+// fatal: the current token usually still has time left on it (renewal
+// starts well before expiry), so one failed attempt is not yet an
+// outage. The message says what an operator has to do when it is.
+func (o *orchestrator) runCredentialRefreshLoop(ctx context.Context, m *credentials.Manager, interval time.Duration) {
+	check := func() {
+		refreshed, err := m.EnsureFresh(ctx)
+		if err != nil {
+			log.Printf("ERROR: Claude credential renewal failed: %v", err)
+			return
+		}
+		if refreshed {
+			log.Printf("Claude credential renewed; agents will pick it up on their next pod")
+		}
+	}
+
+	// Immediate first pass: an orchestrator restarting after a long
+	// downtime should not leave agents failing for a whole interval.
+	check()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			check()
+		}
+	}
+}
+
 // orchSpawner adapts the orchestrator's internal spawn helpers to the
 // reconciler.Spawner interface. The reconciler decides WHICH mode to
 // spawn; the adapter handles agent identity selection, Taiga
@@ -919,6 +999,13 @@ func (o *orchestrator) spawnForReconciler(ctx context.Context, ticketID int, d r
 	if o.ticketAssignedToHuman(ticketID) {
 		log.Printf("Ticket #%d: assigned to human, skipping %s spawn", ticketID, d.Mode)
 		return nil
+	}
+
+	// Review agents are spawned on a separate path: they neither own the
+	// ticket nor advance its lifecycle, so none of the status/assignment
+	// bookkeeping below applies to them.
+	if d.Mode == reconciler.ModeReview {
+		return o.spawnReviewAgent(ctx, ticketID, d, busy)
 	}
 
 	// When the ticket is still in "ready" but we are spawning a
@@ -980,6 +1067,80 @@ func (o *orchestrator) spawnForReconciler(ctx context.Context, ticketID int, d r
 		return fmt.Errorf("creating job: %w", err)
 	}
 	log.Printf("Ticket #%d: %s agent %s spawned (job: %s)", ticketID, d.Mode, agent.ID, jobName)
+	return nil
+}
+
+// spawnReviewAgent spawns a reviewer agent against the pull request
+// named by the decision.
+//
+// It deliberately does NOT reuse the ticket's sticky working agent, and
+// deliberately does NOT touch the ticket's Taiga status or assignee:
+//
+//   - Gitea rejects a review submitted by the author of the PR, and the
+//     ticket's working agent is always that author.
+//   - findLastAgentForTicket derives the ticket's owning agent from
+//     Taiga comment history. A reviewer that assigned itself to the
+//     ticket would be picked up as the owner, and the next step agent
+//     would switch identity mid-ticket — the exact failure that
+//     errPreviousAgentBusy exists to prevent.
+//
+// Reviewers are therefore drawn from their own specialization pool and
+// leave no trace on the ticket; their entire output is the review on
+// the pull request.
+func (o *orchestrator) spawnReviewAgent(ctx context.Context, ticketID int, d reconciler.Decision, busy map[string]bool) error {
+	if d.Review == nil {
+		return fmt.Errorf("review decision for ticket #%d carries no target", ticketID)
+	}
+
+	reviewer, err := o.identityMgr.GetOrCreateAgent(identity.SpecializationReview, busy)
+	if err != nil {
+		return fmt.Errorf("picking reviewer: %w", err)
+	}
+
+	// A reviewer reads and reports; it must not be able to change the
+	// code it is judging. Restricting the tool set is the enforcement —
+	// the system prompt is only the explanation.
+	allowedTools := defaultReviewerTools
+	if spec, ok := o.cfg.Agents.Specializations[identity.SpecializationReview]; ok && len(spec.AllowedTools) > 0 {
+		allowedTools = strings.Join(spec.AllowedTools, " ")
+	}
+
+	// Read access is enough — a reviewer never pushes. Granting write
+	// would hand the one identity that must not alter the PR the means
+	// to do so.
+	if d.Review.Owner != reviewer.ID {
+		if err := o.giteaClient.AddCollaborator(d.Review.Owner, d.Review.Repo, reviewer.ID, "read"); err != nil {
+			log.Printf("WARNING: ticket #%d: could not grant reviewer %s read access to %s/%s: %v",
+				ticketID, reviewer.ID, d.Review.Owner, d.Review.Repo, err)
+		}
+	}
+
+	spec := &lifecycle.AgentJobSpec{
+		AgentID:        reviewer.ID,
+		Specialization: reviewer.Specialization,
+		TicketID:       ticketID,
+		Mode:           d.Mode,
+		GiteaUsername:  reviewer.ID,
+		GiteaPassword:  reviewer.Password,
+		TaigaUsername:  reviewer.ID,
+		TaigaPassword:  reviewer.Password,
+		HumanUsername:  o.cfg.Taiga.HumanUsername,
+		HumanTaigaID:   o.humanTaigaID,
+		TaigaProjectID: o.projectID,
+		AllowedTools:   allowedTools,
+		PRNumber:       d.Review.Number,
+		PRRepo:         d.Review.Owner + "/" + d.Review.Repo,
+		PRHeadSHA:      d.Review.HeadSHA,
+		RepoOwner:      d.Review.Owner,
+		RepoName:       d.Review.Repo,
+	}
+
+	jobName, err := o.lifecycleMgr.CreateJob(ctx, spec)
+	if err != nil {
+		return fmt.Errorf("creating review job: %w", err)
+	}
+	log.Printf("Ticket #%d: review agent %s spawned for %s/%s#%d (job: %s)",
+		ticketID, reviewer.ID, d.Review.Owner, d.Review.Repo, d.Review.Number, jobName)
 	return nil
 }
 

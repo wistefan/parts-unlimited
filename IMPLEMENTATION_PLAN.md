@@ -206,12 +206,12 @@ topk(5, sum by (ticket_id) (agent_tool_calls_total{tool="Bash"}))
 
 #### Step 5: Update documentation and configuration
 
-- Update `CLAUDE.md` with: new monitoring URLs (`Prometheus: localhost:9090`, `Grafana: localhost:3000`), updated `import-images.sh` if monitoring images need caching, new env vars (`PUSHGATEWAY_URL`).
+- Update `AGENTS.md` with: new monitoring URLs (`Prometheus: localhost:9090`, `Grafana: localhost:3000`), updated `import-images.sh` if monitoring images need caching, new env vars (`PUSHGATEWAY_URL`).
 - Update `config.yaml` with a new `monitoring` section (Pushgateway URL, enable/disable flag).
 - Update agent system prompts if needed (no changes expected -- agents don't interact with monitoring).
 - Add `PUSHGATEWAY_URL` to `agent-service-endpoints` ConfigMap in `scripts/setup.sh`.
 
-**Files:** `CLAUDE.md`, `config.yaml`, `scripts/setup.sh`, `k8s/agents/orchestrator.yaml` (ConfigMap)
+**Files:** `AGENTS.md`, `config.yaml`, `scripts/setup.sh`, `k8s/agents/orchestrator.yaml` (ConfigMap)
 
 ### Identified Optimization Opportunities (enabled by this work)
 
@@ -219,13 +219,13 @@ Once the metrics pipeline is running, the following analyses become possible:
 
 | Question | How to Answer | Potential Optimization |
 |---|---|---|
-| Which mode uses the most tokens per ticket? | `sum by (mode) (agent_tokens_input_total + agent_tokens_output_total + agent_tokens_cache_write_total)` | If `step` dominates, invest in better CLAUDE.md context to reduce tool-call exploration. |
+| Which mode uses the most tokens per ticket? | `sum by (mode) (agent_tokens_input_total + agent_tokens_output_total + agent_tokens_cache_write_total)` | If `step` dominates, invest in better AGENTS.md context to reduce tool-call exploration. |
 | Does cache hit ratio drop in later sessions? | `agent_session_cache_hit_ratio` over session number | If yes, the session context summary may be too large or too different from the system prompt, defeating caching. Tune summary size. |
 | Which tools cause the largest token spikes? | `agent_tool_tokens_after` by `tool` | If `Read` on large files dominates, add file size limits or pre-filter content before passing to the agent. |
 | Are PR reviews token-heavy relative to their value? | `orchestrator_review_tokens_input` + `_output` vs. `review_invocations_total` | If reviews consume many tokens but rarely produce actionable issues, reduce review frequency or use a cheaper model. |
-| Do some specializations use more tokens than others? | `sum by (specialization) (agent_tokens_input_total + agent_tokens_output_total)` | Route expensive specializations to cheaper models, or improve their CLAUDE.md context. |
+| Do some specializations use more tokens than others? | `sum by (specialization) (agent_tokens_input_total + agent_tokens_output_total)` | Route expensive specializations to cheaper models, or improve their AGENTS.md context. |
 | Is the 50-turn session limit optimal? | Compare `agent_session_cache_hit_ratio` and `agent_session_tokens_cache_write` across sessions | Tuning `TURNS_PER_SESSION` could reduce cache write costs. |
-| How much does CLAUDE.md size affect first-turn cache writes? | Correlate `agent_session_prompt_bytes{session="1"}` with `agent_session_tokens_cache_write{session="1"}` | Right-size CLAUDE.md: too large = expensive cache writes; too small = more tool exploration later. |
+| How much does AGENTS.md size affect first-turn cache writes? | Correlate `agent_session_prompt_bytes{session="1"}` with `agent_session_tokens_cache_write{session="1"}` | Right-size AGENTS.md: too large = expensive cache writes; too small = more tool exploration later. |
 
 ### Rollout Plan
 

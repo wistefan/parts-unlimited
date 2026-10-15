@@ -32,11 +32,78 @@ agents:
   # Docker image for agent worker containers
   containerImage: "localhost:5000/agent-worker:latest"
 
+  # Claude model and effort for the implementing agents: analysis, plan,
+  # step, onestep and fix. Review agents are set separately below.
+  #
+  # This is passed to the Claude CLI as --model, so it must be a model id
+  # the CLI accepts. A name it does not know is not a startup error: every
+  # agent dies in under a second with "There's an issue with the selected
+  # model", posts nothing, and is respawned on the next reconcile pass
+  # forever (observed with the dotted spelling `claude-opus-4.8`, which
+  # burned ~40 runs in ten minutes).
+  model: "claude-opus-5-5"
+
+  # Effort level: low, medium, high, xhigh, max. Passed to the CLI as
+  # --effort. Thinking tokens land in output, which is ~0.2% of this
+  # system's token spend, so raising this is close to free directly; the
+  # cost it can add is longer runs, which re-read the cached context on
+  # every turn. Leave empty to keep the CLI's own per-model default.
+  effort: "high"
+
+  # Automated senior-engineer PR reviews.
+  review:
+    # When true, a dedicated `review-agent-N` posts a COMMENT review on
+    # every open ticket PR whose head commit has not been reviewed yet.
+    # Review agents never approve, never request changes and never merge
+    # — approving remains the human's job.
+    enabled: true
+
+    # Claude model and effort for review agents. Separate keys from the
+    # implementing agents above even when the values match: reviewing
+    # judges a changeset it cannot compile or test, and being able to
+    # move the reviewers alone is the point of the split.
+    model: "claude-opus-5-5"
+    effort: "high"
+
+  # Automatic renewal of the Claude OAuth credential agents mount.
+  #
+  # scripts/setup.sh copies the host's ~/.claude/.credentials.json into
+  # the `claude-credentials` Secret once. Agent pods mount it read-only
+  # and copy it into an emptyDir, so a token the Claude CLI refreshes
+  # inside a pod is discarded when the pod exits — the Secret itself
+  # never moves. Left alone it expires, and from then on every agent
+  # fails in under a second with "OAuth session expired", writes
+  # nothing, and gets respawned on the next reconcile pass forever.
+  #
+  # With this on, the orchestrator performs the refresh centrally and
+  # writes the result back to the Secret. That also removes the race
+  # between pods: refresh tokens rotate, so whichever pod refreshed
+  # first used to invalidate the stored token for all the others.
+  credentials:
+    # When false the Secret is never touched. Set this only for an
+    # API-key setup (ANTHROPIC_API_KEY), which has nothing to renew —
+    # the orchestrator already skips such a Secret on its own.
+    enabled: true
+
+    # Secret holding the credential, as created by scripts/setup.sh.
+    secretName: "claude-credentials"
+
+    # Renew this long before the access token expires. Must exceed
+    # checkIntervalSeconds, or a token can lapse between two checks.
+    refreshBeforeExpirySeconds: 1800
+
+    # How often to examine the credential. Cheap — a Secret read, and an
+    # HTTP call only when the token is actually close to expiring.
+    checkIntervalSeconds: 300
+
   # Per-specialization tool restrictions.
   # Omitted specializations use the default allowed tools (all).
   specializations:
     documentation:
       allowedTools: ["Read", "Edit", "Write", "Glob", "Grep"]
+    # Reviewers read code and report; they never modify a repository.
+    review:
+      allowedTools: ["Read", "Glob", "Grep", "Bash", "Task"]
 
 notifications:
   # URL to POST notification events to (empty = disabled)

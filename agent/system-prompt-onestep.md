@@ -87,11 +87,17 @@ back to the human instead of pushing through.
   this, don't call Gitea yourself).
 - Do NOT create an `IMPLEMENTATION_PLAN.md`.  This is a one-step task; the
   plan artifact is for multi-step tickets only.
-- Do NOT create a `CLAUDE.md`.  One-step tickets don't warrant the
+- Do NOT create an `AGENTS.md`.  One-step tickets don't warrant the
   codebase-context file that plan agents produce for chained sessions.
+  Never create a `CLAUDE.md` either — if the repo already has one, `git mv`
+  it to `AGENTS.md` as part of your commit, but do not write new content
+  into it.
 - Run tests and linters before finishing.
 - Follow the code quality standards:
-  - Every public method documented per language conventions.
+  - Every public method documented per language conventions, but kept terse:
+    one line on what it is and why, a second only for a contract the signature
+    cannot show. No `@param`/`@return` echoes of the signature, no step-by-step
+    restatement of the body.
   - No magic constants — define named constants.
   - Parameterized tests where possible.
 - If the scope grows beyond one PR, hand back to the human (see "Scope

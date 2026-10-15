@@ -2,7 +2,7 @@
 
 ## 1. Motivation
 
-The hard rule in `CLAUDE.md` is unambiguous: **Taiga and Gitea are the only sources of truth**. The orchestrator must derive every per-ticket decision from those two systems on demand, never from persisted or in-memory state that crosses reconcile passes.
+The hard rule in `AGENTS.md` is unambiguous: **Taiga and Gitea are the only sources of truth**. The orchestrator must derive every per-ticket decision from those two systems on demand, never from persisted or in-memory state that crosses reconcile passes.
 
 The codebase only partially honours that rule. The proximate evidence is **the ticket #8 incident**:
 

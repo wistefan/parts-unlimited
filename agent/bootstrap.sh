@@ -18,21 +18,32 @@
 # /home/agent/.claude/.credentials.json (from K8s Secret).
 #
 # Optional environment variables:
-#   MODE                   - Agent mode: analysis, plan, step, fix (default: step)
+#   MODE                   - Agent mode: analysis, plan, onestep, step, fix,
+#                            review (default: step)
 #   PLAN_STEP              - Implementation plan step number to work on
 #   REPO_OWNER             - Gitea repo owner (extracted from ticket if not set)
 #   REPO_NAME              - Gitea repo name (extracted from ticket if not set)
 #   ALLOWED_TOOLS          - Space-separated list of allowed Claude tools
 #   HUMAN_USERNAME         - Taiga username of the human user (for reassignment)
 #   HUMAN_TAIGA_ID         - Taiga user ID of the human user (for reassignment)
-#   PR_NUMBER              - PR number to fix (fix mode only)
-#   PR_REPO                - "{owner}/{repo}" of the PR (fix mode only)
+#   PR_NUMBER              - PR number to fix or review (fix and review modes)
+#   PR_REPO                - "{owner}/{repo}" of the PR (fix and review modes)
+#   PR_HEAD_SHA            - Head commit the reconciler decided to review. Recorded
+#                            in the posted review so the orchestrator can tell which
+#                            revision has been reviewed (review mode only).
 
 set -euo pipefail
 
 WORKSPACE="/home/agent/workspace"
 PROMPT_FILE="/home/agent/task-prompt.md"
 RESULT_FILE="/home/agent/result.json"
+
+# Repo-root file holding the agent-facing codebase context that plan agents
+# write.  LEGACY_CONTEXT_FILE is the pre-rename name; repos planned before the
+# rename still carry it, and agents are instructed to rename it on their next
+# commit.
+CONTEXT_FILE="AGENTS.md"
+LEGACY_CONTEXT_FILE="CLAUDE.md"
 
 # --- Validation ---
 
@@ -64,6 +75,12 @@ HUMAN_USERNAME="${HUMAN_USERNAME:-}"
 HUMAN_TAIGA_ID="${HUMAN_TAIGA_ID:-}"
 PR_NUMBER="${PR_NUMBER:-}"
 PR_REPO="${PR_REPO:-}"
+PR_HEAD_SHA="${PR_HEAD_SHA:-}"
+
+# Review agents post a comment-only review and nothing else: they never
+# push, never create branches and never comment on Taiga. Every block
+# below that mutates a repository is guarded on this.
+REVIEW_RESULT_FILE="/home/agent/review-result.json"
 
 # --- Helper: request human input and exit cleanly ---
 
@@ -459,7 +476,11 @@ REPO_METADATA=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
     "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}" 2>/dev/null || true)
 UPSTREAM_URL=$(echo "${REPO_METADATA}" | jq -r '.original_url // ""' 2>/dev/null || true)
 
-if [ -n "${UPSTREAM_URL}" ] && [ "${UPSTREAM_URL}" != "null" ]; then
+if [ "${MODE}" = "review" ]; then
+    # A reviewer reads one specific revision. Force-overwriting the base
+    # branch would rewrite the repository it was asked to look at.
+    echo "Review mode — skipping upstream base-branch refresh."
+elif [ -n "${UPSTREAM_URL}" ] && [ "${UPSTREAM_URL}" != "null" ]; then
     echo "Refreshing ${BASE_BRANCH} from upstream ${UPSTREAM_URL}..."
     git remote add upstream "${UPSTREAM_URL}" 2>/dev/null \
         || git remote set-url upstream "${UPSTREAM_URL}"
@@ -483,7 +504,7 @@ fi
 # ticket-level work branch (e.g. ticket-28/work), it only exists on
 # the parent repo, not on the fork.  Detect this via the `parent`
 # field Gitea sets on forked repos and pull the branch across.
-if ! git rev-parse --verify "origin/${BASE_BRANCH}" >/dev/null 2>&1; then
+if [ "${MODE}" != "review" ] && ! git rev-parse --verify "origin/${BASE_BRANCH}" >/dev/null 2>&1; then
     PARENT_FULL_NAME=$(echo "${REPO_METADATA}" | jq -r '.parent.full_name // ""' 2>/dev/null || true)
     if [ -n "${PARENT_FULL_NAME}" ] && [ "${PARENT_FULL_NAME}" != "null" ]; then
         PARENT_CLONE_URL="http://${GITEA_USERNAME}:${GITEA_PASSWORD}@${GITEA_HOST}/${PARENT_FULL_NAME}.git"
@@ -507,6 +528,70 @@ if ! git rev-parse --verify "origin/${BASE_BRANCH}" >/dev/null 2>&1; then
     fi
 fi
 
+# --- Fetch PR metadata (fix and review modes) ---
+#
+# Both modes are anchored to a PR that already exists: a reviewer reads
+# one revision of it, a fix agent pushes new commits onto it. The fetch
+# happens *before* the branch decision below because `fix` derives its
+# branch from `.head.ref` — when it could not, it ran with an empty
+# BRANCH_NAME, which silently disabled the checkout, the push and the
+# no-commit guard alike, so the fix was computed and then thrown away
+# with the ephemeral workspace.
+PR_TITLE_TEXT=""
+PR_BODY_TEXT=""
+PR_BASE_REF=""
+PR_HEAD_REF=""
+PR_DIFF=""
+PR_EXISTING_COMMENTS=""
+
+# Ids of the inline review comments the fix agent is allowed to reply to.
+# A reply is addressed by comment id, and ids are repo-global rather than
+# PR-local, so an id the agent invented could land a reply on an
+# unrelated PR's thread. Only ids actually read off this PR are honoured.
+PR_REPLYABLE_COMMENT_IDS=""
+
+# The PR's repo, which PR_REPO overrides when the orchestrator points the
+# agent at a PR outside the ticket's default repo.
+PR_OWNER="${REPO_OWNER}"
+PR_NAME="${REPO_NAME}"
+
+if [ "${MODE}" = "fix" ] || [ "${MODE}" = "review" ]; then
+    if [ -z "${PR_NUMBER}" ]; then
+        echo "ERROR: ${MODE} mode requires PR_NUMBER."
+        exit 1
+    fi
+
+    if [ -n "${PR_REPO}" ]; then
+        PR_OWNER="${PR_REPO%%/*}"
+        PR_NAME="${PR_REPO##*/}"
+    fi
+
+    echo "Fetching PR #${PR_NUMBER} from ${PR_OWNER}/${PR_NAME}..."
+    PR_JSON=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+        "${GITEA_URL}/api/v1/repos/${PR_OWNER}/${PR_NAME}/pulls/${PR_NUMBER}" 2>/dev/null || true)
+    if [ -z "${PR_JSON}" ]; then
+        echo "ERROR: could not fetch PR #${PR_NUMBER} from ${PR_OWNER}/${PR_NAME}."
+        exit 1
+    fi
+
+    PR_TITLE_TEXT=$(echo "${PR_JSON}" | jq -r '.title // ""')
+    PR_BODY_TEXT=$(echo "${PR_JSON}" | jq -r '.body // ""')
+    PR_BASE_REF=$(echo "${PR_JSON}" | jq -r '.base.ref // ""')
+    PR_HEAD_REF=$(echo "${PR_JSON}" | jq -r '.head.ref // ""')
+
+    # Prefer the SHA the orchestrator decided against. Falling back to
+    # the PR's current head keeps a manual run working; the two differ
+    # only if someone pushed between the decision and this container
+    # starting, and the next reconcile pass catches that.
+    if [ -z "${PR_HEAD_SHA}" ]; then
+        PR_HEAD_SHA=$(echo "${PR_JSON}" | jq -r '.head.sha // ""')
+        echo "  PR_HEAD_SHA not supplied — using current head ${PR_HEAD_SHA}"
+    fi
+
+    echo "  Title: ${PR_TITLE_TEXT}"
+    echo "  ${PR_HEAD_REF} -> ${PR_BASE_REF} @ ${PR_HEAD_SHA}"
+fi
+
 # --- Determine branch ---
 
 BRANCH_PREFIX="ticket-${TICKET_ID}"
@@ -526,8 +611,20 @@ case "${MODE}" in
         BRANCH_NAME="${BRANCH_PREFIX}/onestep"
         ;;
     fix)
-        # Fix mode: check out the existing PR branch (bootstrap determines it later
-        # from the PR data).  Set a placeholder — overridden after PR fetch.
+        # Fix mode pushes onto the PR's own head branch, read from the PR
+        # metadata fetched above. There is deliberately no fallback: a
+        # guessed branch name would put the fix somewhere the PR does not
+        # track, which looks like success and lands nothing.
+        if [ -z "${PR_HEAD_REF}" ]; then
+            echo "ERROR: PR #${PR_NUMBER} reports no head branch — nowhere to place fix commits."
+            request_human_input "PR #${PR_NUMBER} on \`${PR_OWNER}/${PR_NAME}\` reports no head branch, so the fix agent has nowhere to push. Please check the PR."
+            exit 1
+        fi
+        BRANCH_NAME="${PR_HEAD_REF}"
+        ;;
+    review)
+        # Review mode checks out the PR's head revision directly (see the
+        # review checkout block below) and creates no branch of its own.
         BRANCH_NAME=""
         ;;
     step|*)
@@ -553,7 +650,7 @@ esac
 
 # Ensure the work branch exists (all modes except analysis branch off it)
 WORK_BRANCH="${BRANCH_PREFIX}/work"
-if [ "${MODE}" != "analysis" ]; then
+if [ "${MODE}" != "analysis" ] && [ "${MODE}" != "review" ]; then
     if git ls-remote --heads origin "${WORK_BRANCH}" | grep -q "${WORK_BRANCH}"; then
         echo "Work branch exists: ${WORK_BRANCH}"
         git fetch origin "${WORK_BRANCH}"
@@ -569,9 +666,129 @@ if [ -n "${BRANCH_NAME}" ]; then
     if git ls-remote --heads origin "${BRANCH_NAME}" | grep -q "${BRANCH_NAME}"; then
         echo "Resuming work on existing branch: ${BRANCH_NAME}"
         git checkout "${BRANCH_NAME}"
+    elif [ "${MODE}" = "fix" ]; then
+        # The fix branch is the PR's head branch, which exists by
+        # definition. If it is gone the PR can no longer be pushed to;
+        # cutting a fresh branch off the work branch would strand the fix
+        # on a branch the PR does not track.
+        echo "ERROR: head branch ${BRANCH_NAME} of PR #${PR_NUMBER} no longer exists on origin."
+        request_human_input "PR #${PR_NUMBER} head branch \`${BRANCH_NAME}\` is missing on \`${PR_OWNER}/${PR_NAME}\` — the fix agent has nowhere to push. Please restore the branch or close the PR."
+        exit 1
     else
         echo "Creating new branch: ${BRANCH_NAME} from ${WORK_BRANCH}"
         git checkout -b "${BRANCH_NAME}" "origin/${WORK_BRANCH}"
+    fi
+fi
+
+# Revision this branch was at before the agent touched it.
+#
+# The silent-failure guard asks "did this run produce commits?", and for
+# fix mode the only answer available is "is HEAD ahead of the branch the
+# PR tracks?" — a fix agent commits onto an existing branch, so there is
+# no work branch to count against. That comparison must be made against
+# the branch as it stood at checkout, NOT against `origin/${BRANCH_NAME}`
+# read after the run: `push_progress` pushes the session's commits as a
+# crash checkpoint, which makes the remote ref equal to HEAD and turns
+# every successful fix run into a "produced no commits" hand-off. That
+# regression cost ticket #73 its reply on PR #17 — commits landed on the
+# branch, the reviewer got nothing.
+#
+# Empty for analysis and review modes, which own no branch.
+BRANCH_BASE_SHA=""
+if [ -n "${BRANCH_NAME}" ]; then
+    BRANCH_BASE_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+fi
+
+# --- Review mode: check out the PR's head revision ---
+#
+# Reviewers need the code as it stands on the PR, not on any ticket
+# branch. refs/pull/N/head is fetched rather than the head branch name
+# because it resolves for cross-fork PRs too, and it still exists after
+# the head branch is deleted. The PR metadata itself was fetched above.
+if [ "${MODE}" = "review" ]; then
+    if git fetch origin "refs/pull/${PR_NUMBER}/head" 2>/dev/null; then
+        git checkout --detach FETCH_HEAD
+        echo "  Checked out refs/pull/${PR_NUMBER}/head"
+    elif [ -n "${PR_HEAD_REF}" ] && git fetch origin "${PR_HEAD_REF}" 2>/dev/null; then
+        git checkout --detach FETCH_HEAD
+        echo "  Checked out head branch ${PR_HEAD_REF}"
+    else
+        echo "ERROR: could not fetch the head revision of PR #${PR_NUMBER}."
+        exit 1
+    fi
+
+    # Fetch the base too, so the reviewer can run `git diff` / `git log`
+    # against it for context beyond the supplied unified diff.
+    if [ -n "${PR_BASE_REF}" ]; then
+        git fetch origin "${PR_BASE_REF}" 2>/dev/null || true
+    fi
+
+    PR_DIFF=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+        -H "Accept: text/plain" \
+        "${GITEA_URL}/api/v1/repos/${PR_OWNER}/${PR_NAME}/pulls/${PR_NUMBER}.diff" 2>/dev/null || true)
+    if [ -z "${PR_DIFF}" ]; then
+        echo "ERROR: PR #${PR_NUMBER} returned an empty diff — nothing to review."
+        exit 1
+    fi
+    echo "  Diff: $(printf '%s' "${PR_DIFF}" | wc -l) lines"
+fi
+
+# --- Fix mode: collect the review feedback to address ---
+#
+# The fix agent's whole job is "address the review comments", so the
+# comments have to be in its prompt. Both the human's review (which is
+# what triggered this agent) and any advisory reviews left by a review
+# agent are included; the prompt marks which is which.
+if [ "${MODE}" = "fix" ] && [ -n "${PR_NUMBER}" ]; then
+    echo "Fetching review feedback on PR #${PR_NUMBER}..."
+    FIX_REVIEWS=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+        "${GITEA_URL}/api/v1/repos/${PR_OWNER}/${PR_NAME}/pulls/${PR_NUMBER}/reviews" \
+        2>/dev/null || echo '[]')
+
+    # Reviews with an empty body carry only inline comments; keep them so
+    # their code comments are fetched below.
+    FIX_REVIEW_IDS=$(echo "${FIX_REVIEWS}" \
+        | jq -r '[.[] | select(.state != "PENDING")] | .[].id' 2>/dev/null || true)
+
+    for rid in ${FIX_REVIEW_IDS}; do
+        R_META=$(echo "${FIX_REVIEWS}" | jq --argjson id "${rid}" '.[] | select(.id == $id)')
+        R_USER=$(echo "${R_META}" | jq -r '.user.login // "unknown"')
+        R_STATE=$(echo "${R_META}" | jq -r '.state // ""')
+        R_BODY=$(echo "${R_META}" | jq -r '.body // ""')
+
+        # Advisory vs. authoritative: only a human can request changes,
+        # and only the human's verdict gates the merge.
+        R_WEIGHT="human review — authoritative"
+        case "${R_USER}" in
+            review-agent-*) R_WEIGHT="automated reviewer — advisory, use your judgement" ;;
+        esac
+
+        PR_EXISTING_COMMENTS="${PR_EXISTING_COMMENTS}
+### Review by ${R_USER} (${R_STATE}) — ${R_WEIGHT}
+
+${R_BODY}
+"
+        R_COMMENTS=$(curl -sf -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+            "${GITEA_URL}/api/v1/repos/${PR_OWNER}/${PR_NAME}/pulls/${PR_NUMBER}/reviews/${rid}/comments" \
+            2>/dev/null || echo '[]')
+        # The id is rendered into the prompt because it is the address a
+        # threaded reply is posted to: without it the agent can only
+        # answer the review in bulk, not the individual comment.
+        R_COMMENTS_TEXT=$(echo "${R_COMMENTS}" \
+            | jq -r '.[] | "- **\(.path):\(.new_position // .old_position // 0)** (comment_id: \(.id)) — \(.body)"' 2>/dev/null || true)
+        PR_REPLYABLE_COMMENT_IDS="${PR_REPLYABLE_COMMENT_IDS} $(echo "${R_COMMENTS}" \
+            | jq -r '.[] | .id' 2>/dev/null | tr '\n' ' ' || true)"
+        if [ -n "${R_COMMENTS_TEXT}" ]; then
+            PR_EXISTING_COMMENTS="${PR_EXISTING_COMMENTS}
+${R_COMMENTS_TEXT}
+"
+        fi
+    done
+
+    if [ -n "${PR_EXISTING_COMMENTS}" ]; then
+        echo "  Collected review feedback ($(printf '%s' "${PR_EXISTING_COMMENTS}" | wc -l) lines)"
+    else
+        echo "  WARNING: no review feedback found on PR #${PR_NUMBER}."
     fi
 fi
 
@@ -708,16 +925,48 @@ If the scope turned out too large:
         MODE_INSTRUCTIONS="You are a fix agent. Address the review comments on the existing PR.
 
 Review the PR diff and comments below. Fix every issue raised.
-Commit your changes. Do not create new branches or PRs.
+The workspace is already on the PR's head branch \`${BRANCH_NAME}\` — commit
+there. Do not switch branches, create branches, or open PRs; the bootstrap
+pushes this branch and reports back on the PR when you are done.
 
 When done, write /home/agent/completion-status.json:
 \`\`\`json
 {
   \"status\": \"success\",
   \"summary\": \"Addressed N review comments on PR #${PR_NUMBER}.\",
-  \"taiga_comment\": \"[fix:applied]\\n\\nAddressed review feedback on PR #${PR_NUMBER}: <summary>\"
+  \"taiga_comment\": \"[fix:applied]\\n\\nAddressed review feedback on PR #${PR_NUMBER}: <summary>\",
+  \"pr_comment_replies\": [
+    {\"comment_id\": 123, \"reply\": \"Answer to this specific inline comment.\"}
+  ]
 }
-\`\`\`"
+\`\`\`
+
+Every inline comment in the feedback below carries a \`comment_id\`. Put one
+entry in \`pr_comment_replies\` for each one you were asked about — the
+bootstrap posts it as a threaded reply under that exact comment, so the
+reviewer reads your answer where they raised the point. Say what you
+changed, or, for an advisory comment you skipped, why you skipped it. Use
+the ids exactly as given; invented ids are dropped."
+        ;;
+    review)
+        MODE_INSTRUCTIONS="You are an experienced Senior Software Engineer reviewing PR #${PR_NUMBER} on ${REPO_OWNER}/${REPO_NAME}.
+
+Read the diff below and the surrounding code in the workspace (checked out at the PR head). Report what you find.
+
+You are NOT allowed to approve the PR, request changes, merge it, or modify any file. A human decides whether this PR is accepted; your review is advice.
+
+When done, write ${REVIEW_RESULT_FILE}:
+\`\`\`json
+{
+  \"summary\": \"Overall assessment: what the PR does, whether it meets the ticket, headline concerns.\",
+  \"verdict\": \"looks-good | minor-issues | significant-issues\",
+  \"comments\": [
+    {\"path\": \"path/from/repo/root.go\", \"line\": 42, \"severity\": \"blocker|major|minor|question\", \"comment\": \"What is wrong and what to do about it.\"}
+  ]
+}
+\`\`\`
+
+Anchor every inline comment to a line the diff actually touches, on the new side. Points about untouched code belong in the summary. An empty comments list is fine when the PR is sound."
         ;;
     step|*)
         MODE_INSTRUCTIONS="You are a step implementation agent. Implement the next step from the implementation plan.
@@ -751,9 +1000,11 @@ esac
 # redundant — and on chained sessions it gets re-ingested uncached every
 # time, costing real tokens on long-running tickets. Omit it in those modes.
 case "${MODE}" in
-    analysis|plan|onestep)
+    analysis|plan|onestep|review)
         # Onestep has no IMPLEMENTATION_PLAN.md — the ticket description
         # itself is the spec, so we must keep it in the prompt.
+        # Review needs it for a different reason: "does this change do
+        # what was asked" is unanswerable without the ask.
         DESCRIPTION_SECTION="## Ticket Description
 
 ${TICKET_DESCRIPTION}
@@ -763,6 +1014,33 @@ ${TICKET_DESCRIPTION}
         DESCRIPTION_SECTION=""
         ;;
 esac
+
+# PR context section — review mode gets the full diff, fix mode gets the
+# feedback it has to address. Kept out of the heredoc because both are
+# multi-KB blobs with characters the heredoc would try to expand.
+PR_SECTION=""
+if [ "${MODE}" = "review" ]; then
+    PR_SECTION="## Pull Request Under Review
+
+- **PR:** #${PR_NUMBER} on ${REPO_OWNER}/${REPO_NAME}
+- **Title:** ${PR_TITLE_TEXT}
+- **Merging:** \`${PR_HEAD_REF:-unknown}\` into \`${PR_BASE_REF:-unknown}\`
+- **Head commit:** ${PR_HEAD_SHA}
+
+### PR Description
+
+${PR_BODY_TEXT:-_(none)_}
+
+### Diff
+
+\`\`\`diff
+${PR_DIFF}
+\`\`\`
+"
+elif [ "${MODE}" = "fix" ] && [ -n "${PR_EXISTING_COMMENTS}" ]; then
+    PR_SECTION="## Review Feedback to Address (PR #${PR_NUMBER})
+${PR_EXISTING_COMMENTS}"
+fi
 
 cat > "${PROMPT_FILE}" <<PROMPT_EOF
 # Task Assignment
@@ -790,6 +1068,7 @@ ${PLAN_CONTENT}
 PLAN_SECTION
 )
 
+${PR_SECTION}
 ## Instructions
 
 ${MODE_INSTRUCTIONS}
@@ -830,21 +1109,28 @@ elif [ -n "${SYSTEM_PROMPT}" ]; then
     echo "  Using default system prompt"
 fi
 
-# --- Append CLAUDE.md to system prompt for prompt caching ---
+# --- Append AGENTS.md to system prompt for prompt caching ---
 # Claude Code caches the system prompt prefix across all turns in a session.
-# By including CLAUDE.md here (instead of letting the agent read it via a tool
+# By including AGENTS.md here (instead of letting the agent read it via a tool
 # call), the codebase context stays in the cached prefix from turn 1 — saving
 # significant input tokens on every subsequent turn.
+#
+# Repos planned before the AGENTS.md rename still ship a CLAUDE.md, so fall back
+# to it rather than starting those sessions without codebase context.
 
-CLAUDE_MD="${WORKSPACE}/CLAUDE.md"
-if [ -f "${CLAUDE_MD}" ]; then
-    CLAUDE_MD_SIZE=$(wc -c < "${CLAUDE_MD}")
+CONTEXT_MD="${WORKSPACE}/${CONTEXT_FILE}"
+if [ ! -f "${CONTEXT_MD}" ]; then
+    CONTEXT_MD="${WORKSPACE}/${LEGACY_CONTEXT_FILE}"
+fi
+if [ -f "${CONTEXT_MD}" ]; then
+    CONTEXT_MD_NAME=$(basename "${CONTEXT_MD}")
+    CONTEXT_MD_SIZE=$(wc -c < "${CONTEXT_MD}")
     SYSTEM_PROMPT="${SYSTEM_PROMPT}
 
-# Codebase Context (CLAUDE.md)
+# Codebase Context (${CONTEXT_MD_NAME})
 
-$(cat "${CLAUDE_MD}")"
-    echo "  CLAUDE.md appended to system prompt (${CLAUDE_MD_SIZE} bytes)"
+$(cat "${CONTEXT_MD}")"
+    echo "  ${CONTEXT_MD_NAME} appended to system prompt (${CONTEXT_MD_SIZE} bytes)"
 fi
 
 # --- Invoke Claude Code ---
@@ -908,6 +1194,13 @@ if [ -n "${CLAUDE_MODEL:-}" ]; then
     echo "  Model: ${CLAUDE_MODEL}"
 fi
 
+# Effort level. Unset means the CLI keeps its own per-model default, so an
+# orchestrator that predates this variable still produces working agents.
+if [ -n "${CLAUDE_EFFORT:-}" ]; then
+    CLAUDE_ARGS+=(--effort "${CLAUDE_EFFORT}")
+    echo "  Effort: ${CLAUDE_EFFORT}"
+fi
+
 if [ -n "${SYSTEM_PROMPT}" ]; then
     CLAUDE_ARGS+=(--system-prompt "${SYSTEM_PROMPT}")
 fi
@@ -939,6 +1232,20 @@ fi
 
 TURNS_PER_SESSION="${TURNS_PER_SESSION:-30}"
 MAX_SESSIONS="${MAX_SESSIONS:-50}"
+
+# TASK_RESULT_FILE is the file whose existence means "the agent finished".
+# Every implementing mode signals completion with completion-status.json;
+# a reviewer produces a review instead and never writes that file, so the
+# session loop would otherwise run to MAX_SESSIONS on a review that was
+# done in session 1.
+TASK_RESULT_FILE="/home/agent/completion-status.json"
+if [ "${MODE}" = "review" ]; then
+    TASK_RESULT_FILE="${REVIEW_RESULT_FILE}"
+    # Reviewing is bounded work: read a diff, read the touched code,
+    # write a verdict. A reviewer still going after three sessions is
+    # looping, not being thorough.
+    MAX_SESSIONS="${MAX_SESSIONS_REVIEW:-3}"
+fi
 
 # extract_context_summary <result_file>
 # Returns the most recent "### Context Summary" block found anywhere in
@@ -1077,6 +1384,107 @@ if not err:
 print(err or 'no diagnostic available')
 PY
 }
+
+# --- Progress checkpointing ---
+#
+# Work used to reach Gitea only after the whole session loop had finished.
+# Anything that killed the pod first — activeDeadlineSeconds expiring, an
+# eviction, a node restart — therefore discarded every commit the agent
+# had made, and the next agent re-did the step from an empty branch.
+# Observed on ticket #72: a step agent spent an hour producing a 741-line
+# compatibility report plus a TCK baseline run, was killed on the Job
+# deadline mid-run, and left no branch at all behind.
+#
+# Two checkpoints close that window: `push_progress` after every session,
+# and `checkpoint_and_push` from the termination handler.
+
+# Seconds allowed for a checkpoint push. A push that cannot finish in this
+# window is abandoned rather than stalling the session loop or eating the
+# pod's termination grace period.
+PROGRESS_PUSH_TIMEOUT_SECONDS=60
+
+# Subject of the commit that the termination handler creates for an
+# uncommitted worktree. Deliberately recognisable, so a later session or a
+# human can tell a forced checkpoint from a commit the agent authored.
+WIP_COMMIT_SUBJECT="wip(agent): checkpoint uncommitted work"
+
+# PID of the running Claude CLI, or empty between sessions. The
+# termination handler needs it to stop Claude before checkpointing.
+CLAUDE_PID=""
+
+# push_progress <reason>
+# Pushes the commits the agent has already made to its own branch.
+# Deliberately does not commit a dirty worktree: a normal run must not
+# gain checkpoint commits the agent did not author. Never fatal — a failed
+# checkpoint must not end a run that is otherwise making progress.
+push_progress() {
+    local reason="$1"
+
+    # Analysis and review agents own no branch and must not push.
+    [ -n "${BRANCH_NAME}" ] || return 0
+
+    cd "${WORKSPACE}" 2>/dev/null || return 0
+
+    local local_head remote_head
+    local_head=$(git rev-parse HEAD 2>/dev/null || echo "")
+    [ -n "${local_head}" ] || return 0
+    remote_head=$(git rev-parse "origin/${BRANCH_NAME}" 2>/dev/null || echo "")
+    if [ "${local_head}" = "${remote_head}" ]; then
+        return 0
+    fi
+
+    echo "  Checkpoint (${reason}): pushing commits to ${BRANCH_NAME}"
+    if timeout "${PROGRESS_PUSH_TIMEOUT_SECONDS}" \
+        git push -u origin "${BRANCH_NAME}" 2>&1 | sed 's/^/    /'; then
+        echo "    Checkpoint pushed."
+    else
+        echo "    WARNING: checkpoint push failed — continuing, work stays local."
+    fi
+    return 0
+}
+
+# checkpoint_and_push <reason>
+# Last-resort checkpoint for a pod that is going away: commits whatever is
+# in the worktree under WIP_COMMIT_SUBJECT, then pushes. Unlike
+# push_progress this does create a commit, because the alternative is
+# losing the edits outright.
+checkpoint_and_push() {
+    local reason="$1"
+
+    [ -n "${BRANCH_NAME}" ] || return 0
+    cd "${WORKSPACE}" 2>/dev/null || return 0
+
+    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+        git add -A 2>/dev/null || true
+        git commit -m "${WIP_COMMIT_SUBJECT}
+
+Agent ${AGENT_ID} on ticket #${TICKET_ID} (mode ${MODE}) was interrupted
+(${reason}). This commit preserves the worktree as it stood; it is a
+checkpoint, not a finished unit of work." 2>&1 | sed 's/^/    /' || true
+    fi
+
+    push_progress "${reason}"
+}
+
+# on_termination
+# SIGTERM/SIGINT handler. Kubernetes sends SIGTERM when the Job deadline
+# expires or the pod is evicted, then SIGKILLs after the termination grace
+# period, so this has to be quick: stop Claude, checkpoint, exit.
+#
+# Claude therefore runs in the background with `wait` rather than in the
+# foreground — bash defers a trap until the current foreground command
+# returns, which for a running Claude session means never.
+on_termination() {
+    trap '' TERM INT
+    echo ""
+    echo "Received termination signal — checkpointing before exit."
+    if [ -n "${CLAUDE_PID}" ]; then
+        kill -TERM "${CLAUDE_PID}" 2>/dev/null || true
+    fi
+    checkpoint_and_push "pod terminated"
+    exit 143
+}
+trap on_termination TERM INT
 
 while [ "${SESSION_NUM}" -lt "${MAX_SESSIONS}" ]; do
     SESSION_NUM=$((SESSION_NUM + 1))
@@ -1275,16 +1683,25 @@ SLIM_EOF
     # Run Claude with a per-session turn limit
     SESSION_RESULT="/home/agent/session-result-${SESSION_NUM}.json"
     CLAUDE_EXIT=0
+    # Backgrounded so `wait` stays interruptible and on_termination can run
+    # while a session is in flight; see the trap above.
     claude "${CLAUDE_ARGS[@]}" --max-turns "${TURNS_PER_SESSION}" \
-        < "${SESSION_PROMPT_FILE}" > "${SESSION_RESULT}" 2>&1 || CLAUDE_EXIT=$?
+        < "${SESSION_PROMPT_FILE}" > "${SESSION_RESULT}" 2>&1 &
+    CLAUDE_PID=$!
+    wait "${CLAUDE_PID}" || CLAUDE_EXIT=$?
+    CLAUDE_PID=""
 
     echo "  Session ${SESSION_NUM} finished (exit ${CLAUDE_EXIT}, $(wc -c < "${SESSION_RESULT}" 2>/dev/null || echo 0) bytes)"
+
+    # Checkpoint before deciding anything else: from here on the session's
+    # commits survive a kill even if the loop runs for hours more.
+    push_progress "after session ${SESSION_NUM}"
 
     # Append session result to cumulative result for usage tracking
     cat "${SESSION_RESULT}" >> "${CUMULATIVE_RESULT}"
 
     # Check if the agent completed its task
-    if [ -f "/home/agent/completion-status.json" ]; then
+    if [ -f "${TASK_RESULT_FILE}" ]; then
         echo "  Task completed in session ${SESSION_NUM}."
         break
     fi
@@ -1327,7 +1744,7 @@ SLIM_EOF
     echo "  Session ${SESSION_NUM}: extracted context ($(echo "${SESSION_CONTEXT}" | wc -c) bytes)"
 done
 
-if [ "${SESSION_NUM}" -ge "${MAX_SESSIONS}" ] && [ ! -f "/home/agent/completion-status.json" ]; then
+if [ "${SESSION_NUM}" -ge "${MAX_SESSIONS}" ] && [ ! -f "${TASK_RESULT_FILE}" ]; then
     echo "  WARNING: Reached max sessions (${MAX_SESSIONS}) without completing task."
 fi
 
@@ -1423,7 +1840,7 @@ fi
 # Skip this when completion-status.json exists: the agent successfully
 # finished its task before any transient API errors, so normal
 # post-processing should run.
-if [ ! -f "/home/agent/completion-status.json" ] && is_rate_limited "${RESULT_FILE}"; then
+if [ ! -f "${TASK_RESULT_FILE}" ] && is_rate_limited "${RESULT_FILE}"; then
     echo "Claude hit a rate-limit / quota / overload condition — no work to post."
     echo "  Skipping Taiga comment, git push, and PR creation."
     echo "  Exiting 0 so the Job completes cleanly; the orchestrator will reschedule"
@@ -1446,7 +1863,133 @@ echo "  Summary: ${COMPLETION_SUMMARY}"
 
 # --- Mode-specific post-processing ---
 
-if [ "${MODE}" = "analysis" ]; then
+if [ "${MODE}" = "review" ]; then
+    # --- Review mode: post a COMMENT review on the PR, touch nothing else ---
+    #
+    # The event is hard-coded to COMMENT here, in the bootstrap, rather
+    # than taken from the agent's output. That is the enforcement of "the
+    # reviewer may not approve or request changes": there is no value the
+    # agent can write into review-result.json that turns into an APPROVED
+    # or REQUEST_CHANGES review. REQUEST_CHANGES in particular is what
+    # spawns a fix agent, so an agent able to emit it could send other
+    # agents off to act on its own opinion with no human in the loop.
+    REVIEW_EVENT="COMMENT"
+
+    if [ ! -f "${REVIEW_RESULT_FILE}" ]; then
+        echo "  WARNING: no ${REVIEW_RESULT_FILE} produced — the review session failed."
+        echo "  Posting nothing; the reconciler will retry this revision on a later pass."
+        echo ""
+        echo "=== Agent Worker Complete (review produced no result) ==="
+        exit 0
+    fi
+
+    REVIEW_SUMMARY=$(jq -r '.summary // ""' "${REVIEW_RESULT_FILE}" 2>/dev/null || true)
+    REVIEW_VERDICT=$(jq -r '.verdict // ""' "${REVIEW_RESULT_FILE}" 2>/dev/null || true)
+    REVIEW_COMMENT_COUNT=$(jq '[.comments // []] | flatten | length' "${REVIEW_RESULT_FILE}" 2>/dev/null || echo 0)
+
+    echo "  Review verdict: ${REVIEW_VERDICT:-none}"
+    echo "  Inline comments: ${REVIEW_COMMENT_COUNT}"
+
+    # The SHA marker is what makes re-review idempotent: the reconciler
+    # reads it back off the posted review to decide whether this exact
+    # revision has already been looked at. Keep the format in sync with
+    # ReviewSHAMarker() in orchestrator/pkg/reconciler.
+    REVIEW_SHA_MARKER="<!-- agent-review: ${PR_HEAD_SHA} -->"
+
+    REVIEW_BODY="## Automated Review — ${AGENT_ID}
+
+${REVIEW_SUMMARY:-_No summary provided._}"
+
+    if [ -n "${REVIEW_VERDICT}" ]; then
+        REVIEW_BODY="${REVIEW_BODY}
+
+**Verdict:** \`${REVIEW_VERDICT}\`"
+    fi
+
+    if [ -n "${USAGE_SUMMARY}" ]; then
+        REVIEW_BODY="${REVIEW_BODY}
+
+<details><summary>Token usage</summary>
+
+${USAGE_SUMMARY}
+
+</details>"
+    fi
+
+    REVIEW_BODY="${REVIEW_BODY}
+
+---
+*Advisory review by an automated agent. It cannot approve, request changes, or merge — @${HUMAN_USERNAME:-the maintainer} still decides.*
+
+${REVIEW_SHA_MARKER}"
+
+    # Build the Gitea payload. Inline comments are dropped when their
+    # line falls outside the diff (Gitea 422s the whole review in that
+    # case), so each is filtered to a positive line on a non-empty path;
+    # severity is folded into the comment text since Gitea has no field
+    # for it.
+    REVIEW_PAYLOAD=$(jq -n \
+        --arg body "${REVIEW_BODY}" \
+        --arg event "${REVIEW_EVENT}" \
+        --slurpfile result "${REVIEW_RESULT_FILE}" \
+        '(($result[0].comments // []) | map(select(
+                (.path // "") != "" and ((.line // 0) | tonumber? // 0) > 0
+            ) | {
+                path: .path,
+                body: (if (.severity // "") != "" then "**" + (.severity | ascii_upcase) + ":** " + (.comment // "") else (.comment // "") end),
+                new_position: (.line | tonumber)
+            })) as $inline
+         | {body: $body, event: $event}
+         | if ($inline | length) > 0 then . + {comments: $inline} else . end' 2>/dev/null || true)
+
+    if [ -z "${REVIEW_PAYLOAD}" ]; then
+        echo "  WARNING: ${REVIEW_RESULT_FILE} is not valid JSON — falling back to a summary-only review."
+        REVIEW_PAYLOAD=$(jq -n --arg body "${REVIEW_BODY}" --arg event "${REVIEW_EVENT}" \
+            '{body: $body, event: $event}')
+    fi
+
+    echo "Posting review on ${REPO_OWNER}/${REPO_NAME}#${PR_NUMBER}..."
+    REVIEW_HTTP=$(curl -s -o /home/agent/review-response.json -w '%{http_code}' \
+        -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+        -X POST "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews" \
+        -H "Content-Type: application/json" \
+        -d "${REVIEW_PAYLOAD}" 2>/dev/null || echo "000")
+
+    if [ "${REVIEW_HTTP}" = "200" ] || [ "${REVIEW_HTTP}" = "201" ]; then
+        echo "  Review posted (HTTP ${REVIEW_HTTP})."
+    else
+        # Most likely cause: an inline comment anchored outside the diff.
+        # Retry without inline comments so the summary is not lost — an
+        # imperfect review beats a silently dropped one, and the SHA
+        # marker in the body still records the revision as reviewed.
+        echo "  WARNING: review POST failed (HTTP ${REVIEW_HTTP}):"
+        head -c 500 /home/agent/review-response.json 2>/dev/null || true
+        echo ""
+        echo "  Retrying with the summary only..."
+        REVIEW_HTTP=$(curl -s -o /home/agent/review-response.json -w '%{http_code}' \
+            -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+            -X POST "${GITEA_URL}/api/v1/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg body "${REVIEW_BODY}" --arg event "${REVIEW_EVENT}" '{body: $body, event: $event}')" \
+            2>/dev/null || echo "000")
+        if [ "${REVIEW_HTTP}" = "200" ] || [ "${REVIEW_HTTP}" = "201" ]; then
+            echo "  Summary-only review posted (HTTP ${REVIEW_HTTP})."
+        else
+            echo "  ERROR: could not post the review (HTTP ${REVIEW_HTTP})."
+            head -c 500 /home/agent/review-response.json 2>/dev/null || true
+            echo ""
+        fi
+    fi
+
+    # Deliberately no Taiga comment. A reviewer that commented on the
+    # ticket would (a) land in the lifecycle-marker stream the reconciler
+    # parses and (b) be re-ingested into every later agent's prompt. Its
+    # output belongs on the PR.
+    echo ""
+    echo "=== Agent Worker Complete (review posted) ==="
+    exit 0
+
+elif [ "${MODE}" = "analysis" ]; then
     # --- Analysis mode: post result comment, handle need-info ---
 
     ANALYSIS_RESULT=$(jq -r '.analysis_result // ""' /home/agent/completion-status.json 2>/dev/null || true)
@@ -1522,11 +2065,13 @@ else
         if [ -n "$(git status --porcelain)" ]; then
             HAS_NEW_WORK="true"
         elif [ "${MODE}" = "fix" ]; then
-            # Fix mode works on an existing PR branch; new work shows up
-            # as local commits not yet pushed to that same remote branch.
+            # Fix mode works on an existing PR branch, so new work shows
+            # up as commits beyond where that branch stood when this
+            # agent checked it out. Comparing against the *remote* ref
+            # instead would be defeated by `push_progress`, which has
+            # already pushed those very commits — see BRANCH_BASE_SHA.
             LOCAL_HEAD=$(git rev-parse HEAD)
-            REMOTE_HEAD=$(git rev-parse "origin/${BRANCH_NAME}" 2>/dev/null || echo "")
-            if [ -n "${REMOTE_HEAD}" ] && [ "${LOCAL_HEAD}" != "${REMOTE_HEAD}" ]; then
+            if [ -n "${BRANCH_BASE_SHA}" ] && [ "${LOCAL_HEAD}" != "${BRANCH_BASE_SHA}" ]; then
                 HAS_NEW_WORK="true"
             fi
         else
@@ -1632,6 +2177,126 @@ ${COMPLETION_STATUS}"
             else
                 echo "  WARNING: Could not create PR"
             fi
+        fi
+    fi
+
+    # --- Fix mode: answer on the PR itself ---
+    #
+    # A fix agent replies to a review, and the review lives on the PR. A
+    # Taiga-only reply leaves whoever asked for the change looking at an
+    # unchanged PR thread with no sign the request was even read.
+    #
+    # Two things are posted: a threaded reply under each inline comment
+    # the agent answered, then one summary comment for the PR as a whole.
+    #
+    # Both are plain comments rather than a review: Gitea rejects a
+    # review submitted by the PR's own author, and the fix agent is
+    # pushing to the branch it authored. It also keeps the fix agent out
+    # of the review stream the reconciler parses for REQUEST_CHANGES.
+    if [ "${MODE}" = "fix" ] && [ -n "${PR_NUMBER}" ]; then
+        # --- Threaded replies to the individual review comments ---
+        #
+        # The summary comment below reports on the PR as a whole; it does
+        # not tell the reviewer which of their points it answers, and a
+        # reviewer re-reading their own inline comment sees no response at
+        # all. Gitea's reply endpoint posts into the comment's own
+        # conversation thread, so each point is answered where it was
+        # raised. These are plain comments, not a review, so the
+        # self-review restriction does not apply and nothing lands in the
+        # REQUEST_CHANGES stream the reconciler parses.
+        PR_REPLY_ENTRIES=$(jq -c '(.pr_comment_replies // [])[]' \
+            /home/agent/completion-status.json 2>/dev/null || true)
+        REPLIES_POSTED=0
+        REPLIES_SKIPPED=0
+
+        while IFS= read -r reply_entry; do
+            [ -n "${reply_entry}" ] || continue
+
+            REPLY_COMMENT_ID=$(echo "${reply_entry}" \
+                | jq -r 'if (.comment_id // null) == null then "" else (.comment_id | tostring) end' 2>/dev/null || true)
+            REPLY_BODY=$(echo "${reply_entry}" | jq -r '.reply // ""' 2>/dev/null || true)
+
+            if [ -z "${REPLY_COMMENT_ID}" ] || [ -z "${REPLY_BODY}" ]; then
+                echo "  WARNING: dropping a reply with no comment_id or no body."
+                REPLIES_SKIPPED=$((REPLIES_SKIPPED + 1))
+                continue
+            fi
+
+            # Whitelist check — see PR_REPLYABLE_COMMENT_IDS above.
+            case " ${PR_REPLYABLE_COMMENT_IDS} " in
+                *" ${REPLY_COMMENT_ID} "*) ;;
+                *)
+                    echo "  WARNING: dropping reply to comment ${REPLY_COMMENT_ID} — not an inline comment on PR #${PR_NUMBER}."
+                    REPLIES_SKIPPED=$((REPLIES_SKIPPED + 1))
+                    continue
+                    ;;
+            esac
+
+            REPLY_HTTP=$(curl -s -o /home/agent/pr-reply-response.json -w '%{http_code}' \
+                -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+                -X POST "${GITEA_URL}/api/v1/repos/${PR_OWNER}/${PR_NAME}/pulls/${PR_NUMBER}/comments/${REPLY_COMMENT_ID}/replies" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg body "${REPLY_BODY}" '{body: $body}')" 2>/dev/null || echo "000")
+
+            if [ "${REPLY_HTTP}" = "200" ] || [ "${REPLY_HTTP}" = "201" ]; then
+                REPLIES_POSTED=$((REPLIES_POSTED + 1))
+            else
+                # Non-fatal: the commits are pushed either way, and the
+                # summary comment below still records the outcome.
+                echo "  WARNING: reply to comment ${REPLY_COMMENT_ID} failed (HTTP ${REPLY_HTTP}):"
+                head -c 500 /home/agent/pr-reply-response.json 2>/dev/null || true
+                echo ""
+                REPLIES_SKIPPED=$((REPLIES_SKIPPED + 1))
+            fi
+        done <<< "${PR_REPLY_ENTRIES}"
+
+        if [ "${REPLIES_POSTED}" -gt 0 ] || [ "${REPLIES_SKIPPED}" -gt 0 ]; then
+            echo "  Inline replies: ${REPLIES_POSTED} posted, ${REPLIES_SKIPPED} dropped."
+        fi
+
+        if [ "${HAS_NEW_WORK}" = "true" ]; then
+            FIX_PR_COMMENT="## Review feedback addressed — \`${AGENT_ID}\`
+
+${COMPLETION_SUMMARY:-_No summary provided._}
+
+Pushed to \`${BRANCH_NAME}\` ($(git rev-parse --short HEAD 2>/dev/null || echo unknown))."
+        else
+            # Mirrors the silent-failure guard above: the ticket already
+            # carries a request_human_input comment, and the PR should say
+            # the same thing rather than stay silent.
+            FIX_PR_COMMENT="## Review feedback NOT addressed — \`${AGENT_ID}\`
+
+The fix agent produced no commits. A human has been asked to look at ticket #${TICKET_ID}.
+
+**Status:** ${COMPLETION_STATUS}
+**Summary:** ${COMPLETION_SUMMARY:-_none_}"
+        fi
+
+        if [ -n "${USAGE_SUMMARY}" ]; then
+            FIX_PR_COMMENT="${FIX_PR_COMMENT}
+
+<details><summary>Token usage</summary>
+
+${USAGE_SUMMARY}
+
+</details>"
+        fi
+
+        echo "Posting fix summary on ${PR_OWNER}/${PR_NAME}#${PR_NUMBER}..."
+        FIX_COMMENT_HTTP=$(curl -s -o /home/agent/fix-comment-response.json -w '%{http_code}' \
+            -u "${GITEA_USERNAME}:${GITEA_PASSWORD}" \
+            -X POST "${GITEA_URL}/api/v1/repos/${PR_OWNER}/${PR_NAME}/issues/${PR_NUMBER}/comments" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg body "${FIX_PR_COMMENT}" '{body: $body}')" 2>/dev/null || echo "000")
+
+        if [ "${FIX_COMMENT_HTTP}" = "200" ] || [ "${FIX_COMMENT_HTTP}" = "201" ]; then
+            echo "  PR comment posted (HTTP ${FIX_COMMENT_HTTP})."
+        else
+            # Non-fatal: the commits are already pushed, and the Taiga
+            # comment below still records the outcome.
+            echo "  WARNING: could not post the PR comment (HTTP ${FIX_COMMENT_HTTP}):"
+            head -c 500 /home/agent/fix-comment-response.json 2>/dev/null || true
+            echo ""
         fi
     fi
 

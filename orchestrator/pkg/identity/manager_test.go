@@ -261,7 +261,7 @@ func TestRemoveAgent(t *testing.T) {
 }
 
 func TestDefaultSpecializations(t *testing.T) {
-	expected := []string{"general", "frontend", "backend", "test", "documentation", "operations"}
+	expected := []string{"general", "frontend", "backend", "test", "documentation", "operations", SpecializationReview}
 	if len(DefaultSpecializations) != len(expected) {
 		t.Errorf("expected %d specializations, got %d", len(expected), len(DefaultSpecializations))
 	}

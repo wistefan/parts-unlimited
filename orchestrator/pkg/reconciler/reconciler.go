@@ -63,7 +63,36 @@ const (
 	ModeStep     = "step"
 	ModeOnestep  = "onestep"
 	ModeFix      = "fix"
+	ModeReview   = "review"
 )
+
+// ReviewAgentPrefix is the agent-ID prefix of the dedicated reviewer
+// specialization (see identity.DefaultSpecializations). Reviews posted
+// by a user whose login carries this prefix are the orchestrator's own
+// automated reviews; everything else is a human (or a working agent's
+// PR conversation) and must not suppress a review.
+const ReviewAgentPrefix = "review-agent-"
+
+// reviewSHAMarkerPrefix opens the HTML comment every automated review
+// embeds in its body to record the exact revision it examined:
+//
+//	<!-- agent-review: 0a1b2c3... -->
+//
+// Gitea populates a review's commit_id inconsistently for COMMENT-event
+// reviews, so the marker is the authoritative record of "this revision
+// has been reviewed". agent/bootstrap.sh writes it; [ReviewSHAMarker]
+// is the single definition of the format shared by both sides.
+const (
+	reviewSHAMarkerPrefix = "<!-- agent-review: "
+	reviewSHAMarkerSuffix = " -->"
+)
+
+// ReviewSHAMarker returns the marker an automated review embeds in its
+// body to record the head revision it reviewed. Keep in sync with the
+// REVIEW_SHA_MARKER construction in agent/bootstrap.sh.
+func ReviewSHAMarker(sha string) string {
+	return reviewSHAMarkerPrefix + sha + reviewSHAMarkerSuffix
+}
 
 // Lifecycle marker strings posted by agents in Taiga comments. The
 // reconciler recognises these via substring match so agents may embed them
@@ -80,7 +109,7 @@ const (
 )
 
 // PR title substrings used to classify merged PRs as plan vs. step PRs.
-// Plan PRs open the implementation-plan document and ship the CLAUDE.md
+// Plan PRs open the implementation-plan document and ship the AGENTS.md
 // codebase context; step PRs implement a numbered plan step.
 const (
 	planPRTitleMarker      = "Implementation Plan"
@@ -116,6 +145,18 @@ type FixTarget struct {
 	Number int
 }
 
+// ReviewTarget identifies the pull request a review agent should
+// examine, pinned to the exact head revision the decision was made
+// against. Carrying the SHA through to the agent means the review the
+// agent posts records the revision the reconciler judged unreviewed,
+// even if someone pushes again while the Job is starting.
+type ReviewTarget struct {
+	Owner   string
+	Repo    string
+	Number  int
+	HeadSHA string
+}
+
 // Decision is the reconciler's verdict for a ticket on a single pass.
 // Callers inspect [Decision.Action] first and, when it is ActionSpawn,
 // dispatch based on [Decision.Mode].
@@ -130,6 +171,10 @@ type Decision struct {
 	// Fix identifies the PR needing review follow-up. Non-nil only when
 	// Mode == ModeFix.
 	Fix *FixTarget
+
+	// Review identifies the PR awaiting an automated senior-engineer
+	// review. Non-nil only when Mode == ModeReview.
+	Review *ReviewTarget
 
 	// Reason is a short human-readable explanation of why the reconciler
 	// chose this action. Intended for logs, not control flow.
@@ -159,6 +204,8 @@ type PRSnapshot struct {
 //     repositories, each with its own review list.
 //   - humanTaigaID: the Taiga user ID of the human overseeing the
 //     orchestrator. Pass 0 to disable the "assigned to human" check.
+//   - reviewEnabled: whether automated senior-engineer PR reviews are
+//     turned on. Pass false to suppress ModeReview entirely.
 //
 // The decision logic is the single source of truth for "what mode
 // (if any) should run for this ticket right now": comment markers
@@ -169,6 +216,7 @@ func DeriveTicketState(
 	comments []taiga.HistoryEntry,
 	prs []PRSnapshot,
 	humanTaigaID int,
+	reviewEnabled bool,
 ) Decision {
 	if story == nil {
 		return Decision{Action: ActionNone, Reason: "nil story"}
@@ -194,6 +242,25 @@ func DeriveTicketState(
 
 	if recovered, reason := modeFromPRState(prs, comments); recovered != "" {
 		return Decision{Action: ActionSpawn, Mode: recovered, Reason: reason}
+	}
+
+	// Nothing else to do for this ticket: no agent work is pending and
+	// no PR needs fixing. This is exactly the window in which a PR sits
+	// open awaiting a human — so use it to post an automated review, if
+	// one is not already on record for the PR's current head revision.
+	//
+	// Deliberately last: a review must never displace plan/step/fix
+	// work, and the reviewer runs only against revisions that are
+	// otherwise idle.
+	if reviewEnabled {
+		if rev := findReviewTarget(prs); rev != nil {
+			return Decision{
+				Action: ActionSpawn,
+				Mode:   ModeReview,
+				Review: rev,
+				Reason: "open PR has no automated review for its current head revision",
+			}
+		}
 	}
 
 	return Decision{Action: ActionNone, Reason: modeReason}
@@ -350,6 +417,91 @@ func findFixTarget(prs []PRSnapshot) *FixTarget {
 		}
 	}
 	return nil
+}
+
+// findReviewTarget returns the first open PR that has no automated
+// review on record for its current head revision, or nil when every
+// open PR is already reviewed at its latest commit.
+//
+// This is the whole "only review again when new commits were added"
+// rule, and it is derived entirely from Gitea: the PR's head SHA versus
+// the revisions recorded on the reviews already posted by review
+// agents. Nothing is remembered between passes.
+//
+// A PR whose head SHA is unknown is skipped rather than reviewed. An
+// empty SHA can never be matched by a later review, so reviewing it
+// would re-review the same PR on every single pass — an unbounded token
+// burn. Skipping loses a review; not skipping loses the budget.
+func findReviewTarget(prs []PRSnapshot) *ReviewTarget {
+	for _, snap := range prs {
+		if snap.PR.State != prStateOpen {
+			continue
+		}
+		headSHA := snap.PR.Head.Sha
+		if headSHA == "" {
+			continue
+		}
+		if hasAgentReviewForSHA(snap.Reviews, headSHA) {
+			continue
+		}
+		if countAgentReviews(snap.Reviews) >= maxAgentReviewsPerPR {
+			continue
+		}
+		return &ReviewTarget{
+			Owner:   snap.Owner,
+			Repo:    snap.Repo,
+			Number:  snap.PR.Number,
+			HeadSHA: headSHA,
+		}
+	}
+	return nil
+}
+
+// maxAgentReviewsPerPR caps how many automated reviews a single pull
+// request may accumulate.
+//
+// The SHA check already stops the normal case, but it only works if the
+// review actually lands on the PR. If posting keeps failing — the
+// reviewer lost read access, Gitea rejects the payload, the Job dies
+// before posting — no marker is ever recorded, the PR looks unreviewed
+// on every pass, and the orchestrator spawns a reviewer every 30
+// seconds forever. This cap turns that from an unbounded token burn
+// into at most ten wasted runs. Ten also comfortably exceeds the number
+// of revisions a real PR goes through.
+const maxAgentReviewsPerPR = 10
+
+// countAgentReviews returns how many reviews on a PR were posted by
+// review agents.
+func countAgentReviews(reviews []gitea.PRReview) int {
+	n := 0
+	for _, r := range reviews {
+		if strings.HasPrefix(r.User.Login, ReviewAgentPrefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// hasAgentReviewForSHA reports whether any review agent has already
+// reviewed the given revision.
+//
+// Two independent signals are accepted, because neither is reliable
+// alone: Gitea's commit_id is not consistently populated on COMMENT
+// reviews, and a review body could in principle be edited. Either one
+// matching is treated as "already reviewed" — the failure mode of a
+// false positive (one skipped review) is far cheaper than that of a
+// false negative (re-reviewing the same revision every pass).
+func hasAgentReviewForSHA(reviews []gitea.PRReview, headSHA string) bool {
+	marker := ReviewSHAMarker(headSHA)
+	for _, r := range reviews {
+		if !strings.HasPrefix(r.User.Login, ReviewAgentPrefix) {
+			continue
+		}
+		if r.CommitID == headSHA || strings.Contains(r.Body, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // modeFromPRState recovers a follow-up mode from merged-PR state. This

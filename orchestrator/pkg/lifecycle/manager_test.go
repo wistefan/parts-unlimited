@@ -190,10 +190,10 @@ func TestCreateJob_Idempotent(t *testing.T) {
 		AgentID:        "general-agent-1",
 		Specialization: "general",
 		TicketID:       42,
-		GiteaUsername:   "general-agent-1",
-		GiteaPassword:   "pass",
-		TaigaUsername:   "general-agent-1",
-		TaigaPassword:   "pass",
+		GiteaUsername:  "general-agent-1",
+		GiteaPassword:  "pass",
+		TaigaUsername:  "general-agent-1",
+		TaigaPassword:  "pass",
 	}
 
 	name1, err := mgr.CreateJob(ctx, spec)
@@ -224,10 +224,10 @@ func TestDeleteJob(t *testing.T) {
 		AgentID:        "general-agent-1",
 		Specialization: "general",
 		TicketID:       42,
-		GiteaUsername:   "a",
-		GiteaPassword:   "a",
-		TaigaUsername:   "a",
-		TaigaPassword:   "a",
+		GiteaUsername:  "a",
+		GiteaPassword:  "a",
+		TaigaUsername:  "a",
+		TaigaPassword:  "a",
 	}
 	jobName, _ := mgr.CreateJob(ctx, spec)
 
@@ -365,5 +365,202 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if config.TTLAfterFinished != DefaultTTLAfterFinished {
 		t.Errorf("expected TTL %d, got %d", DefaultTTLAfterFinished, config.TTLAfterFinished)
+	}
+}
+
+// envValue returns the value of the named plain (non-ValueFrom) env var
+// on the job's agent container, or "" when it is absent.
+func envValue(job *batchv1.Job, name string) string {
+	for _, env := range job.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == name {
+			return env.Value
+		}
+	}
+	return ""
+}
+
+func TestClaudeModelPerMode(t *testing.T) {
+	// Reviewers judge code, implementers write it; the two run on
+	// different models. Every mode but `review` is an implementer.
+	tests := []struct {
+		name          string
+		mode          string
+		config        *Config
+		expectedModel string
+	}{
+		{"review uses the review model", ModeReview, DefaultConfig(), DefaultReviewClaudeModel},
+		{"analysis uses the implementation model", "analysis", DefaultConfig(), DefaultClaudeModel},
+		{"plan uses the implementation model", "plan", DefaultConfig(), DefaultClaudeModel},
+		{"step uses the implementation model", "step", DefaultConfig(), DefaultClaudeModel},
+		{"onestep uses the implementation model", "onestep", DefaultConfig(), DefaultClaudeModel},
+		{"fix uses the implementation model", ModeFix, DefaultConfig(), DefaultClaudeModel},
+		{
+			name:          "config overrides the review model",
+			mode:          ModeReview,
+			config:        &Config{Namespace: "agents", ReviewClaudeModel: "configured-review-model"},
+			expectedModel: "configured-review-model",
+		},
+		{
+			name:          "config overrides the implementation model",
+			mode:          "step",
+			config:        &Config{Namespace: "agents", ClaudeModel: "configured-model"},
+			expectedModel: "configured-model",
+		},
+		{
+			// A Config written before these fields existed leaves both
+			// empty; agents must still get a model, since an empty
+			// --model would fail every run.
+			name:          "empty config falls back to the review default",
+			mode:          ModeReview,
+			config:        &Config{Namespace: "agents"},
+			expectedModel: DefaultReviewClaudeModel,
+		},
+		{
+			name:          "empty config falls back to the implementation default",
+			mode:          "step",
+			config:        &Config{Namespace: "agents"},
+			expectedModel: DefaultClaudeModel,
+		},
+		{
+			// The implementation model must not leak into reviewers
+			// just because it is the one that was configured.
+			name:          "setting only the implementation model leaves reviewers on their default",
+			mode:          ModeReview,
+			config:        &Config{Namespace: "agents", ClaudeModel: "configured-model"},
+			expectedModel: DefaultReviewClaudeModel,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientset := fake.NewSimpleClientset()
+			mgr := NewManager(clientset, tt.config)
+			ctx := context.Background()
+
+			jobName, err := mgr.CreateJob(ctx, &AgentJobSpec{
+				AgentID:        "general-agent-1",
+				Specialization: "general",
+				TicketID:       42,
+				Mode:           tt.mode,
+				RepoOwner:      "claude",
+				RepoName:       "test-repo",
+				PRNumber:       7,
+				PRRepo:         "claude/test-repo",
+			})
+			if err != nil {
+				t.Fatalf("CreateJob: %v", err)
+			}
+
+			job, err := clientset.BatchV1().Jobs(tt.config.Namespace).Get(ctx, jobName, metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("Get job: %v", err)
+			}
+
+			if got := envValue(job, "CLAUDE_MODEL"); got != tt.expectedModel {
+				t.Errorf("mode %q: expected CLAUDE_MODEL %q, got %q", tt.mode, tt.expectedModel, got)
+			}
+		})
+	}
+}
+
+func TestDefaultConfigModels(t *testing.T) {
+	// The two defaults currently hold the same model and effort. That is a
+	// configuration choice, not an invariant — what must hold is that each
+	// pair is wired to its own constant, so the knobs stay independent.
+	config := DefaultConfig()
+	for _, tt := range []struct {
+		field, got, want string
+	}{
+		{"ClaudeModel", config.ClaudeModel, DefaultClaudeModel},
+		{"ReviewClaudeModel", config.ReviewClaudeModel, DefaultReviewClaudeModel},
+		{"ClaudeEffort", config.ClaudeEffort, DefaultClaudeEffort},
+		{"ReviewClaudeEffort", config.ReviewClaudeEffort, DefaultReviewClaudeEffort},
+	} {
+		if tt.got != tt.want {
+			t.Errorf("%s: got %q, want %q", tt.field, tt.got, tt.want)
+		}
+	}
+}
+
+func TestClaudeEffortPerMode(t *testing.T) {
+	tests := []struct {
+		name           string
+		mode           string
+		config         *Config
+		expectedEffort string // "" means the env var must be absent
+	}{
+		{"review gets the review effort", ModeReview, DefaultConfig(), DefaultReviewClaudeEffort},
+		{"step gets the implementation effort", "step", DefaultConfig(), DefaultClaudeEffort},
+		{"fix gets the implementation effort", ModeFix, DefaultConfig(), DefaultClaudeEffort},
+		{
+			name:           "config overrides the review effort alone",
+			mode:           ModeReview,
+			config:         &Config{Namespace: "agents", ReviewClaudeEffort: "max"},
+			expectedEffort: "max",
+		},
+		{
+			name:           "setting only the review effort leaves implementers on their default",
+			mode:           "step",
+			config:         &Config{Namespace: "agents", ReviewClaudeEffort: "max"},
+			expectedEffort: DefaultClaudeEffort,
+		},
+		{
+			name:           "empty config falls back to the default effort",
+			mode:           "step",
+			config:         &Config{Namespace: "agents"},
+			expectedEffort: DefaultClaudeEffort,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientset := fake.NewSimpleClientset()
+			mgr := NewManager(clientset, tt.config)
+			ctx := context.Background()
+
+			jobName, err := mgr.CreateJob(ctx, &AgentJobSpec{
+				AgentID:  "general-agent-1",
+				TicketID: 42,
+				Mode:     tt.mode,
+				PRNumber: 7,
+				PRRepo:   "claude/test-repo",
+			})
+			if err != nil {
+				t.Fatalf("CreateJob: %v", err)
+			}
+			job, err := clientset.BatchV1().Jobs(tt.config.Namespace).Get(ctx, jobName, metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("Get job: %v", err)
+			}
+			if got := envValue(job, "CLAUDE_EFFORT"); got != tt.expectedEffort {
+				t.Errorf("mode %q: expected CLAUDE_EFFORT %q, got %q", tt.mode, tt.expectedEffort, got)
+			}
+		})
+	}
+}
+
+// An unset effort must leave CLAUDE_EFFORT out of the pod entirely rather
+// than setting it empty: bootstrap.sh tests the variable for emptiness, and
+// an empty --effort would be rejected by the CLI.
+func TestClaudeEffortOmittedWhenUnset(t *testing.T) {
+	clientset := fake.NewSimpleClientset()
+	mgr := NewManager(clientset, &Config{Namespace: "agents"})
+	ctx := context.Background()
+
+	jobName, err := mgr.CreateJob(ctx, &AgentJobSpec{AgentID: "a", TicketID: 1, Mode: "step"})
+	if err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	job, err := clientset.BatchV1().Jobs("agents").Get(ctx, jobName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get job: %v", err)
+	}
+	// With a non-empty Default*Effort the fallback supplies a real level, so
+	// what this pins is the invariant that survives someone setting that
+	// constant to "": the var is either absent or meaningful, never empty.
+	for _, env := range job.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == "CLAUDE_EFFORT" && env.Value == "" {
+			t.Error("CLAUDE_EFFORT present but empty — bootstrap would pass an invalid --effort")
+		}
 	}
 }

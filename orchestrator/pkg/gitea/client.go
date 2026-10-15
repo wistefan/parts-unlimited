@@ -120,6 +120,11 @@ type PullRequest struct {
 type PRRef struct {
 	Label string `json:"label"`
 	Ref   string `json:"ref"`
+	// Sha is the commit the ref pointed at when the PR was fetched. For
+	// the head ref this is the revision a reviewer actually looked at,
+	// which is how the reconciler decides whether a PR has gained new
+	// commits since its last automated review.
+	Sha string `json:"sha"`
 }
 
 // CreatePullRequest creates a new pull request.
@@ -286,8 +291,23 @@ func (c *Client) CreateReview(owner, repo string, prNumber int, review *CreateRe
 
 // CreateReviewRequest holds parameters for creating a PR review.
 type CreateReviewRequest struct {
-	Body  string          `json:"body"`
-	Event string          `json:"event"` // "APPROVED", "REQUEST_CHANGES", "COMMENT"
+	Body  string `json:"body"`
+	Event string `json:"event"` // "APPROVED", "REQUEST_CHANGES", "COMMENT"
+	// Comments carries inline, line-anchored remarks submitted together
+	// with the review. Optional: a review with an empty slice is a
+	// summary-only review.
+	Comments []CreateReviewComment `json:"comments,omitempty"`
+}
+
+// CreateReviewComment is a single inline code comment submitted as part
+// of a review. NewLine anchors the comment to a line on the head
+// revision of the diff; Gitea rejects comments whose path/line pair is
+// not part of the PR's diff.
+type CreateReviewComment struct {
+	Path    string `json:"path"`
+	Body    string `json:"body"`
+	NewLine int    `json:"new_position,omitempty"`
+	OldLine int    `json:"old_position,omitempty"`
 }
 
 // --- PR Comments ---

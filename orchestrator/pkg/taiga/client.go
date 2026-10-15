@@ -13,12 +13,22 @@ import (
 )
 
 // Client is a Taiga REST API client.
+//
+// Taiga access tokens expire (24h by default, see ACCESS_TOKEN_LIFETIME in
+// taiga-back), so the client keeps the credentials it authenticated with and
+// transparently re-authenticates when the server rejects the cached token.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
 
+	// refreshMu serializes token refreshes so that a burst of concurrent
+	// 401s results in a single call to /api/v1/auth.
+	refreshMu sync.Mutex
+
 	mu        sync.RWMutex
 	authToken string
+	username  string
+	password  string
 }
 
 // NewClient creates a new Taiga API client.
@@ -32,6 +42,8 @@ func NewClient(baseURL string) *Client {
 }
 
 // Authenticate obtains a JWT token using username/password credentials.
+// The credentials are retained so that the client can renew the token on its
+// own once Taiga expires it; see refreshToken.
 func (c *Client) Authenticate(username, password string) error {
 	payload := map[string]string{
 		"type":     "normal",
@@ -58,27 +70,51 @@ func (c *Client) Authenticate(username, password string) error {
 
 	c.mu.Lock()
 	c.authToken = result.AuthToken
+	c.username = username
+	c.password = password
 	c.mu.Unlock()
 
 	return nil
+}
+
+// refreshToken obtains a new access token after staleToken was rejected with
+// 401. If another goroutine already replaced staleToken it returns without
+// contacting Taiga, so a burst of concurrent 401s triggers a single login.
+func (c *Client) refreshToken(staleToken string) error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+
+	c.mu.RLock()
+	current, username, password := c.authToken, c.username, c.password
+	c.mu.RUnlock()
+
+	if current != staleToken {
+		// A concurrent refresh already won; the caller retries with it.
+		return nil
+	}
+	if username == "" {
+		return fmt.Errorf("token rejected and no credentials stored: call Authenticate first")
+	}
+
+	return c.Authenticate(username, password)
 }
 
 // --- User Stories ---
 
 // UserStory represents a Taiga user story.
 type UserStory struct {
-	ID            int              `json:"id"`
-	Ref           int              `json:"ref"`
-	Subject       string           `json:"subject"`
-	Description   string           `json:"description"`
-	Status        int              `json:"status"`
-	AssignedTo    *int             `json:"assigned_to"`
-	AssignedUsers []int            `json:"assigned_users"`
-	Tags          [][]string       `json:"tags"`
-	Project       int              `json:"project"`
-	Version       int              `json:"version"`
-	CreatedDate   string           `json:"created_date"`
-	ModifiedDate  string           `json:"modified_date"`
+	ID            int        `json:"id"`
+	Ref           int        `json:"ref"`
+	Subject       string     `json:"subject"`
+	Description   string     `json:"description"`
+	Status        int        `json:"status"`
+	AssignedTo    *int       `json:"assigned_to"`
+	AssignedUsers []int      `json:"assigned_users"`
+	Tags          [][]string `json:"tags"`
+	Project       int        `json:"project"`
+	Version       int        `json:"version"`
+	CreatedDate   string     `json:"created_date"`
+	ModifiedDate  string     `json:"modified_date"`
 }
 
 // ListUserStories returns user stories for a project, optionally filtered by status or tags.
@@ -186,6 +222,13 @@ func (c *Client) AddComment(storyID int, comment string, version int) error {
 	return err
 }
 
+const (
+	// disablePaginationHeader makes Taiga return a full collection in one
+	// response instead of the default 30-entry page.
+	disablePaginationHeader = "x-disable-pagination"
+	disablePaginationValue  = "True"
+)
+
 // HistoryEntry represents an entry in a user story's history.
 type HistoryEntry struct {
 	ID                string  `json:"id"`
@@ -210,21 +253,8 @@ type HistoryEntry struct {
 func (c *Client) GetComments(storyID int) ([]HistoryEntry, error) {
 	path := fmt.Sprintf("/api/v1/history/userstory/%d?type=comment", storyID)
 
-	req, err := http.NewRequest(http.MethodGet, c.baseURL+path, nil)
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
-	}
-	req.Header.Set("x-disable-pagination", "True")
-
-	c.mu.RLock()
-	token := c.authToken
-	c.mu.RUnlock()
-	if token == "" {
-		return nil, fmt.Errorf("not authenticated: call Authenticate first")
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := c.httpClient.Do(req)
+	headers := map[string]string{disablePaginationHeader: disablePaginationValue}
+	resp, err := c.doRequestWithHeaders(http.MethodGet, path, nil, true, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -327,11 +357,11 @@ func (c *Client) ListProjectMembers(projectID int) ([]User, error) {
 // Requires public registration to be enabled on the Taiga instance.
 func (c *Client) RegisterUser(username, password, email, fullName string) (*User, error) {
 	payload := map[string]string{
-		"type":      "public",
-		"username":  username,
-		"password":  password,
-		"email":     email,
-		"full_name": fullName,
+		"type":           "public",
+		"username":       username,
+		"password":       password,
+		"email":          email,
+		"full_name":      fullName,
 		"accepted_terms": "true",
 	}
 
@@ -492,10 +522,10 @@ func (c *Client) GetProjectBySlug(slug string) (*Project, error) {
 
 // Membership represents a project membership.
 type Membership struct {
-	ID      int    `json:"id"`
-	User    int    `json:"user"`
-	Project int    `json:"project"`
-	Role    int    `json:"role"`
+	ID      int `json:"id"`
+	User    int `json:"user"`
+	Project int `json:"project"`
+	Role    int `json:"role"`
 }
 
 // CreateMembership adds a user to a project with a given role.
@@ -561,34 +591,73 @@ func (c *Client) ListRoles(projectID int) ([]Role, error) {
 
 // doRequest builds and executes an HTTP request.
 func (c *Client) doRequest(method, path string, body interface{}, auth bool) (*http.Response, error) {
-	var bodyReader io.Reader
+	return c.doRequestWithHeaders(method, path, body, auth, nil)
+}
+
+// doRequestWithHeaders builds and executes an HTTP request, adding the given
+// extra headers on top of the standard ones.
+//
+// An authenticated request whose token Taiga rejects with 401 is retried once
+// with a freshly obtained token: Taiga access tokens expire after a fixed
+// lifetime, and without this the orchestrator would fail every Taiga call from
+// that moment until someone restarted it.
+func (c *Client) doRequestWithHeaders(method, path string, body interface{}, auth bool, headers map[string]string) (*http.Response, error) {
+	var payload []byte
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
 			return nil, fmt.Errorf("marshaling request body: %w", err)
 		}
-		bodyReader = bytes.NewReader(data)
+		payload = data
+	}
+
+	resp, token, err := c.sendRequest(method, path, payload, auth, headers)
+	if err != nil || !auth || resp.StatusCode != http.StatusUnauthorized {
+		return resp, err
+	}
+
+	// The token expired (or was revoked): log in again and replay once.
+	resp.Body.Close()
+	if err := c.refreshToken(token); err != nil {
+		return nil, fmt.Errorf("re-authenticating after 401: %w", err)
+	}
+
+	resp, _, err = c.sendRequest(method, path, payload, auth, headers)
+	return resp, err
+}
+
+// sendRequest performs a single HTTP attempt and reports the bearer token it
+// used, which doRequestWithHeaders needs to detect a concurrent refresh.
+func (c *Client) sendRequest(method, path string, payload []byte, auth bool, headers map[string]string) (*http.Response, string, error) {
+	var bodyReader io.Reader
+	if payload != nil {
+		bodyReader = bytes.NewReader(payload)
 	}
 
 	req, err := http.NewRequest(method, c.baseURL+path, bodyReader)
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return nil, "", fmt.Errorf("creating request: %w", err)
 	}
 
-	if body != nil {
+	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	for name, value := range headers {
+		req.Header.Set(name, value)
+	}
 
+	var token string
 	if auth {
 		c.mu.RLock()
-		token := c.authToken
+		token = c.authToken
 		c.mu.RUnlock()
 
 		if token == "" {
-			return nil, fmt.Errorf("not authenticated: call Authenticate first")
+			return nil, "", fmt.Errorf("not authenticated: call Authenticate first")
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	return c.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req)
+	return resp, token, err
 }

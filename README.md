@@ -460,25 +460,27 @@ Instead of passing the full Taiga comment history to every agent (which can be 2
 
 Every agent is instructed to end its Taiga comment with a `### Context Summary` section that captures cumulative progress, key decisions, current state, and open issues. This rolling summary replaces the full history and keeps prompt input proportional to the current task, not the ticket's total lifetime.
 
-### CLAUDE.md codebase context
+### AGENTS.md codebase context
 
-During the **plan phase**, the agent creates a `CLAUDE.md` file in the repository root alongside `IMPLEMENTATION_PLAN.md`. This file contains:
+During the **plan phase**, the agent creates an `AGENTS.md` file in the repository root alongside `IMPLEMENTATION_PLAN.md`. This file contains:
 
 - Project overview, tech stack, and build commands
 - Project structure with key directories and files
 - Coding conventions and patterns
 - Important configuration and entry points
 
-Claude Code automatically loads `CLAUDE.md` at session start. Step and fix agents get full codebase orientation without spending tool calls exploring the repository. The bootstrap also appends `CLAUDE.md` to the `--system-prompt` argument (see below).
+Claude Code automatically loads `AGENTS.md` at session start. Step and fix agents get full codebase orientation without spending tool calls exploring the repository. The bootstrap also appends `AGENTS.md` to the `--system-prompt` argument (see below).
+
+Agents never create a `CLAUDE.md`: any `CLAUDE.md` found in a target repo is renamed to `AGENTS.md` on the next commit. The bootstrap still falls back to reading a `CLAUDE.md` when no `AGENTS.md` exists yet, so repos planned before the rename keep their context until an agent renames the file.
 
 ### Prompt caching via system prompt
 
 The Claude API caches prompt prefixes across turns within a session. The bootstrap maximizes cache hit ratio by placing all stable context into the system prompt:
 
 - **Mode-specific system prompt** — instructions that don't change between turns
-- **CLAUDE.md content** — pre-read from the repo and appended to the system prompt before the first turn
+- **AGENTS.md content** — pre-read from the repo and appended to the system prompt before the first turn
 
-This means the codebase context enters the cached prefix on turn 1 and stays cached (~90% cheaper) for all subsequent turns. Without this, the agent would read `CLAUDE.md` via a tool call, placing it later in the conversation where it can't be cached as effectively.
+This means the codebase context enters the cached prefix on turn 1 and stays cached (~90% cheaper) for all subsequent turns. Without this, the agent would read `AGENTS.md` via a tool call, placing it later in the conversation where it can't be cached as effectively.
 
 ### Docker-in-Docker sidecar
 
@@ -615,7 +617,7 @@ The orchestrator spawns agents in different modes via the `MODE` environment var
 | Mode | When | What the agent does |
 |---|---|---|
 | `analysis` | Ticket is "ready" and unassigned | Evaluates ticket + repo, posts `[analysis:proceed]` or `[analysis:need-info]` |
-| `plan` | Analysis confirmed "proceed" | Creates `CLAUDE.md` (codebase context) and `IMPLEMENTATION_PLAN.md`, opens plan PR to work branch |
+| `plan` | Analysis confirmed "proceed" | Creates `AGENTS.md` (codebase context) and `IMPLEMENTATION_PLAN.md`, opens plan PR to work branch |
 | `step` | Plan PR merged, or previous step PR merged | Reads plan, implements next step, opens step PR, signals `[step:N/M]` or `[step:complete]` |
 | `fix` | Human requests changes on a PR | Addresses review comments on existing PR branch, pushes, re-assigns to human |
 
@@ -727,6 +729,14 @@ agents:
   retryLimit: 2
   escalationThreshold: 2
   containerImage: "agent-worker:latest"
+  # Implementing agents (analysis, plan, step, onestep, fix).
+  model: "claude-opus-5-5"
+  effort: "high"            # low | medium | high | xhigh | max
+  review:
+    enabled: true
+    # Separate keys so reviewers can be moved on their own.
+    model: "claude-opus-5-5"
+    effort: "high"
   specializations:
     test:
       allowedTools: ["Read", "Grep", "Bash"]

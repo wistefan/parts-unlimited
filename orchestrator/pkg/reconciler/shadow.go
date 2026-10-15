@@ -82,6 +82,10 @@ type Config struct {
 	InProgressID  int
 	HumanTaigaID  int
 
+	// ReviewEnabled turns automated senior-engineer PR reviews on. When
+	// false, ModeReview is never decided and no reviewer Job is spawned.
+	ReviewEnabled bool
+
 	// MaxConcurrency caps the number of active agent Jobs the reconciler
 	// will tolerate. When the cap is reached, further Spawn decisions
 	// for the current pass are deferred until a later tick. Only honoured
@@ -232,7 +236,7 @@ func (r *Reconciler) reconcileOne(ctx context.Context, story *taiga.UserStory, b
 		prs = nil
 	}
 
-	decision := DeriveTicketState(story, comments, prs, r.cfg.HumanTaigaID)
+	decision := DeriveTicketState(story, comments, prs, r.cfg.HumanTaigaID, r.cfg.ReviewEnabled)
 
 	hasJob, jobErr := r.cfg.Jobs.HasJobForTicket(ctx, story.ID)
 	if jobErr != nil {
@@ -312,6 +316,10 @@ func (r *Reconciler) logDecision(story *taiga.UserStory, d Decision, hasJob bool
 		if d.Mode == ModeFix && d.Fix != nil {
 			r.cfg.Log.Printf("[reconciler] ticket #%d (%s): SPAWN %s on %s/%s#%d [%s] — %s",
 				story.ID, story.Subject, d.Mode, d.Fix.Owner, d.Fix.Repo, d.Fix.Number, jobState, d.Reason)
+		} else if d.Mode == ModeReview && d.Review != nil {
+			r.cfg.Log.Printf("[reconciler] ticket #%d (%s): SPAWN %s on %s/%s#%d @%s [%s] — %s",
+				story.ID, story.Subject, d.Mode, d.Review.Owner, d.Review.Repo, d.Review.Number,
+				shortSHA(d.Review.HeadSHA), jobState, d.Reason)
 		} else {
 			r.cfg.Log.Printf("[reconciler] ticket #%d (%s): SPAWN %s [%s] — %s",
 				story.ID, story.Subject, d.Mode, jobState, d.Reason)
@@ -320,6 +328,20 @@ func (r *Reconciler) logDecision(story *taiga.UserStory, d Decision, hasJob bool
 		r.cfg.Log.Printf("[reconciler] ticket #%d (%s): NONE [%s] — %s",
 			story.ID, story.Subject, jobState, d.Reason)
 	}
+}
+
+// shortSHALength is the number of leading hex characters of a commit
+// SHA kept in log lines — enough to identify a revision by eye without
+// making the line unreadable.
+const shortSHALength = 8
+
+// shortSHA abbreviates a commit SHA for logging, passing through
+// anything already shorter than [shortSHALength].
+func shortSHA(sha string) string {
+	if len(sha) <= shortSHALength {
+		return sha
+	}
+	return sha[:shortSHALength]
 }
 
 func (r *Reconciler) modeName() string {
